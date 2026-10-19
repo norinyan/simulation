@@ -1,0 +1,19 @@
+# ROS 2 / colcon
+/sim_ws/build/
+/sim_ws/install/
+/sim_ws/log/
+/sim_ws/results/
+
+# Docker runtime data
+/.docker-data/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local configuration
+.env
+
+# Editor and system
+.vscode/
+.DS_Store

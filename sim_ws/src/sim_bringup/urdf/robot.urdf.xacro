@@ -1,0 +1,201 @@
+<?xml version="1.0"?>
+<robot name="wheel_leg_robot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <!-- 单位：m、kg、rad。X 向前、Y 向左、Z 向上；以下为教学初稿参数。 -->
+  <xacro:arg name="static_display" default="true"/>
+  <xacro:arg name="scene_file" default=""/>
+  <xacro:arg name="planning_file" default=""/>
+  <xacro:arg name="executor_library" default="librobot_executor.so"/>
+  <xacro:property name="body_x" value="0.54"/>
+  <xacro:property name="body_y" value="0.30"/>
+  <xacro:property name="body_z" value="0.18"/>
+  <xacro:property name="body_mass" value="4.0"/>
+  <xacro:property name="wheel_radius" value="0.14"/>
+  <xacro:property name="wheel_width" value="0.08"/>
+  <xacro:property name="wheel_separation" value="0.42"/>
+  <xacro:property name="wheel_mass" value="0.5"/>
+  <xacro:property name="carrier_drop" value="0.18"/>
+  <xacro:property name="carrier_x" value="0.05"/>
+  <xacro:property name="carrier_z" value="0.04"/>
+  <xacro:property name="carrier_mass" value="0.4"/>
+  <xacro:property name="lift_travel" value="0.22"/>
+  <xacro:property name="upper_length" value="0.28"/>
+  <xacro:property name="lower_length" value="0.28"/>
+  <xacro:property name="leg_width" value="0.035"/>
+  <xacro:property name="leg_mass" value="0.25"/>
+  <xacro:property name="shoulder_x" value="0.04"/>
+  <xacro:property name="shoulder_y" value="0.34"/>
+  <xacro:property name="shoulder_z" value="0.06"/>
+  <xacro:property name="foot_length" value="0.18"/>
+  <xacro:property name="foot_width" value="0.10"/>
+  <xacro:property name="foot_height" value="0.035"/>
+  <xacro:property name="foot_mass" value="0.15"/>
+  <!-- 零关节值即收腿姿态：安装角之和为 0，足底水平；不是控制器给定值。 -->
+  <xacro:property name="shoulder_mount_pitch" value="1.15"/>
+  <xacro:property name="knee_mount_pitch" value="-2.30"/>
+  <xacro:property name="ankle_mount_pitch" value="1.15"/>
+  <xacro:property name="joint_effort" value="10.0"/>
+  <xacro:property name="joint_speed" value="1.0"/>
+  <xacro:property name="leg_joint_speed" value="2.0"/>
+  <xacro:property name="pitch_limit" value="1.57"/>
+
+  <!-- URDF 与 Gazebo 共用颜色：参考 Spot 的黄黑搭配：机身哑光金黄、双侧肢体石墨黑、双轮橡胶黑。 -->
+  <xacro:property name="body_rgba" value="0.85 0.58 0.10 1"/>
+  <xacro:property name="wheel_rgba" value="0.055 0.055 0.055 1"/>
+  <xacro:property name="limb_rgba" value="0.16 0.17 0.18 1"/>
+  <material name="body_color"><color rgba="${body_rgba}"/></material>
+  <material name="wheel_color"><color rgba="${wheel_rgba}"/></material>
+  <material name="limb_color"><color rgba="${limb_rgba}"/></material>
+
+  <!-- Gazebo Classic 需要显式 visual 材质才能保留自定义 RGBA。 -->
+  <xacro:macro name="gazebo_color" params="link rgba">
+    <gazebo reference="${link}">
+      <visual>
+        <material>
+          <ambient>${rgba}</ambient>
+          <diffuse>${rgba}</diffuse>
+          <specular>0.08 0.08 0.08 1</specular>
+        </material>
+      </visual>
+    </gazebo>
+  </xacro:macro>
+
+  <!-- 箱体惯量按均匀长方体计算，仅为合法模型参数，不代表动力学标定。 -->
+  <xacro:macro name="box_parts" params="sx sy sz mass xyz material">
+    <visual>
+      <origin xyz="${xyz}"/>
+      <geometry><box size="${sx} ${sy} ${sz}"/></geometry>
+      <material name="${material}"/>
+    </visual>
+    <collision>
+      <origin xyz="${xyz}"/>
+      <geometry><box size="${sx} ${sy} ${sz}"/></geometry>
+    </collision>
+    <inertial>
+      <origin xyz="${xyz}"/>
+      <mass value="${mass}"/>
+      <inertia ixx="${mass * (sy*sy + sz*sz) / 12.0}"
+               iyy="${mass * (sx*sx + sz*sz) / 12.0}"
+               izz="${mass * (sx*sx + sy*sy) / 12.0}"
+               ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </xacro:macro>
+
+  <link name="base_link">
+    <xacro:box_parts sx="${body_x}" sy="${body_y}" sz="${body_z}"
+                     mass="${body_mass}" xyz="0 0 0" material="body_color"/>
+    <!-- 肩部横梁归属机身，不新增连杆或关节；连接两侧腿与机身。 -->
+    <visual>
+      <origin xyz="${shoulder_x} 0 ${shoulder_z}"/>
+      <geometry><box size="${leg_width} ${2*shoulder_y} ${leg_width}"/></geometry>
+      <material name="body_color"/>
+    </visual>
+    <collision>
+      <origin xyz="${shoulder_x} 0 ${shoulder_z}"/>
+      <geometry><box size="${leg_width} ${2*shoulder_y} ${leg_width}"/></geometry>
+    </collision>
+  </link>
+  <xacro:gazebo_color link="base_link" rgba="${body_rgba}"/>
+
+  <link name="wheel_carrier">
+    <xacro:box_parts sx="${carrier_x}" sy="${wheel_separation}" sz="${carrier_z}"
+                     mass="${carrier_mass}" xyz="0 0 0" material="limb_color"/>
+    <!-- 升降连接杆的上端在初始姿态连接机身底面。 -->
+    <visual>
+      <origin xyz="0 0 ${(carrier_drop-body_z/2)/2}"/>
+      <geometry><box size="${carrier_x} ${carrier_x} ${carrier_drop-body_z/2}"/></geometry>
+      <material name="limb_color"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${(carrier_drop-body_z/2)/2}"/>
+      <geometry><box size="${carrier_x} ${carrier_x} ${carrier_drop-body_z/2}"/></geometry>
+    </collision>
+  </link>
+  <xacro:gazebo_color link="wheel_carrier" rgba="${limb_rgba}"/>
+
+  <joint name="wheel_lift_joint" type="prismatic">
+    <parent link="base_link"/><child link="wheel_carrier"/>
+    <origin xyz="0 0 ${-carrier_drop}"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0" upper="${lift_travel}" effort="${joint_effort}" velocity="${joint_speed}"/>
+  </joint>
+
+  <xacro:macro name="wheel_and_leg" params="side sign material">
+    <link name="${side}_wheel">
+      <visual>
+        <!-- URDF 圆柱沿局部 Z，绕 X 旋转后轮轴沿 Y。 -->
+        <origin rpy="${pi/2} 0 0"/>
+        <geometry><cylinder radius="${wheel_radius}" length="${wheel_width}"/></geometry>
+        <material name="wheel_color"/>
+      </visual>
+      <collision>
+        <origin rpy="${pi/2} 0 0"/>
+        <geometry><cylinder radius="${wheel_radius}" length="${wheel_width}"/></geometry>
+      </collision>
+      <inertial>
+        <mass value="${wheel_mass}"/>
+        <inertia ixx="${wheel_mass * (3*wheel_radius*wheel_radius + wheel_width*wheel_width)/12}"
+                 iyy="${wheel_mass * wheel_radius*wheel_radius/2}"
+                 izz="${wheel_mass * (3*wheel_radius*wheel_radius + wheel_width*wheel_width)/12}"
+                 ixy="0" ixz="0" iyz="0"/>
+      </inertial>
+    </link>
+    <xacro:gazebo_color link="${side}_wheel" rgba="${wheel_rgba}"/>
+
+    <joint name="${side}_wheel_joint" type="continuous">
+      <parent link="wheel_carrier"/><child link="${side}_wheel"/>
+      <origin xyz="0 ${sign*wheel_separation/2} 0"/>
+      <axis xyz="0 1 0"/>
+      <limit effort="${joint_effort}" velocity="${joint_speed}"/>
+    </joint>
+
+    <link name="${side}_upper_leg">
+      <xacro:box_parts sx="${leg_width}" sy="${leg_width}" sz="${upper_length}"
+                       mass="${leg_mass}" xyz="0 0 ${-upper_length/2}" material="${material}"/>
+    </link>
+    <xacro:gazebo_color link="${side}_upper_leg" rgba="${limb_rgba}"/>
+
+    <joint name="${side}_shoulder_joint" type="revolute">
+      <parent link="base_link"/><child link="${side}_upper_leg"/>
+      <origin xyz="${shoulder_x} ${sign*shoulder_y} ${shoulder_z}" rpy="0 ${shoulder_mount_pitch} 0"/>
+      <axis xyz="0 1 0"/>
+      <limit lower="${-pitch_limit}" upper="${pitch_limit}" effort="${joint_effort}" velocity="${leg_joint_speed}"/>
+    </joint>
+
+    <link name="${side}_lower_leg">
+      <xacro:box_parts sx="${leg_width}" sy="${leg_width}" sz="${lower_length}"
+                       mass="${leg_mass}" xyz="0 0 ${-lower_length/2}" material="${material}"/>
+    </link>
+    <xacro:gazebo_color link="${side}_lower_leg" rgba="${limb_rgba}"/>
+
+    <joint name="${side}_knee_joint" type="revolute">
+      <parent link="${side}_upper_leg"/><child link="${side}_lower_leg"/>
+      <origin xyz="0 0 ${-upper_length}" rpy="0 ${knee_mount_pitch} 0"/>
+      <axis xyz="0 1 0"/>
+      <limit lower="${-pitch_limit}" upper="${pitch_limit}" effort="${joint_effort}" velocity="${leg_joint_speed}"/>
+    </joint>
+
+    <link name="${side}_foot">
+      <xacro:box_parts sx="${foot_length}" sy="${foot_width}" sz="${foot_height}"
+                       mass="${foot_mass}" xyz="${foot_length/2-leg_width/2} 0 0" material="${material}"/>
+    </link>
+    <xacro:gazebo_color link="${side}_foot" rgba="${limb_rgba}"/>
+
+    <joint name="${side}_ankle_joint" type="revolute">
+      <parent link="${side}_lower_leg"/><child link="${side}_foot"/>
+      <origin xyz="0 0 ${-lower_length}" rpy="0 ${ankle_mount_pitch} 0"/>
+      <axis xyz="0 1 0"/>
+      <limit lower="${-pitch_limit}" upper="${pitch_limit}" effort="${joint_effort}" velocity="${leg_joint_speed}"/>
+    </joint>
+  </xacro:macro>
+  <xacro:wheel_and_leg side="left" sign="${1}" material="limb_color"/>
+  <xacro:wheel_and_leg side="right" sign="${-1}" material="limb_color"/>
+
+  <!-- 静态模型由插件逐连杆执行运动学轨迹，不启用动力学平衡控制。 -->
+  <gazebo>
+    <static>$(arg static_display)</static>
+    <plugin name="robot_executor" filename="$(arg executor_library)">
+      <scene_file>$(arg scene_file)</scene_file>
+      <planning_file>$(arg planning_file)</planning_file>
+    </plugin>
+  </gazebo>
+</robot>
