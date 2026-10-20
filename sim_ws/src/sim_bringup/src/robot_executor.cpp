@@ -37,7 +37,8 @@ class RobotExecutor final : public ModelPlugin {
   std::string frame_, state_{"READY_WHEEL"};
   enum class Action {Idle, Deploy, Fold, Foot};
   Action action_{Action::Idle};
-  bool leg_{false}, driving_{false}, failed_{false};
+  bool leg_{false}, driving_{false}, failed_{false}, live_geometry_{false};
+  mutable std::string collision_reason_;
   double x_, y_, z_, yaw_, lift_{0}, v_{0}, w_{0}, cv_{0}, cw_{0};
   double vy_{0}, vz_{0};
   double last_{-1}, report_{-1}, command_time_{-100}, begin_{0}, heartbeat_{-1};
@@ -54,12 +55,13 @@ class RobotExecutor final : public ModelPlugin {
     failed_=true; action_=Action::Idle; driving_=false;v_=w_=cv_=cw_=0;state_="FAILED: "+why;
     RCLCPP_ERROR(node_->get_logger(), "%s",state_.c_str());
   }
+  double forward() const {return x_*std::cos(yaw_)+y_*std::sin(yaw_);}
   void folded() {
-    fx_.fill(x_+hx_+toe_-l1_*std::sin(mount_[0])-l2_*std::sin(mount_[0]+mount_[1]));
+    fx_.fill(forward()+hx_+toe_-l1_*std::sin(mount_[0])-l2_*std::sin(mount_[0]+mount_[1]));
     fz_.fill(z_+hz_-l1_*std::cos(mount_[0])-l2_*std::cos(mount_[0]+mount_[1]));
   }
   bool ik(int side, double& a,double& b) const {
-    double dx=fx_[side]-toe_-x_-hx_, down=z_+hz_-fz_[side];
+    double dx=fx_[side]-toe_-forward()-hx_, down=z_+hz_-fz_[side];
     double c=(dx*dx+down*down-l1_*l1_-l2_*l2_)/(2*l1_*l2_);
     if(!std::isfinite(c)||c < -1-1e-8||c > 1+1e-8)return false;
     double knee=-std::acos(std::clamp(c,-1.,1.));
@@ -86,7 +88,7 @@ class RobotExecutor final : public ModelPlugin {
       setLink(s+"_wheel",0,sign*track_/2,z_-drop_+lift_,wheels_[i]);
       setLink(s+"_upper_leg",hx_,sign*hy_,z_+hz_,a[i]);
       setLink(s+"_lower_leg",hx_-l1_*std::sin(a[i]),sign*hy_,z_+hz_-l1_*std::cos(a[i]),b[i]);
-      setLink(s+"_foot",fx_[i]-x_-toe_,sign*hy_,fz_[i]);
+      setLink(s+"_foot",fx_[i]-forward()-toe_,sign*hy_,fz_[i]);
       msg.name.insert(msg.name.end(),{s+"_shoulder_joint",s+"_knee_joint",s+"_ankle_joint"});
       msg.position.insert(msg.position.end(),{a[i]-mount_[0],b[i]-a[i]-mount_[1],-b[i]-mount_[2]});
     }
@@ -111,7 +113,7 @@ class RobotExecutor final : public ModelPlugin {
       const auto p=model_->GetLink(name)->WorldPose();parts.push_back({p.Pos()+p.Rot().RotateVector(offset),size/2,p.Rot()});
     };
     auto vec=[](const YAML::Node& n){return V(n[0].as<double>(),n[1].as<double>(),n[2].as<double>());};
-    if(!leg_ && action_==Action::Idle) {
+    if(!leg_ && action_==Action::Idle && !live_geometry_) {
       const auto p=model_->WorldPose();
       parts.push_back({V(p.Pos().X(),p.Pos().Y(),ground_+.5),V(robot_["wheel_mode_length"].as<double>()/2+.02,robot_["wheel_mode_width"].as<double>()/2+.02,.49),p.Rot()});
       const auto b=scene_[ground_>scene_["ground_heights"]["lower"].as<double>()+.01?"upper_bounds":"lower_bounds"];
@@ -136,9 +138,24 @@ class RobotExecutor final : public ModelPlugin {
       for(auto l:m->GetLinks())for(auto c:l->GetCollisions()) {
         auto shape=boost::dynamic_pointer_cast<physics::BoxShape>(c->GetShape());if(!shape)continue;
         // In wheel mode platform/steps are enforced by the configured surface bounds.
-        if(!leg_&&action_==Action::Idle&&name.find("obstacle")==std::string::npos&&name.find("wall")==std::string::npos)continue;
+        if(!live_geometry_&&!leg_&&action_==Action::Idle&&name.find("obstacle")==std::string::npos&&name.find("wall")==std::string::npos)continue;
         const auto p=c->WorldPose();Box obstacle{p.Pos(),shape->Size()/2,p.Rot()};
-        for(const auto& box:parts)if(hit(box,obstacle))return false;
+        for(const auto& box:parts)if(hit(box,obstacle)){collision_reason_=name+"/"+l->GetName();return false;}
+      }
+    }
+    if(live_geometry_ && !leg_ && action_==Action::Idle) {
+      // Require actual horizontal solid support at the configured wheel ground;
+      // do not infer storey height from X or skip rails/steps in collision checks.
+      for(double dx:{-.27,0.,.27})for(double dy:{-.39,0.,.39}) {
+        const double xx=x_+std::cos(yaw_)*dx-std::sin(yaw_)*dy, yy=y_+std::sin(yaw_)*dx+std::cos(yaw_)*dy;
+        bool supported=false;
+        for(auto m:model_->GetWorld()->Models())if(m!=model_)for(auto l:m->GetLinks())for(auto c:l->GetCollisions()) {
+          auto sh=boost::dynamic_pointer_cast<physics::BoxShape>(c->GetShape());if(!sh)continue;
+          const auto p=c->WorldPose();const auto r=p.Rot().Euler();if(std::abs(r.X())+std::abs(r.Y())>1e-5)continue;
+          const auto local=p.Rot().RotateVectorReverse(V(xx,yy,ground_)-p.Pos());const auto size=sh->Size();
+          if(std::abs(local.Z()-size.Z()/2)<.003 && std::abs(local.X())<=size.X()/2+1e-6 && std::abs(local.Y())<=size.Y()/2+1e-6)supported=true;
+        }
+        if(!supported){collision_reason_="WHEEL_SURFACE_SUPPORT";return false;}
       }
     }
     return true;
@@ -164,14 +181,18 @@ class RobotExecutor final : public ModelPlugin {
       double t=rclcpp::Duration(p.time_from_start).seconds();
       if(p.transforms.size()!=3||p.velocities.size()!=3||p.accelerations.size()!=3||t<=prev||(prev>=0&&t-prev>.051)){fail("INVALID_FOOT_SAMPLES");return;}
       for(size_t i=0;i<3;i++) {
-        const auto& a=p.transforms[i];
-        if(!std::isfinite(a.translation.x)||!std::isfinite(a.translation.y)||!std::isfinite(a.translation.z)||std::abs(a.rotation.w-1)>1e-6||std::abs(a.rotation.x)+std::abs(a.rotation.y)+std::abs(a.rotation.z)>1e-6||std::abs(a.translation.y-(p.transforms[0].translation.y+(i==0?0:(i==1?hy_:-hy_))))>.001){fail("INVALID_FOOT_COORDINATES");return;}
+        const auto& a=p.transforms[i];const auto& body=p.transforms[0];
+        ignition::math::Quaterniond q(a.rotation.w,a.rotation.x,a.rotation.y,a.rotation.z);
+        const auto r=q.Euler();
+        const double lateral=-std::sin(yaw_)*(a.translation.x-body.translation.x)+std::cos(yaw_)*(a.translation.y-body.translation.y);
+        const double angle=std::atan2(std::sin(r.Z()-yaw_),std::cos(r.Z()-yaw_));
+        if(!std::isfinite(a.translation.x)||!std::isfinite(a.translation.y)||!std::isfinite(a.translation.z)||std::abs(r.X())+std::abs(r.Y())>1e-6||std::abs(angle)>.001||std::abs(lateral-(i==0?0:(i==1?hy_:-hy_)))>.001){fail("INVALID_FOOT_COORDINATES");return;}
       }
       prev=t;
     }
     const auto& first=msg.points.front();const auto& b=first.transforms[0].translation;
-    double error=std::abs(b.x-x_)+std::abs(b.y-y_)+std::abs(b.z-z_)+std::abs(yaw_);
-    for(int i=0;i<2;i++)error+=std::abs(first.transforms[i+1].translation.x-fx_[i])+std::abs(first.transforms[i+1].translation.z-fz_[i]);
+    double error=std::abs(b.x-x_)+std::abs(b.y-y_)+std::abs(b.z-z_);
+    for(int i=0;i<2;i++)error+=std::abs(first.transforms[i+1].translation.x*std::cos(yaw_)+first.transforms[i+1].translation.y*std::sin(yaw_)-fx_[i])+std::abs(first.transforms[i+1].translation.z-fz_[i]);
     if(error>.012||std::abs(rclcpp::Duration(first.time_from_start).seconds())>1e-9){fail("FOOT_START_MISMATCH");return;}
     planned_=msg;begin_=model_->GetWorld()->SimTime().Double();action_=Action::Foot;state_="EXECUTING_FOOT";
   }
@@ -191,7 +212,7 @@ class RobotExecutor final : public ModelPlugin {
       return interpolate(get(p),get(e),get(a->velocities[i].linear),get(b->velocities[i].linear),get(a->accelerations[i].linear),get(b->accelerations[i].linear),tb-ta,std::clamp((elapsed-ta)/(tb-ta),0.,1.));
     };
     x_=value(0,0);y_=value(0,1);z_=value(0,2);
-    for(int i=0;i<2;i++){fx_[i]=value(i+1,0);fz_[i]=value(i+1,2);}
+    for(int i=0;i<2;i++){fx_[i]=value(i+1,0)*std::cos(yaw_)+value(i+1,1)*std::sin(yaw_);fz_[i]=value(i+1,2);}
     if(elapsed>=rclcpp::Duration(planned_.points.back().time_from_start).seconds()){action_=Action::Idle;state_="FOOT_DONE";}
   }
   void publish(double now) {
@@ -235,8 +256,8 @@ class RobotExecutor final : public ModelPlugin {
       }
       double u=(now-begin_)/morph_time_;
       if(action_==Action::Deploy) {
-        if(u<.5)for(int i=0;i<2;i++){fx_[i]=mix(from_fx_[i],x_+hx_+toe_,2*u);fz_[i]=mix(from_fz_[i],ground_+half_,2*u);}
-        else {fx_.fill(x_+hx_+toe_);fz_.fill(ground_+half_);z_=mix(from_z_,ground_+body_height_,2*u-1);lift_=mix(from_lift_,lift_target_,2*u-1);}
+        if(u<.5)for(int i=0;i<2;i++){fx_[i]=mix(from_fx_[i],forward()+hx_+toe_,2*u);fz_[i]=mix(from_fz_[i],ground_+half_,2*u);}
+        else {fx_.fill(forward()+hx_+toe_);fz_.fill(ground_+half_);z_=mix(from_z_,ground_+body_height_,2*u-1);lift_=mix(from_lift_,lift_target_,2*u-1);}
         if(u>=1){leg_=true;action_=Action::Idle;state_="LEG_READY";}
       } else if(action_==Action::Fold) {
         if(u<.5){z_=mix(from_z_,ground_+wheel_height_,2*u);lift_=mix(from_lift_,0,2*u);}
@@ -245,7 +266,7 @@ class RobotExecutor final : public ModelPlugin {
       } else if(action_==Action::Foot)footTick(now-begin_);
     }
     if(!apply(now)){fail("IK_OR_JOINT_LIMIT");}
-    else if(!failed_&&!collisionFree()){fail("LIVE_GAZEBO_COLLISION_GUARD");}
+    else if(!failed_&&!collisionFree()){fail("LIVE_GAZEBO_COLLISION_GUARD: "+collision_reason_);}
     if(failed_) {
       // Hold the last safe pose, including links (kinematic rollback).
       x_=previous.Pos().X();y_=previous.Pos().Y();z_=previous_z;yaw_=previous.Rot().Yaw();
@@ -265,7 +286,7 @@ public:
   void Load(physics::ModelPtr model,sdf::ElementPtr sdf) override {
     model_=model;model_->SetStatic(true);node_=gazebo_ros::Node::Get(sdf);
     try {
-      const auto doc=YAML::LoadFile(sdf->Get<std::string>("scene_file"));scene_=doc["scene"];robot_=doc["robot"];
+      const auto doc=YAML::LoadFile(sdf->Get<std::string>("scene_file"));scene_=doc["scene"];robot_=doc["robot"];live_geometry_=scene_["live_geometry"] && scene_["live_geometry"].as<bool>();
       config_=YAML::LoadFile(sdf->Get<std::string>("planning_file"))["planning_node"]["ros__parameters"];
       auto r=[&](const char* key){return robot_[key].as<double>();};auto t=config_["task"];
       frame_=scene_["frame"].as<std::string>();radius_=r("wheel_radius");track_=r("wheel_track");drop_=r("carrier_drop");wheel_height_=drop_+radius_;

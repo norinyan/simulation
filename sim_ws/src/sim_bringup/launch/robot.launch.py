@@ -1,13 +1,12 @@
-"""加载场景、运动学执行器与可选的自主规划任务。"""
+"""Load the robot into an existing two_steps Gazebo server, with optional planning."""
 
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
 from ament_index_python.packages import get_package_share_directory, get_package_prefix
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, SetEnvironmentVariable
 from launch.conditions import IfCondition
-from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -15,9 +14,16 @@ import xacro
 import yaml
 
 
-def generate_launch_description():
+def setup(context):
+    value = lambda name: LaunchConfiguration(name).perform(context)
+    if value('scene') != 'two_steps':
+        raise ValueError('Robot configuration is only available for scene:=two_steps; three_floor currently supports observation only')
+    flags = {name: value(name) == 'true' for name in ('planning', 'local_planning', 'foot_planning', 'autonomous')}
+    if (flags['local_planning'] or flags['foot_planning']) and not flags['planning']:
+        raise ValueError('local_planning and foot_planning require planning:=true')
+    if flags['autonomous'] and not all(flags[name] for name in ('planning', 'local_planning', 'foot_planning')):
+        raise ValueError('autonomous:=true requires planning:=true local_planning:=true foot_planning:=true')
     share = Path(get_package_share_directory('sim_bringup'))
-    gazebo_share = Path(get_package_share_directory('gazebo_ros'))
     description = xacro.process_file(
         str(share / 'urdf' / 'robot.urdf.xacro'),
         mappings={'static_display': 'true',
@@ -33,16 +39,6 @@ def generate_launch_description():
     radius = float(robot.find("link[@name='left_wheel']/collision/geometry/cylinder").get('radius'))
     spawn_z = radius - lift_z
 
-    gazebo = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(str(gazebo_share / 'launch' / 'gazebo.launch.py')),
-        launch_arguments={
-            'world': str(share / 'worlds' / 'two_steps.world'),
-            'gui': LaunchConfiguration('gui'),
-            'verbose': 'true',
-            'pause': 'false',
-            'server_required': 'true',
-        }.items(),
-    )
     # 执行插件发布 joint_states 与实际 odom，机器人状态发布器负责关节 TF。
     state_publisher = Node(
         package='robot_state_publisher',
@@ -87,19 +83,18 @@ def generate_launch_description():
             },
         ],
     )
+    return [SetEnvironmentVariable('GAZEBO_MASTER_URI', value('master_uri')),
+            state_publisher, spawn, planning]
+
+
+def generate_launch_description():
     return LaunchDescription([
-        DeclareLaunchArgument('autonomous', default_value='false', description='自动执行 A→E→X→B，需启用三类规划'),
-        DeclareLaunchArgument('gui', default_value='true', description='启动 Gazebo 图形界面'),
-        DeclareLaunchArgument('planning', default_value='false', description='启动全局 A* 参考路径规划'),
-        DeclareLaunchArgument('local_planning', default_value='false', description='启用单次轮式 TEB 预测，需 planning:=true'),
-        DeclareLaunchArgument('foot_planning', default_value='false', description='启用 E→X 足步与五次轨迹规划，需 planning:=true'),
-        DeclareLaunchArgument(
-            'results_dir',
-            default_value=str(Path.home() / '.local/state/simulation/global_planning'),
-            description='规划 CSV 输出根目录，每次运行创建独立子目录',
-        ),
-        gazebo,
-        state_publisher,
-        spawn,
-        planning,
+        DeclareLaunchArgument('scene', default_value='two_steps', choices=['two_steps', 'three_floor']),
+        DeclareLaunchArgument('master_uri', default_value='http://127.0.0.1:11345'),
+        DeclareLaunchArgument('planning', default_value='false', choices=['true', 'false']),
+        DeclareLaunchArgument('local_planning', default_value='false', choices=['true', 'false']),
+        DeclareLaunchArgument('foot_planning', default_value='false', choices=['true', 'false']),
+        DeclareLaunchArgument('autonomous', default_value='false', choices=['true', 'false']),
+        DeclareLaunchArgument('results_dir', default_value=str(Path.home()/'.local/state/simulation/global_planning')),
+        OpaqueFunction(function=setup),
     ])
