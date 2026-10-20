@@ -1,4 +1,4 @@
-"""Load the robot into an existing two_steps Gazebo server, with optional planning."""
+"""Load a robot into an existing Gazebo server; planning remains limited to two_steps."""
 
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -16,18 +16,35 @@ import yaml
 
 def setup(context):
     value = lambda name: LaunchConfiguration(name).perform(context)
-    if value('scene') != 'two_steps':
-        raise ValueError('Robot configuration is only available for scene:=two_steps; three_floor currently supports observation only')
     flags = {name: value(name) == 'true' for name in ('planning', 'local_planning', 'foot_planning', 'autonomous')}
+    if value('scene') != 'two_steps' and any(flags.values()):
+        raise ValueError('three_floor supports robot placement only; planning is not configured')
     if (flags['local_planning'] or flags['foot_planning']) and not flags['planning']:
         raise ValueError('local_planning and foot_planning require planning:=true')
     if flags['autonomous'] and not all(flags[name] for name in ('planning', 'local_planning', 'foot_planning')):
         raise ValueError('autonomous:=true requires planning:=true local_planning:=true foot_planning:=true')
     share = Path(get_package_share_directory('sim_bringup'))
+    scene_file = Path(value('scene_file')).expanduser() if value('scene_file') else share/'config/scene.yaml'
+    if value('scene') == 'three_floor' and not value('scene_file'):
+        raise ValueError('three_floor placement requires a scene_file with live_geometry enabled')
+    scene = yaml.safe_load(scene_file.read_text())
+    if scene['scene']['name'] != value('scene'):
+        raise ValueError('scene_file does not match the selected scene')
+    if value('scene') == 'three_floor' and not scene['scene'].get('live_geometry', False):
+        raise ValueError('three_floor placement must use live_geometry collision and support checks')
+    start = scene['scene']['waypoints']['A']
+    # Preserve the planner task geometry while allowing explicitly selected spawn presets.
+    if value('spawn_pose'):
+        start = [float(v) for v in value('spawn_pose').split(',')]
+        import math
+        if len(start) != 4 or not all(math.isfinite(v) for v in start):
+            raise ValueError('spawn_pose must contain finite x,y,ground_z,yaw values')
+    if any(flags.values()) and start != scene['scene']['waypoints']['A']:
+        raise ValueError('Planning is supported only from the configured preset A')
     description = xacro.process_file(
         str(share / 'urdf' / 'robot.urdf.xacro'),
         mappings={'static_display': 'true',
-                  'scene_file': str(share / 'config' / 'scene.yaml'),
+                  'scene_file': str(scene_file),
                   'planning_file': str(share / 'config' / 'planning.yaml'),
                   'executor_library': str(Path(get_package_prefix('sim_bringup')) / 'lib' / 'librobot_executor.so')},
     ).toxml()
@@ -51,8 +68,6 @@ def setup(context):
         }],
     )
     # spawn_entity 自行等待描述与 /spawn_entity 服务，不使用固定启动延时。
-    scene = yaml.safe_load((share / 'config' / 'scene.yaml').read_text())
-    start = scene['scene']['waypoints']['A']
     spawn = Node(
         package='gazebo_ros',
         executable='spawn_entity.py',
@@ -74,10 +89,11 @@ def setup(context):
         parameters=[
             str(share / 'config' / 'planning.yaml'),
             {
-                'scene_file': str(share / 'config' / 'scene.yaml'),
+                'scene_file': str(scene_file),
                 'output_dir': LaunchConfiguration('results_dir'),
                 'use_sim_time': True,
                 'local_enabled': ParameterValue(LaunchConfiguration('local_planning'), value_type=bool),
+                'interactive': ParameterValue(LaunchConfiguration('interactive'), value_type=bool),
                 'autonomous': ParameterValue(LaunchConfiguration('autonomous'), value_type=bool),
                 'foot_enabled': ParameterValue(LaunchConfiguration('foot_planning'), value_type=bool),
             },
@@ -91,6 +107,9 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('scene', default_value='two_steps', choices=['two_steps', 'three_floor']),
         DeclareLaunchArgument('master_uri', default_value='http://127.0.0.1:11345'),
+        DeclareLaunchArgument('scene_file', default_value=''),
+        DeclareLaunchArgument('spawn_pose', default_value='', description='Optional x,y,ground_z,yaw; does not change planner endpoints'),
+        DeclareLaunchArgument('interactive', default_value='false', choices=['true', 'false']),
         DeclareLaunchArgument('planning', default_value='false', choices=['true', 'false']),
         DeclareLaunchArgument('local_planning', default_value='false', choices=['true', 'false']),
         DeclareLaunchArgument('foot_planning', default_value='false', choices=['true', 'false']),

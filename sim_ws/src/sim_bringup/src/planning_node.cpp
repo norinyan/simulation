@@ -11,6 +11,7 @@
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <trajectory_msgs/msg/multi_dof_joint_trajectory.hpp>
 #include <yaml-cpp/yaml.h>
 
@@ -324,11 +325,41 @@ public:
       local_path_publisher_ = create_publisher<nav_msgs::msg::Path>("/planning/local_path", local_qos);
       local_status_publisher_ = create_publisher<std_msgs::msg::String>("/planning/local_status", local_qos);
     }
+    interactive_ = declare_parameter<bool>("interactive", false);
     setupTask();
+    require(!(interactive_ && autonomous_), "interactive and autonomous are mutually exclusive");
+    if (interactive_) {
+      plan_service_ = create_service<std_srvs::srv::Trigger>("/planning/plan", [this](const std_srvs::srv::Trigger::Request::SharedPtr, std_srvs::srv::Trigger::Response::SharedPtr response) {
+        if (task_ready_ || terminal_) {response->success=false;response->message="Reset the robot before planning another task";return;}
+        try {run();response->success=plan_ready_;response->message=plan_ready_?"PLAN_READY: A -> E -> X -> B":"Planning failed; inspect planning status";}
+        catch(const std::exception& e){response->success=false;response->message=e.what();}
+      });
+      execute_service_ = create_service<std_srvs::srv::Trigger>("/planning/execute", [this](const std_srvs::srv::Trigger::Request::SharedPtr, std_srvs::srv::Trigger::Response::SharedPtr response) {
+        if (!plan_ready_ || task_ready_ || terminal_) {response->success=false;response->message="Plan first; executed/stopped tasks require resetting the robot";return;}
+        if (!have_odom_ || !have_status_ || !have_feet_ || !at(task_scene_.lower.start,wheelHeight(),.01) || !stopped() || executor_.find("READY_WHEEL")!=0) {
+          response->success=false;response->message="Robot must be ready and stopped at preset A";return;
+        }
+        try {
+          beginTask();
+          // Manual requests can arrive at any wall-timer phase. Start the first
+          // control update now, then schedule full periods from this request.
+          task_timer_->reset();taskTick();
+          response->success=true;response->message="Task accepted";
+        } catch(const std::exception& e){
+          if(task_ready_ && !terminal_)finishTask("FAILED",e.what());
+          response->success=false;response->message=e.what();
+        }
+      });
+      stop_service_ = create_service<std_srvs::srv::Trigger>("/planning/stop", [this](const std_srvs::srv::Trigger::Request::SharedPtr, std_srvs::srv::Trigger::Response::SharedPtr response) {
+        if(task_ready_ && !terminal_)finishTask("STOPPED","Stopped by operator; reset robot before another task");
+        else {velocity(0,0);modeCommand("STOP");}
+        plan_ready_=false;terminal_=true;response->success=true;response->message="Stop sent; reset robot before another task";
+      });
+    }
     timer_ = create_wall_timer(std::chrono::milliseconds(100), [this]() {
       if (get_parameter("use_sim_time").as_bool() && now().nanoseconds() == 0) return;
       timer_->cancel();
-      run();
+      if (!interactive_) run();
     });
   }
 
@@ -549,6 +580,7 @@ private:
 
   void run()
   {
+    plan_ready_=false;local_ok_=false;foot_command_.points.clear();
     const auto begin = std::chrono::steady_clock::now();
     Sections sections;
     bool success = false;
@@ -625,23 +657,26 @@ private:
     }
     if (local_enabled_) runLocal(scene, sections, success, reason);
     if (foot_enabled_) runFoot(scene, sections, success, reason);
-    if (autonomous_) {
-      task_scene_ = scene; task_sections_ = sections;
-      std::filesystem::create_directories(output_dir_);
-      actual_.exceptions(std::ios::failbit | std::ios::badbit);
-      events_.exceptions(std::ios::failbit | std::ios::badbit);
-      bands_.exceptions(std::ios::failbit | std::ios::badbit);
-      actual_.open(output_dir_/"actual_trajectory.csv"); events_.open(output_dir_/"task_events.csv");
-      bands_.open(output_dir_/"teb_execution.csv");
-      actual_ << "sim_time_s,state,x_m,y_m,body_z_m,yaw_rad,v_mps,w_rps,left_x_m,left_y_m,left_z_m,right_x_m,right_y_m,right_z_m,executor_status\n";
-      events_ << "sim_time_s,state,reason,x_m,y_m,body_z_m,yaw_rad,v_mps,w_rps\n";
-      bands_ << "plan_id,segment,odom_stamp_s,initial_x_m,initial_y_m,initial_yaw_rad,initial_v_mps,initial_w_rps,index,time_s,x_m,y_m,yaw_rad,v_mps,w_rps,planning_ms,seed_spacing_m\n";
-      task_begin_=phase_begin_=now().seconds(); wall_begin_=std::chrono::steady_clock::now();
-      task_ready_=true;
-      if (!success || !local_enabled_ || !foot_enabled_ || foot_command_.points.empty())
-        finishTask("FAILED", "GLOBAL_OR_FOOT_PLAN_UNAVAILABLE_OR_PLANNERS_DISABLED: "+reason);
-      else enterTask("WAIT_EXECUTOR");
-    }
+    task_scene_ = scene; task_sections_ = sections;
+    plan_ready_ = success && local_enabled_ && foot_enabled_ && local_ok_ && !foot_command_.points.empty();
+    if (autonomous_) beginTask();
+  }
+
+  void beginTask()
+  {
+    std::filesystem::create_directories(output_dir_);
+    actual_.exceptions(std::ios::failbit | std::ios::badbit);
+    events_.exceptions(std::ios::failbit | std::ios::badbit);
+    bands_.exceptions(std::ios::failbit | std::ios::badbit);
+    actual_.open(output_dir_/"actual_trajectory.csv"); events_.open(output_dir_/"task_events.csv");
+    bands_.open(output_dir_/"teb_execution.csv");
+    actual_ << "sim_time_s,state,x_m,y_m,body_z_m,yaw_rad,v_mps,w_rps,left_x_m,left_y_m,left_z_m,right_x_m,right_y_m,right_z_m,executor_status\n";
+    events_ << "sim_time_s,state,reason,x_m,y_m,body_z_m,yaw_rad,v_mps,w_rps\n";
+    bands_ << "plan_id,segment,odom_stamp_s,initial_x_m,initial_y_m,initial_yaw_rad,initial_v_mps,initial_w_rps,index,time_s,x_m,y_m,yaw_rad,v_mps,w_rps,planning_ms,seed_spacing_m\n";
+    task_begin_=phase_begin_=now().seconds(); wall_begin_=std::chrono::steady_clock::now();
+    task_ready_=true;
+    if (!plan_ready_) finishTask("FAILED", "GLOBAL_OR_FOOT_PLAN_UNAVAILABLE_OR_PLANNERS_DISABLED");
+    else enterTask("WAIT_EXECUTOR");
   }
 
   void saveLocal(const std::array<planning::LocalPlanResult, 2>& results)
@@ -707,6 +742,7 @@ private:
         result = {}; result.failure_reason = std::string("LOCAL_CSV_ERROR: ")+error.what();
       }
     }
+    local_ok_=results[0].success && results[1].success;
     for (std::size_t s = 0; s < results.size(); ++s) {
       const auto& result = results[s];
       const char* segment = s == 0 ? "A-E" : "X-B";
@@ -859,7 +895,7 @@ private:
     yaw_tolerance_ = declare_parameter<double>("task.yaw_tolerance", .0005);
     approach_gain_ = declare_parameter<double>("task.approach_gain", .5);
     declare_parameter<double>("task.morph_duration", 4.0);
-    if (!autonomous_) return;
+    if (!autonomous_ && !interactive_) return;
     require(feedback_timeout_>0 && command_timeout_>0 && stage_timeout_>0 && task_timeout_>0 &&
             position_tolerance_>0 && yaw_tolerance_>0 && approach_gain_>0, "Invalid task execution parameters");
     velocity_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>("/robot/cmd_vel", 1);
@@ -1032,6 +1068,8 @@ private:
       require(at(task_scene_.upper.start,wheelHeight(),.004)&&stopped(),"WHEEL_EXIT_POSE_MISMATCH");enterTask("WHEEL_X_B");
     }
   }
+  bool interactive_{false},plan_ready_{false},local_ok_{false};
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr plan_service_,execute_service_,stop_service_;
   bool autonomous_{false},task_ready_{false},terminal_{false},have_odom_{false},have_status_{false},have_feet_{false};
   std::string task_state_,executor_;
   Scene task_scene_;Sections task_sections_;

@@ -21,8 +21,8 @@ def setup(context):
         raise ValueError('real_time_factor must be between 1 and 10')
     if not math.isfinite(snapshot) or snapshot < 0:
         raise ValueError('snapshot_after must be a finite nonnegative number')
-    if scene == 'two_steps' and (view != 'exterior' or floor != 0):
-        raise ValueError('two_steps supports the native exterior view with floor:=0')
+    if scene == 'two_steps' and (view not in ('exterior', 'top') or floor != 0):
+        raise ValueError('two_steps supports exterior/top views with floor:=0')
     if scene == 'three_floor':
         if view in ('top', 'interior') and floor == 0:
             raise ValueError('top/interior views require floor:=1, 2, or 3')
@@ -56,8 +56,7 @@ def setup(context):
                    EmitEvent(event=Shutdown(reason='Gazebo server exited'))])), server]
     if value('gui') == 'true':
         command = ['gzclient', '--verbose']
-        if scene == 'three_floor':
-            command += ['--gui-client-plugin', str(lib/'libscene_visualization.so')]
+        command += ['--gui-client-plugin', str(lib/'libscene_visualization.so')]
         actions.append(TimerAction(period=2.0, actions=[ExecuteProcess(cmd=command, env=env)]))
     return actions
 

@@ -461,8 +461,8 @@ ros2 launch sim_bringup robot.launch.py scene:=two_steps planning:=true
 | `scene` | `three_floor` | 总入口、场景入口的默认场景；机器人子入口默认 two_steps |
 | `robot` | `false` | 仅总入口提供，当前只允许搭配 two_steps |
 | `gui` | `true` | 关闭后仍运行场景动态控制与机器人节点 |
-| `view` | `exterior` | exterior、top、interior、split；two_steps 使用原生 exterior 显示 |
-| `floor` | `0` | 0 表示整楼；top/interior 必须指定 1、2、3；split 必须为 0 |
+| `view` | `exterior` | exterior、top、interior、split；two_steps 支持总览和俯视 |
+| `floor` | `0` | 三层场景中 0 表示整楼，top/interior 指定 1、2、3，split 为 0；two_steps 为 0 |
 | `real_time_factor` | `1` | 目标倍率 1～10，实际受负载限制；行人观察可用 5，机器人闭环任务默认 1 |
 | `snapshot_after` | `2` | 三层观察就绪后经过的仿真秒数，保存一次截图，之后继续实时显示 |
 | `output_dir` | 自动生成的时间戳目录 | 容器 ~/.local/state/simulation/ 下，保存运行时 World 与截图 |
@@ -486,3 +486,21 @@ cd /workspace/sim_ws
 colcon build --packages-select sim_bringup --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
 source install/setup.bash
 ```
+
+## 图形仿真控制台（HMI 第一版）
+
+独立包为 [simulation_hmi](sim_ws/src/simulation_hmi/README.md)。容器内构建、启动：
+
+```bash
+source /opt/ros/humble/setup.bash
+cd /workspace/sim_ws
+colcon build --packages-up-to simulation_hmi --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+source install/setup.bash
+ros2 launch simulation_hmi hmi.launch.py
+```
+
+启动面板后依次选择场景 → 启动仿真 → 选择出生点/目标点 → 生成机器人。两级台阶 A→B 支持“仅规划 → 开始执行”，三层楼九个点只支持放置与目标标记；其他两级台阶组合也只放置。停止/完成后需移除并重新生成机器人再开始新任务。
+
+Gazebo 独立窗口支持总览、俯视、楼层剖视、三层同屏和机器人跟随。消息框和状态来自实际 ROS 反馈，关闭面板时清理它自己启动的进程。预设点位集中在 [presets.yaml](sim_ws/src/simulation_hmi/config/presets.yaml)。
+
+默认使用独立 ROS_DOMAIN_ID=91 和 Gazebo master 11355；面板运行时，其他终端查询需 `export ROS_DOMAIN_ID=91`。它不接管已有命令行启动的仿真。中文依赖 `fonts-noto-cjk`，Qt 依赖 `python3-pyqt5`，均已加入 Dockerfile。现有容器已补齐字体，新建镜像会自动安装。

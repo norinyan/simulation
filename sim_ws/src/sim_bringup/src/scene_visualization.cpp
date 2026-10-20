@@ -12,6 +12,7 @@
 #include <QLabel>
 #include <QHBoxLayout>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <map>
 #include <chrono>
@@ -19,9 +20,16 @@
 namespace gazebo {
 class SceneVisualization final : public GUIPlugin {
  struct State {double t=0,x=0,y=0,z=0,yaw=0,speed=0,wait=0;std::string mode="WAITING";};
- transport::NodePtr node_;transport::SubscriberPtr sub_;event::ConnectionPtr render_;
+ transport::NodePtr node_;transport::SubscriberPtr sub_,pose_sub_;event::ConnectionPtr render_;
  msgs::Scene data_;std::vector<rendering::VisualPtr> visuals_;std::map<std::string,State> states_;
- std::map<std::string,rendering::VisualPtr> people_;std::mutex mutex_;
+ std::map<std::string,rendering::VisualPtr> people_,robot_links_,models_;
+ struct Surface {rendering::VisualPtr visual;float transparency;};
+ std::vector<Surface> occluders_;
+ std::map<std::string,ignition::math::Pose3d> robot_poses_;std::mutex mutex_;
+ std::string config_text_;bool follow_=false;std::vector<rendering::DynamicLines*> lines_;
+ std::chrono::steady_clock::time_point config_check_{};
+ ignition::math::Vector3d marker_start_,marker_goal_;bool markers_=false;
+ int robot_floor_=0;
  QLabel *labels_[3]{};std::string out_,world_,view_;int floor_=0;bool split_=false;bool ready_=false,saved_=false;double start_=-1,snapshot_after_=2;
  std::chrono::steady_clock::time_point previous_{};
  static int Floor(const std::string &s){return s.size()>1 && s[0]=='f' && s[1]>='1' && s[1]<='3'?s[1]-'0':0;}
@@ -43,6 +51,7 @@ class SceneVisualization final : public GUIPlugin {
    show();
   }else{setGeometry(0,0,0,0);hide();}
   node_.reset(new transport::Node());node_->Init(world_);sub_=node_->Subscribe("~/pedestrians/state",&SceneVisualization::Feedback,this);
+  pose_sub_=node_->Subscribe("~/pose/info",&SceneVisualization::Poses,this);
   render_=event::Events::ConnectPostRender(std::bind(&SceneVisualization::Render,this));
  }
  private:void Feedback(ConstGzStringPtr &message){
@@ -51,6 +60,55 @@ class SceneVisualization final : public GUIPlugin {
    if(it!=states_.end() && s.t>it->second.t)s.speed=std::hypot(s.x-it->second.x,s.y-it->second.y)/(s.t-it->second.t);
    states_[n["name"].as<std::string>()]=s;
   }catch(const std::exception &e){gzerr<<"Invalid pedestrian feedback: "<<e.what()<<"\n";}
+ }
+ void Poses(ConstPosesStampedPtr &message){
+  std::lock_guard<std::mutex> lock(mutex_);
+  for(const auto &pose:message->pose())if(pose.name()=="wheel_leg_robot" || pose.name().find("wheel_leg_robot::")==0)
+   robot_poses_[pose.name()]=msgs::ConvertIgn(pose);
+ }
+ void Configure(const rendering::ScenePtr &scene){
+  const auto now=std::chrono::steady_clock::now();
+  if(std::chrono::duration<double>(now-config_check_).count()<.2)return;
+  config_check_=now;std::ifstream file(out_+"/viewer.yaml");if(!file)return;
+  const std::string text((std::istreambuf_iterator<char>(file)),std::istreambuf_iterator<char>());
+  if(text==config_text_)return;
+  try{
+   auto config=YAML::Load(text);const auto view=config["view"].as<std::string>();
+   const int floor=config["floor"].as<int>();
+   if((view!="exterior"&&view!="top"&&view!="interior"&&view!="split")||floor<0||floor>3)return;
+   const bool layout=view!=view_||floor!=floor_||config["robot_generation"].as<int>(0)!=generation_;
+   generation_=config["robot_generation"].as<int>(0);
+   view_=view;floor_=floor;follow_=config["follow"].as<bool>(false);
+   markers_=config["start"] && config["goal"];
+   if(markers_){auto a=config["start"],b=config["goal"];marker_start_.Set(a[0].as<double>(),a[1].as<double>(),a[2].as<double>());marker_goal_.Set(b[0].as<double>(),b[1].as<double>(),b[2].as<double>());}
+   // Marker changes also rebuild the GUI hierarchy; physical models remain untouched.
+   const bool changed=text!=config_text_;config_text_=text;
+   if(layout||changed){
+    for(auto line:lines_)scene->WorldVisual()->DeleteDynamicLine(line);lines_.clear();
+    // Retain model/link visuals across view switches. Reusing their names after
+    // removal races Gazebo's render cache and can produce an empty viewport.
+    ready_=false;saved_=false;start_=-1;
+    const bool next_split=view_=="split";
+    if(next_split && !labels_[0]){
+     auto layout=new QHBoxLayout(this);
+     for(int i=0;i<3;++i){labels_[i]=new QLabel(this);labels_[i]->setMinimumWidth(400);layout->addWidget(labels_[i],1);}
+    }
+    split_=next_split;
+    if(split_){setGeometry(0,0,1920,80);setStyleSheet("background-color:rgba(14,26,38,230);color:white;");show();}
+    else hide();
+   }
+  }catch(const std::exception &e){gzerr<<"Viewer configuration: "<<e.what()<<"\n";}
+ }
+ int generation_=-1;
+ void Markers(const rendering::ScenePtr &scene){
+  if(!markers_)return;
+  for(int index=0;index<2;++index){auto p=index?marker_goal_:marker_start_;int floor=world_=="three_floor"?int(std::round(p.Z()/3.2))+1:0;
+   if(world_=="three_floor" && !Visible("marker",floor))continue;
+   auto display=DisplayPose(ignition::math::Pose3d(p,ignition::math::Quaterniond::Identity),floor).Pos();
+   auto line=scene->WorldVisual()->CreateDynamicLine(rendering::RENDERING_LINE_STRIP);lines_.push_back(line);
+   line->setMaterial(index?"Gazebo/Red":"Gazebo/Green");
+   for(int i=0;i<=32;++i){double a=2*M_PI*i/32;line->AddPoint(display+ignition::math::Vector3d(.3*std::cos(a),.3*std::sin(a),.05));}line->Update();
+  }
  }
  // Preserve the established floor isolation and wall cutaway rules.
  bool Visible(const std::string &name,int floor) const {
@@ -65,10 +123,15 @@ class SceneVisualization final : public GUIPlugin {
  }
  void SetCamera(const rendering::UserCameraPtr &camera){
   if(split_){camera->SetHFOV(ignition::math::Angle(M_PI/3));camera->SetWorldPose(ignition::math::Pose3d(0,0,57,0,M_PI/2,M_PI/2));return;}
+  camera->SetHFOV(ignition::math::Angle(follow_?80*M_PI/180:M_PI/3));
   const double z=(std::max(floor_,1)-1)*3.2;
   ignition::math::Vector3d position(-20,-23,z+20),target(0,0,z+.5);
   if(view_=="top"){position.Set(0,0,z+28);target.Set(0,0,z);}
   if(floor_==0){position.Set(-23,-26,22);target.Set(0,0,4);}
+  if(world_=="two_steps"){
+   target.Set(2.25,0,0);position.Set(13,-17,13);
+   if(view_=="top")position.Set(2.25,0,22);
+  }
   const auto delta=target-position;
   const double yaw=view_=="top"?M_PI/2:std::atan2(delta.Y(),delta.X());
   const double pitch=std::atan2(-delta.Z(),std::hypot(delta.X(),delta.Y()));
@@ -79,38 +142,89 @@ class SceneVisualization final : public GUIPlugin {
   for(const auto &m:data_.model()){
    auto old=scene->GetVisual(m.name());if(old)old->SetVisible(false);
    for(const auto &l:m.link())for(const auto &v:l.visual()){auto original=scene->GetVisual(v.name());if(original)original->SetVisible(false);}
-   const int floor=Floor(m.name());if(!floor)continue;
-   if(!Visible(m.name(),floor))continue;
-   const auto name="scene_view::"+m.name();rendering::VisualPtr root(new rendering::Visual(name,scene->WorldVisual()));root->Load();root->SetWorldPose(DisplayPose(msgs::ConvertIgn(m.pose()),floor));visuals_.push_back(root);
-   if(m.name().find("_pedestrian")!=std::string::npos)people_[m.name()]=root;
-   for(const auto &l:m.link()){
-    rendering::VisualPtr link(new rendering::Visual("scene_view::"+l.name(),root));link->Load();link->SetPose(msgs::ConvertIgn(l.pose()));visuals_.push_back(link);
-    for(const auto &original:l.visual())if(original.type()==msgs::Visual::VISUAL){msgs::Visual v=original;v.set_name("scene_view::"+original.name());v.set_parent_name(link->Name());v.clear_id();v.clear_parent_id();v.set_visible(true);rendering::VisualPtr leaf(new rendering::Visual(v.name(),link));ConstVisualPtr msg(new msgs::Visual(v));leaf->LoadFromMsg(msg);visuals_.push_back(leaf);}
+   const bool robot=m.name()=="wheel_leg_robot";
+   const int floor=robot?int(std::round((m.pose().position().z()-.32)/3.2))+1:Floor(m.name());
+   if(!robot && !floor && world_=="three_floor")continue;
+   const bool show=world_!="three_floor" || Visible(m.name(),floor);
+   if(robot)robot_floor_=floor;
+   auto found=models_.find(m.name());
+   if(found==models_.end()){
+    const auto name="scene_view::"+m.name();rendering::VisualPtr root(new rendering::Visual(name,scene->WorldVisual()));root->Load();visuals_.push_back(root);models_[m.name()]=root;
+    if(robot)robot_links_[m.name()]=root;
+    if(m.name().find("_pedestrian")!=std::string::npos)people_[m.name()]=root;
+    for(const auto &l:m.link()){
+     rendering::VisualPtr link(new rendering::Visual("scene_view::"+l.name(),root));link->Load();link->SetPose(msgs::ConvertIgn(l.pose()));visuals_.push_back(link);
+     if(robot)robot_links_[l.name()]=link;
+     for(const auto &original:l.visual())if(original.type()==msgs::Visual::VISUAL){
+      msgs::Visual v=original;v.set_name("scene_view::"+original.name());v.set_parent_name(link->Name());v.clear_id();v.clear_parent_id();v.set_visible(true);
+      rendering::VisualPtr leaf(new rendering::Visual(v.name(),link));ConstVisualPtr msg(new msgs::Visual(v));leaf->LoadFromMsg(msg);visuals_.push_back(leaf);
+      // Keep original transparency so leaving follow mode restores glass/materials.
+      if(m.name().find("wall")!=std::string::npos || m.name().find("door")!=std::string::npos ||
+         m.name().find("window")!=std::string::npos || m.name().find("lintel")!=std::string::npos)
+       occluders_.push_back({leaf,leaf->GetTransparency()});
+     }
+    }
    }
+   auto root=models_.at(m.name());root->SetWorldPose(DisplayPose(msgs::ConvertIgn(m.pose()),floor));root->SetVisible(show);
    if(split_)for(const auto &plugin:m.plugin())if(plugin.name()=="pedestrian_patrol"){
     const auto sdf=std::string("<sdf version='1.6'><model name='route'><link name='unused'/><plugin name='p' filename='unused'>")+plugin.innerxml()+"</plugin></model></sdf>";
     sdf::SDF parsed;parsed.SetFromString(sdf);auto p=parsed.Root()->GetElement("model")->GetElement("plugin");
-    auto line=scene->WorldVisual()->CreateDynamicLine(rendering::RENDERING_LINE_STRIP);line->setMaterial(floor==1?"Gazebo/Red":floor==2?"Gazebo/Blue":"Gazebo/Green");
+    auto line=scene->WorldVisual()->CreateDynamicLine(rendering::RENDERING_LINE_STRIP);lines_.push_back(line);line->setMaterial(floor==1?"Gazebo/Red":floor==2?"Gazebo/Blue":"Gazebo/Green");
     for(auto wp=p->GetElement("waypoint");wp;wp=wp->GetNextElement("waypoint")){auto v=wp->Get<ignition::math::Vector3d>("position");v.X()+=(floor-2)*22.;v.Z()=.035;line->AddPoint(v);}
     line->Update();
    }
   }
-  ready_=true;
+  // A removed robot has no physical model in the fresh Scene response.
+  if(models_.count("wheel_leg_robot")){
+   bool present=false;for(const auto &m:data_.model())if(m.name()=="wheel_leg_robot")present=true;
+   if(!present)models_.at("wheel_leg_robot")->SetVisible(false);
+  }
+  // A wide follow camera may sit behind a room wall. Fade only render surfaces;
+  // the physical walls, doors and windows retain their original collisions.
+  for(const auto &surface:occluders_)
+   surface.visual->SetTransparency(follow_?surface.transparency+(1-surface.transparency)*.72f:surface.transparency);
+  Markers(scene);ready_=true;
+ }
+ bool SaveImage(const QImage &image,const std::string &name){
+  const auto target=std::filesystem::path(out_)/name;
+  const auto temporary=std::filesystem::path(out_)/("."+name);
+  if(!image.save(QString::fromStdString(temporary.string()),"PNG"))return false;
+  std::error_code error;std::filesystem::rename(temporary,target,error);
+  return !error;
  }
  void Render(){
   auto wall=std::chrono::steady_clock::now();if(std::chrono::duration<double>(wall-previous_).count()<.045)return;previous_=wall;
   auto camera=gui::get_active_camera();if(!camera||!camera->GetScene())return;auto scene=camera->GetScene();
   camera->SetCaptureData(true);
+  Configure(scene);
   if(!ready_){Build(scene);if(ready_)SetCamera(camera);return;}
+  std::map<std::string,ignition::math::Pose3d> robot;
+  {std::lock_guard<std::mutex> lock(mutex_);robot=robot_poses_;}
+  for(const auto &pose:robot){
+   auto visual=robot_links_.find(pose.first);if(visual==robot_links_.end())continue;
+   // Gazebo pose/info model poses are world-relative; link poses are relative
+   // to the model. Preserve that hierarchy instead of applying the offset twice.
+   if(pose.first=="wheel_leg_robot")visual->second->SetWorldPose(DisplayPose(pose.second,robot_floor_));
+   else visual->second->SetPose(pose.second);
+  }
+  auto body=robot.find("wheel_leg_robot");
+  if(follow_ && body!=robot.end()){
+   auto target=DisplayPose(body->second,robot_floor_).Pos();target.Z()+=.25;
+   const double yaw=body->second.Rot().Yaw();auto position=target+ignition::math::Vector3d(-4.8*std::cos(yaw),-4.8*std::sin(yaw),4.8);
+   auto delta=target-position;camera->SetWorldPose(ignition::math::Pose3d(position,ignition::math::Quaterniond(0,std::atan2(-delta.Z(),std::hypot(delta.X(),delta.Y())),std::atan2(delta.Y(),delta.X()))));
+  }
   std::map<std::string,State> states;{std::lock_guard<std::mutex> lock(mutex_);states=states_;}
   if(split_)setFixedWidth(camera->ImageWidth());
   if(split_)for(int f=1;f<=3;++f){auto it=states.find("f"+std::to_string(f)+"_pedestrian");if(it!=states.end()){auto &s=it->second;labels_[f-1]->setText(QString("F%1 | %2 | sim %3 s<br/>actual speed %4 m/s | pause %5 s").arg(f).arg(QString::fromStdString(s.mode)).arg(s.t,0,'f',1).arg(s.speed,0,'f',2).arg(s.wait,0,'f',1));}}
   double sim=0;for(const auto &s:states){sim=std::max(sim,s.second.t);auto p=people_.find(s.first);if(p!=people_.end())p->second->SetWorldPose(DisplayPose(ignition::math::Pose3d(s.second.x,s.second.y,s.second.z,0,0,s.second.yaw),Floor(s.first)));}
-  if(states.size()!=3 || saved_)return;if(start_<0)start_=sim;
+  if(saved_)return;
+  if(world_=="three_floor" && states.size()!=3)return;
+  if(world_!="three_floor")sim=std::chrono::duration<double>(wall.time_since_epoch()).count();
+  if(start_<0)start_=sim;
   if(sim-start_<snapshot_after_)return;
   const auto *bytes=camera->ImageData();if(!bytes)return;int w=camera->ImageWidth(),h=camera->ImageHeight();
   QImage image(bytes,w,h,w*3,QImage::Format_RGB888);
-  if(!split_){saved_=image.save(QString::fromStdString(out_+"/scene_view.png"));return;}
+  if(!split_){saved_=SaveImage(image,"scene_view.png");return;}
   int crop=std::min(h,w*720/1920);QImage view=image.copy(0,(h-crop)/2,w,crop).scaled(1920,720,Qt::IgnoreAspectRatio,Qt::SmoothTransformation);
   QPainter painter(&view);painter.fillRect(0,0,1920,90,QColor(14,26,38));QFont font("DejaVu Sans",15);painter.setFont(font);
   for(int f=1;f<=3;++f){const auto &s=states.at("f"+std::to_string(f)+"_pedestrian");QColor color=f==1?QColor(240,95,70):f==2?QColor(80,170,250):QColor(85,220,120);painter.setPen(color);int x=(f-1)*640+18;
@@ -124,7 +238,7 @@ class SceneVisualization final : public GUIPlugin {
    sdf::SDF sdf;sdf.SetFromString("<sdf version='1.6'><model name='m'><link name='l'/><plugin name='p' filename='x'>"+plugin.innerxml()+"</plugin></model></sdf>");auto p=sdf.Root()->GetElement("model")->GetElement("plugin");int k=0;
    for(auto wp=p->GetElement("waypoint");wp;wp=wp->GetNextElement("waypoint")){auto point=wp->Get<ignition::math::Vector3d>("position");double x=(w/2.+(point.X()+(Floor(m.name())-2)*22.)*scale)*1920/w;double y=(h/2.-point.Y()*scale-(h-crop)/2.)*720/crop;painter.drawEllipse(QPointF(x,y),5,5);painter.drawText(QPointF(x+7,y-7),QString::number(++k));}
   }
-  painter.end();saved_=view.save(QString::fromStdString(out_+"/three_floors_top.png"));
+  painter.end();saved_=SaveImage(view,"three_floors_top.png");
  }
 };GZ_REGISTER_GUI_PLUGIN(SceneVisualization)
 }

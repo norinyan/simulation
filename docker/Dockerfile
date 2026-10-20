@@ -9,6 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-robot-state-publisher \
     python3-colcon-common-extensions \
     python3-lxml \
+    python3-pyqt5 \
+    fonts-noto-cjk \
     liburdfdom-tools \
     libceres-dev \
     mesa-utils \
