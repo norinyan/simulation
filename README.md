@@ -1,41 +1,35 @@
-# 轮足机器人仿真：使用与开发手册
+# 轮足机器人导航仿真
 
-ROS 2 Humble · Gazebo Classic · C++17。基于已知场景，完成 **A→E 轮式绕障 → E→X 足式攀爬 → X→B 轮式绕障停车**。
+基于 **ROS 2 Humble + Gazebo Classic 11** 的轮足机器人导航仿真项目。提供场景与动态障碍物、图形控制台（HMI）、全局与局部规划、机器人执行及结果记录，用于验证导航闭环，并为替换规划算法、比较运行结果提供统一接口。
 
-当前默认入口为 `simulation.launch.py`，默认只观察三层楼。原机器人任务需显式指定 `scene:=two_steps robot:=true`，场景/机器人分开启动方式见文末。
+[快速启动](#快速启动) · [技术栈](#技术栈) · [系统架构](#系统架构) · [核心流程](#核心流程) · [开发与验证](#开发与验证)
 
-目录：[演示效果](#demo) · [环境与运行](#run) · [模型与 ROS 接口](#interfaces) · [规划与自主任务](#planning) · [参数与开发](#development) · [结果与排查](#diagnostics)
+## 项目定位
 
-<a id="demo"></a>
+| 输入 | 处理 | 输出 |
+|---|---|---|
+| World 场景、机器人模型、起终点、规划与运动参数 | 场景几何提取 → 全局规划 → 局部规划 → 执行与反馈 | 规划路径、实际运动、任务状态、轨迹与结果记录 |
 
-## 1. 演示效果
+当前支持两种场景：
 
-[![场景总览，点击播放演示](doc/f1/scene-overview.png)](doc/f1/task-full-1.5x.mp4)
+| 场景 | 已实现能力 | 运行入口 |
+|---|---|---|
+| 两级台阶 `two_steps` | A→E 轮式绕障、E→X 足式上台阶、X→B 轮式到达停车 | HMI 选择 A→B，或命令行自动任务 |
+| 三层楼 `three_floor` | 每层三个预设点之间的同层轮式导航；三名行人往返；障碍冲突等待、恢复与必要时重规划 | HMI 选择同层不同点位 |
 
-**[播放完整任务录像：1.5 倍速，约 83 秒](doc/f1/task-full-1.5x.mp4)**。视频连续展示绕障、展腿、上台阶、收腿和到达 B 停车。
+当前采用 **运动学执行**，验证轨迹、碰撞和地面支撑，不包含动力学平衡、接触力或电机力矩控制。导航使用已知场景与仿真实际状态，不包含 SLAM 或传感器定位。三层楼跨层导航、自动轮足切换与电梯控制尚未实现；两级台阶已有固定任务的轮足切换，足式仅支持沿 +X 的平面上台阶运动。
 
-当前为 **Gazebo Classic 运动学执行**，不包含动力学平衡、接触力或电机力矩控制。场景、台阶和切换点预先配置，无在线建图或楼梯识别。
+![三层楼场景总览](doc/f2/gazebo_final_overview.png)
 
-<a id="run"></a>
+[两级台阶完整任务录像（1.5 倍速）](doc/f1/task-full-1.5x.mp4) · [三层楼正式图片](doc/f2)（各层俯视、内部透视及整体视图）。这些是既有演示素材，同屏图片中的行人路线属于历史配置，当前路线以 World 为准。
 
-## 2. 环境与运行
+## 快速启动
 
-### 开发环境
+### 1. 启动并进入容器
 
-| 项目 | 当前配置 |
-|---|---|
-| 系统 / ROS / 仿真 | 容器 Ubuntu 22.04、ROS 2 Humble、Gazebo Classic 11；素材采集版本为 11.10.2 |
-| 构建与依赖 | C++17、colcon、CMake、Ceres、yaml-cpp、TBB、Gazebo ROS、Xacro、robot_state_publisher |
-| 宿主机 | Docker Engine、Compose V2（支持 `gpus: all`）、NVIDIA 驱动与 Container Toolkit、X11 |
-| Compose / 容器 | 项目 `hfun-navi-simulation`，服务 `dev`，容器 `hfun-navi-simulation-dev-1` |
-| 通信域 | `ROS_DOMAIN_ID=73`，由 Compose 设置；ROS 查询在同一容器内执行 |
-| 挂载 | 宿主机 `/home/hfun/norin/lab/simulation` ↔ 容器 `/workspace`，双向可写 |
+当前容器环境为 Ubuntu 22.04、ROS 2 Humble、Gazebo Classic 11。宿主机需安装 Docker Engine、Compose V2、NVIDIA 驱动与 Container Toolkit，并提供 X11 图形桌面；现有 Compose 使用 `gpus: all`。
 
-配置见 [Dockerfile](docker/Dockerfile)、[compose.yaml](docker/compose.yaml)。项目换目录时只替换宿主机路径；镜像未锁定摘要，首次构建的小版本可能不同。
-
-### 首次构建
-
-**宿主机执行**，`xhost` 在图形桌面用户终端运行：
+在**宿主机图形桌面终端**执行，项目放在其他位置时替换第一行路径：
 
 ```bash
 cd /home/hfun/norin/lab/simulation
@@ -44,475 +38,284 @@ docker compose -f docker/compose.yaml up -d --build
 docker compose -f docker/compose.yaml exec dev bash
 ```
 
-**容器内执行**，编译工作空间：
+项目目录挂载到容器 `/workspace`。日常使用无需重新构建镜像，将 `up -d --build` 改为 `up -d`；已有容器也可用 `docker exec -it hfun-navi-simulation-dev-1 bash` 进入。
+
+### 2. 构建并启动 HMI
+
+在**容器内**执行：
 
 ```bash
 source /opt/ros/humble/setup.bash
 cd /workspace/sim_ws
-colcon build --packages-select planning sim_bringup \
+colcon build --packages-up-to simulation_hmi \
   --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-source /workspace/sim_ws/install/setup.bash
-```
-
-### 日常启动与新终端
-
-**宿主机执行**：无需重新构建镜像。
-
-```bash
-cd /home/hfun/norin/lab/simulation
-xhost +si:localuser:root
-docker compose -f docker/compose.yaml up -d
-docker compose -f docker/compose.yaml exec dev bash
-```
-
-<a id="terminal-environment"></a>
-
-**每个新容器终端执行**：后续运行、查询和编译均需先加载环境。
-
-```bash
-source /opt/ros/humble/setup.bash
-cd /workspace/sim_ws
-source /workspace/sim_ws/install/setup.bash
-echo "ROS_DISTRO=$ROS_DISTRO ROS_DOMAIN_ID=$ROS_DOMAIN_ID"
-```
-
-预期为 `humble`、`73`。
-
-<a id="full-task"></a>
-
-### 运行完整任务
-
-**容器内执行**：启动后自动规划并执行，无需服务调用。
-
-```bash
-source /opt/ros/humble/setup.bash
-cd /workspace/sim_ws
-source /workspace/sim_ws/install/setup.bash
-ros2 launch sim_bringup simulation.launch.py scene:=two_steps robot:=true \
-  planning:=true local_planning:=true foot_planning:=true autonomous:=true \
-  results_dir:=/workspace/sim_ws/results
-```
-
-四个开关必须同时启用，`autonomous` 不会自动打开其他规划。无界面运行在[分模式运行](#modes)中给出；`gui:=false` 不取消当前 Compose 的 GPU 要求。
-
-### 退出与重跑
-
-在启动终端按 `Ctrl+C`，等待整套 Launch 退出，再运行上述命令即可从 A 重来。`gzclient` 只负责显示，关闭窗口不保证 `gzserver` 和任务停止。
-
-当前没有项目级复位服务。自主任务中暂停可能触发反馈超时，重置仿真时间会触发 `SIMULATION_TIME_RESET`；不要用 Gazebo Reset 代替整套重启。中途退出可能没有最终结果文件。
-
-**宿主机执行**：不再使用容器时停止它，挂载数据保留；容器 shell 中的 `exit` 只退出当前终端。
-
-```bash
-cd /home/hfun/norin/lab/simulation
-docker compose -f docker/compose.yaml stop dev
-```
-
-<a id="interfaces"></a>
-
-## 3. 模型与 ROS 接口
-
-[![系统架构示意图](doc/f1/system-architecture.png)](doc/f1/system-architecture.png)
-
-| 位置 / 组件 | 职责 |
-|---|---|
-| [planning](sim_ws/src/planning) | 全局 A*、轮式 TEB、足步 A* 与五次轨迹的 C++ 库，不是独立 ROS 节点 |
-| [planning_node.cpp](sim_ws/src/sim_bringup/src/planning_node.cpp) | 同一节点调用三类算法，负责自主调度、反馈控制、可视化和结果记录 |
-| [robot_executor.cpp](sim_ws/src/sim_bringup/src/robot_executor.cpp) | Gazebo ModelPlugin，加载在 gzserver 内，执行运动、轮足切换与保护；不能独立 `ros2 run` |
-| [robot.urdf.xacro](sim_ws/src/sim_bringup/urdf/robot.urdf.xacro) | 连杆、关节、碰撞和插件声明；spawn_entity.py 在 A 生成模型后退出 |
-| [two_steps.world](sim_ws/src/sim_bringup/worlds/two_steps.world) | 实际平台、台阶、障碍和围墙 |
-| [simulation.launch.py](sim_ws/src/sim_bringup/launch/simulation.launch.py) | 总入口组合 scene.launch.py 与可选 robot.launch.py；状态发布器根据 joint_states 发布关节 TF |
-| `doc/` | 本手册使用的图片与完整演示视频 |
-
-[![ROS 2 通信与闭环信号](doc/f1/ros2-communication-and-feedback.png)](doc/f1/ros2-communication-and-feedback.png)
-
-| Topic | 消息类型 | 用途 / 出现条件 |
-|---|---|---|
-| `/planning/global_path` | `nav_msgs/msg/Path` | 全局路径与台阶参考；planning |
-| `/planning/status` | `std_msgs/msg/String` | 全局结果、原因与输出目录；planning |
-| `/planning/local_path` | `nav_msgs/msg/Path` | TEB 预测；local_planning |
-| `/planning/local_status` | `std_msgs/msg/String` | 单次预测结果或闭环规划状态；local_planning |
-| `/planning/footstep_path` | `nav_msgs/msg/Path` | 规划落脚点；foot_planning |
-| `/planning/foot_trajectory` | `trajectory_msgs/msg/MultiDOFJointTrajectory` | 规划机身与双足轨迹；foot_planning |
-| `/planning/foot_status` | `std_msgs/msg/String` | 足式规划结果；foot_planning |
-| `/planning/task_status` | `std_msgs/msg/String` | 任务阶段、终态和原因；autonomous |
-| `/robot/cmd_vel` | `geometry_msgs/msg/TwistStamped` | 带时间戳的轮式速度指令，frame 为 base_link |
-| `/robot/mode_command` | `std_msgs/msg/String` | 形态指令、心跳与内部停止指令 |
-| `/robot/foot_trajectory` | `trajectory_msgs/msg/MultiDOFJointTrajectory` | 自主调度发送给插件的执行轨迹 |
-| `/robot/odom` | `nav_msgs/msg/Odometry` | 实际模型位姿与速度，world → base_link |
-| `/robot/foot_feedback` | `trajectory_msgs/msg/MultiDOFJointTrajectory` | 实际机身与双足碰撞中心位姿，单个采样 |
-| `/robot/execution_status` | `std_msgs/msg/String` | 执行阶段、形态或保护失败原因 |
-| `/joint_states` | `sensor_msgs/msg/JointState` | 插件发布的关节位置 |
-| `/clock` | `rosgraph_msgs/msg/Clock` | 仿真时间 |
-
-足式轨迹与反馈按 `body`、`left_foot_center`、`right_foot_center` 排列。`/planning/*` 是规划输出；`/robot/odom` 和 `/robot/foot_feedback` 才是实际仿真运动反馈，不能相互替代。
-
-<a id="planning"></a>
-
-## 4. 规划与自主任务
-
-<a id="modes"></a>
-
-### 分模式运行
-
-[Launch](sim_ws/src/sim_bringup/launch/simulation.launch.py) 参数如下：
-
-| 参数 | 默认值 | 作用与依赖 |
-|---|---|---|
-| `scene` | `three_floor` | 场景选择：three_floor 或 two_steps；以下机器人示例均显式选择 two_steps |
-| `robot` | `false` | 加载机器人与可选规划控制，当前只支持 two_steps |
-| `gui` | `true` | 是否启动 gzclient，关闭后保留服务端 |
-| `planning` | `false` | 启动 planning_node，生成全局规划 |
-| `local_planning` | `false` | 启用轮式 TEB，依赖 planning |
-| `foot_planning` | `false` | 启用足步与五次轨迹，依赖 planning |
-| `autonomous` | `false` | 完整任务需前三项全部启用 |
-| `results_dir` | `~/.local/state/simulation/global_planning` | 输出根目录，每次创建独立 run_* 子目录 |
-
-以下命令均在**容器内**[加载环境](#terminal-environment)后执行。切换模式前先用 `Ctrl+C` 退出旧 Launch，避免重复节点或服务端。单次规划只输出结果，机器人保持在 A，不自动行驶。
-
-**仅场景、机器人与执行插件**：检查模型和实际反馈，无 planning_node。
-
-```bash
-ros2 launch sim_bringup simulation.launch.py scene:=two_steps robot:=true \
-  planning:=false local_planning:=false foot_planning:=false autonomous:=false
-```
-
-**仅全局 A***：显示蓝色平台路径和橙色台阶参考。
-
-```bash
-ros2 launch sim_bringup simulation.launch.py scene:=two_steps robot:=true \
-  planning:=true local_planning:=false foot_planning:=false autonomous:=false \
-  results_dir:=/workspace/sim_ws/results
-```
-
-**轮式 TEB 单次预测**：分别从 A / X 的静止状态生成绿色短时域预测。
-
-```bash
-ros2 launch sim_bringup simulation.launch.py scene:=two_steps robot:=true \
-  planning:=true local_planning:=true foot_planning:=false autonomous:=false \
-  results_dir:=/workspace/sim_ws/results
-```
-
-**足步与五次轨迹规划**：输出 E→X 足印和轨迹，不自动展腿。
-
-```bash
-ros2 launch sim_bringup simulation.launch.py scene:=two_steps robot:=true \
-  planning:=true local_planning:=false foot_planning:=true autonomous:=false \
-  results_dir:=/workspace/sim_ws/results
-```
-
-**全部规划、不执行**：同时检查三类算法输出。
-
-```bash
-ros2 launch sim_bringup simulation.launch.py scene:=two_steps robot:=true \
-  planning:=true local_planning:=true foot_planning:=true autonomous:=false \
-  results_dir:=/workspace/sim_ws/results
-```
-
-**完整自主任务**使用[前面的启动命令](#full-task)；**无界面完整任务**如下，其他模式也可追加 `gui:=false`：
-
-```bash
-ros2 launch sim_bringup simulation.launch.py scene:=two_steps robot:=true \
-  gui:=false planning:=true local_planning:=true foot_planning:=true autonomous:=true \
-  results_dir:=/workspace/sim_ws/results
-```
-
-### 任务流程与可视化
-
-[![自主任务执行流程](doc/f1/autonomous-task-flow.png)](doc/f1/autonomous-task-flow.png)
-
-任务自动经过等待执行器、A→E、展腿、E→X、收腿、X→B。轮式阶段根据实际里程计闭环运行 TEB，足式阶段执行预先生成的轨迹，不在线重规划足步。当前足式只支持同 Y、零 yaw、沿 +X 上楼。
-
-`DONE` 表示实际到达 B 并以轮式停车：位置误差 ≤0.002 m、朝向误差 <0.0005 rad，机身高度误差 <0.006 m，实际线速度和角速度绝对值分别 <0.001 m/s、<0.001 rad/s。检查或保护失败进入 `FAILED`，原因随状态发布。
-
-[![图2：全部规划、不执行](doc/f1/planning-overview.png)](doc/f1/planning-overview.png)
-
-蓝色为全局路径，绿色为 TEB 预测，橙色阶梯线为台阶几何参考；青色/橙色足印分别为左/右脚规划落脚区域，均无碰撞体。TEB 接近目标时自然缩短，退出轮式阶段会清理，不代表已走过的轨迹。
-
-[![图5：足式攀爬](doc/f1/stair-climbing.png)](doc/f1/stair-climbing.png)
-
-Gazebo 中双击机器人聚焦，左键拖动平移、中键拖动旋转、滚轮缩放，也可选择 `wheel_leg_robot` 后用 Follow 跟随。观察时使用选择工具，避免拖动模型；路径由 Gazebo Transport 显示，无需 RViz。
-
-<a id="development"></a>
-
-## 5. 参数与开发
-
-### 配置、场景与模型
-
-| 文件 | 修改内容与同步要求 |
-|---|---|
-| [planning.yaml](sim_ws/src/sim_bringup/config/planning.yaml) | 规划和任务参数；节点启动时、插件加载时读取 |
-| [scene.yaml](sim_ws/src/sim_bringup/config/scene.yaml) | 已知几何、A/E/X/B 和机器人规划尺寸，须与 World、Xacro 一致 |
-| [two_steps.world](sim_ws/src/sim_bringup/worlds/two_steps.world) | 修改实际地形/障碍时同步 scene 和点位标记；GUI 改动不会反写 YAML |
-| [robot.urdf.xacro](sim_ws/src/sim_bringup/urdf/robot.urdf.xacro) | 修改模型时同步 scene.robot 的尺寸、安装角、限位和完整轮式占用 |
-
-下表为 **YAML 当前值**，名称相对 `planning_node.ros__parameters`，其他选项见配置文件。
-
-| 参数 | 当前值 | 作用 |
-|---|---|---|
-| `resolution` / `safety_margin` | 0.05 / 0.05 m | 全局网格 / 额外净距 |
-| `motion.max_v` / `motion.max_w` | 0.30 m/s / 0.80 rad/s | 轮式速度上限 |
-| `motion.max_a` / `motion.max_alpha` | 0.30 m/s² / 1.0 rad/s² | 轮式加速度上限 |
-| `motion.time_horizon` / `teb.spacing` | 6.0 s / 0.15 m | 预测时域 / 初始空间采样 |
-| `teb.iterations` / `teb.solver_time_limit` | 30 / 0.10 s | 单次求解上限，闭环会收紧时间预算 |
-| `foot.max_step` / `foot.swing_clearance` | 0.50 / 0.08 m | 最大步长 / 摆脚抬高量 |
-| `foot.step_duration` / `foot.sample_dt` | 4.5 / 0.02 s | 每步时长 / 轨迹采样间隔 |
-| `foot.max_joint_v` / `foot.max_joint_a` | 2.0 rad/s / 20.0 rad/s² | 腿部关节运动上限 |
-| `foot.max_body_v` / `foot.max_body_a` | 0.3 m/s / 1.0 m/s² | 机身运动上限 |
-| `foot.max_foot_v` / `foot.max_foot_a` | 0.8 m/s / 3.0 m/s² | 足端运动上限 |
-| `foot.body_height` / `foot.wheel_lift` | 0.43 / 0.13 m | 足式机身相对支撑地面高度 / 轮架提升量 |
-| `task.morph_duration` | 4.0 s | 每次轮足切换时长 |
-| `task.feedback_timeout` / `task.command_timeout` | 1.0 / 0.8 s | 反馈与心跳保护 / 速度指令有效期 |
-| `task.stage_timeout` / `task.timeout` | 240 / 600 s | 阶段 / 总任务仿真时间上限，另有墙钟保护 |
-
-未加载 YAML 时，C++ 默认 `motion.time_horizon=2.2 s`、`foot.step_duration=9.0 s`、`foot.max_joint_v=1.0 rad/s`，与上表不同。URDF 腿关节限速为 2.0 rad/s，相对安装角范围为 ±1.57 rad。
-
-足式提速需同时满足关节、机身、足端速度/加速度及可达性、支撑和碰撞约束；减小 `sample_dt` 只增加采样，加快播帧不能替代轨迹提速。
-
-关键点是 `[x,y,ground_z,yaw]`：A=`[-4.5,0,0,0]`、E=`[1.6,0,0,0]`、X=`[3.3,0,0.34,0]`、B=`[9,0,0.34,0]`，单位 m、rad。两级台阶各高 0.17 m、深 0.35 m。注意区分：
-
-- **地面 Z**：下层 0、上层 0.34 m；全局路径使用此高度。
-- **base_link Z**：轮式为地面 +0.32 m，A/B 分别为 0.32/0.66 m；足式等高支撑时为地面 +0.43 m，跨阶随轨迹变化。
-- **足部碰撞中心 Z**：落地时为支撑面 +0.0175 m，且相对足 link 向前偏移 0.0725 m。
-
-Launch 固定加载安装目录的 `worlds/two_steps.world`，只改 `scene.world_file` 不会换场景。当前为普通 colcon 安装，配置、模型和 Launch 改后也需重新安装并重启；`ros2 param set` 不会让规划与执行插件同步实时生效。
-
-### 统一规划接口与同层导航
-
-算法选择位于 `planning.yaml` 的 `planners.global / wheel / foot`，默认 `astar / teb / footstep`；公共轮式约束位于 `motion`，TEB 求解器设置留在 `teb`。显式传入的旧 `teb.max_v` 等 ROS 参数仍作为公共参数别名；YAML 已统一迁移。参数在启动时固定，修改算法或约束须重启节点。
-
-`scene.yaml` 的 `task_route: [A, E, X, B]` 解析为轮式、足式、轮式路段。三层楼同层任务采用 `[start, goal]`，从 HMI 生成的任务快照及实际加载的 World 提取障碍和楼板支撑；三层楼跨层任务尚未开放。
-
-开发新算法时，实现 `GlobalPlanner`、`WheelLocalPlanner` 或 `FootLocalPlanner`，在对应 `make*Planner` 工厂中注册并加入构建。节点统一通过 `runPlanner` 调用、校验结果；无需修改 HMI、World 或执行器。算法不读 ROS/Gazebo，须遵守请求的运动约束及 `PlanControl` 协作式取消／时间预算。
-
-规划与局部求解在工作线程执行，ROS 回调继续处理停止和反馈。取消、超时和不合法输出不能产生后续运动。旧 CSV 列保持不变；每次结果目录增加 `planner_config.yaml`，记录算法、参数和场景快照。
-
-### 修改入口与验证
-
-| 想修改什么 | 文件 | 验证方式 |
-|---|---|---|
-| 全局 A* | [astar.h](sim_ws/src/planning/include/astar.h)、[global_planner.h](sim_ws/src/planning/include/global_planner.h)、[astar.cpp](sim_ws/src/planning/src/global/astar.cpp) | 重编两包；仅全局模式，检查 status、path 和 result.csv |
-| 轮式 TEB | [teb_optimizer.h](sim_ws/src/planning/include/teb_optimizer.h)、[local_planner.h](sim_ws/src/planning/include/local_planner.h)、[teb_optimizer.cpp](sim_ws/src/planning/src/local/wheel/teb_optimizer.cpp) | 重编两包；单次预测后验证完整闭环任务 |
-| 足步与五次轨迹 | [footstep_planner.h](sim_ws/src/planning/include/footstep_planner.h)、[footstep_planner.cpp](sim_ws/src/planning/src/local/foot/footstep_planner.cpp) | 重编两包；检查 foot_status、足式 CSV 和实际执行 |
-| 调度、反馈控制、可视化 | [planning_node.cpp](sim_ws/src/sim_bringup/src/planning_node.cpp) | 重编 sim_bringup；检查任务状态、路径/足印和实际轨迹 |
-| 执行、轮足切换与反馈 | [robot_executor.cpp](sim_ws/src/sim_bringup/src/robot_executor.cpp) | 重编 sim_bringup；重启整套 Launch，验证反馈与完整任务 |
-| Launch、依赖和安装 | [Launch](sim_ws/src/sim_bringup/launch/simulation.launch.py)、[sim_bringup CMake](sim_ws/src/sim_bringup/CMakeLists.txt) / [package.xml](sim_ws/src/sim_bringup/package.xml)、[planning CMake](sim_ws/src/planning/CMakeLists.txt) / [package.xml](sim_ws/src/planning/package.xml) | 重编受影响包，检查资源安装与对应模式 |
-
-**容器内执行：只修改 sim_bringup（含配置、模型和 Launch）。** 前提是 planning 已安装。
-
-```bash
-source /opt/ros/humble/setup.bash
-cd /workspace/sim_ws
-source /workspace/sim_ws/install/setup.bash
-colcon build --packages-select sim_bringup \
-  --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-source /workspace/sim_ws/install/setup.bash
-```
-
-**容器内执行：修改 planning 库、公共接口或两包。** 同时重编依赖方。
-
-```bash
-source /opt/ros/humble/setup.bash
-cd /workspace/sim_ws
-colcon build --packages-select planning sim_bringup \
-  --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-source /workspace/sim_ws/install/setup.bash
-```
-
-planning 库安装到 `install/planning/lib`。重新 source 后仍需重启节点；插件/模型变化需重启整套 Launch。已有 [A*](sim_ws/src/planning/test/astar_test.cpp)、[TEB](sim_ws/src/planning/test/teb_test.cpp) 测试可用 `-DBUILD_TESTING=ON` 构建，再在容器内执行 `colcon test --packages-select planning` 和 `colcon test-result --verbose`；当前无独立足式测试目标。
-
-<a id="diagnostics"></a>
-
-## 6. 结果与排查
-
-### 结果文件
-
-本手册指定的输出位于容器 `/workspace/sim_ws/results/run_*/`，对应宿主机 `simulation/sim_ws/results/run_*/`。每次 planning_node 运行独立建目录，状态中的 `output=` 指向本次结果。
-
-不传 `results_dir` 时，Launch 默认写入启动用户的 `~/.local/state/simulation/global_planning/run_*/`；当前容器通常在 `/root` 下，不在项目挂载中。独立运行节点使用参数 `output_dir`，其 C++ 默认优先使用绝对路径 `XDG_STATE_HOME`，否则使用 HOME 下的状态目录，再回退到临时目录。
-
-| CSV | 用途 |
-|---|---|
-| **task_result.csv** | 先看终态、失败原因、到达误差和停车速度 |
-| **task_events.csv** | 再看阶段切换和切换时的实际状态 |
-| **actual_trajectory.csv** | 检查实际机身、双足运动与速度 |
-| teb_execution.csv | 闭环 TEB 的各次预测、初始反馈和规划耗时 |
-| path.csv / result.csv | 全局路径与规划结果，台阶段仅为几何参考 |
-| local_trajectory.csv / local_result.csv | 启动时两段单次 TEB 预测，非实际轨迹 |
-| footstep_path.csv / foot_trajectory.csv | 规划落脚序列、机身与双足轨迹 |
-
-单次模式只生成对应规划文件；完整任务另有执行记录。FAILED 或手动中断可能导致部分记录或文件缺失。[.gitignore](.gitignore) 忽略 `sim_ws/{build,install,log,results}` 和 `.docker-data`；其他目录中的 CSV 不会自动忽略。
-
-### 查询状态与日志
-
-以下均在**另一个容器终端**[加载环境](#terminal-environment)后执行。
-
-**检查节点、Topic、安装路径和实际参数：**
-
-```bash
-ros2 node list
-ros2 topic list -t
-ros2 node info /planning_node
-ros2 topic info /robot/odom --verbose
-ros2 pkg prefix --share sim_bringup
-ros2 param get /planning_node motion.time_horizon
-```
-
-**读取任务和执行状态：** 持续观察时去掉 `--once`。
-
-```bash
-ros2 topic echo /planning/task_status std_msgs/msg/String --once \
-  --qos-durability transient_local --qos-reliability reliable \
-  --qos-history keep_last --qos-depth 1
-ros2 topic echo /robot/execution_status std_msgs/msg/String --once \
-  --qos-durability transient_local --qos-reliability reliable \
-  --qos-history keep_last --qos-depth 1
-```
-
-`/planning/*` 使用 reliable + transient_local；local_path、local_status 深度 2，其余深度 1。查询 `/planning/status`、`/planning/foot_status` 可沿用上述 QoS；查询 local_status 用深度 2 并持续接收。历史消息只在发布者存活时保留。
-
-**读取实际运动与仿真时钟：** `hz` 持续采样，按 `Ctrl+C` 退出。
-
-```bash
-ros2 topic echo /robot/odom nav_msgs/msg/Odometry --once
-ros2 topic echo /robot/foot_feedback trajectory_msgs/msg/MultiDOFJointTrajectory --once
-ros2 topic echo /clock rosgraph_msgs/msg/Clock --once
-ros2 topic hz /robot/odom
-```
-
-优先看启动终端的 planning_node / gzserver 日志；ROS 日志默认在 `~/.ros/log`。仿真经 `docker compose exec` 启动，`docker compose logs` 不包含完整前台任务日志。
-
-**容器内执行：搜索 ROS 日志。**
-
-```bash
-simulation_log_dir="${ROS_LOG_DIR:-$HOME/.ros/log}"
-find "$simulation_log_dir" -type f -name '*.log' \
-  -exec grep -nE 'FAILED|ERROR|FATAL|TIMEOUT|Exception' {} +
-```
-
-### 常见问题
-
-| 现象 | 查看与检查 |
-|---|---|
-| Gazebo 无界面 | 确认 gui 开关；查 gzclient 错误、DISPLAY、X11 授权/挂载、NVIDIA 驱动和 Toolkit。用 clock/odom 判断服务端是否仍在运行，避免重复启动 |
-| 节点或 Topic 不存在 | 查 Launch 开关、启动日志、overlay 和域 73；task_status 仅在 autonomous 下出现。clock 不前进会阻止首次规划，spawn/插件错误查 gzserver |
-| 修改未生效 | 确认包安装路径，重新安装、source 并重启；param get 不证明插件已重读配置 |
-| 全局规划失败 | 查 planning/status、result.csv；检查边界、端点、占用、安全余量和栅格上限 |
-| TEB 不可行 | 查 local_status、local_result.csv 或任务中的 LOCAL_EXECUTION_PLAN 原因；检查初始碰撞、参考路径距离、净距、运动约束、时域与采样 |
-| 足式规划失败 | 查 foot_status；检查落脚支撑、边缘余量、IK、限位、碰撞及机身/足端/关节运动约束，不只调整步长或周期 |
-| 执行器未就绪 / 姿态不符 | EXECUTOR_STARTUP_TIMEOUT 查模型、插件、订阅者；INITIAL_POSE_OR_MODE_MISMATCH 查 A 点 odom 和 READY_WHEEL，不只重启任务节点接管半途机器人 |
-| 反馈或指令超时 | EXECUTION_FEEDBACK_TIMEOUT 查反馈时间戳和频率；PLANNER_HEARTBEAT_TIMEOUT、VELOCITY_COMMAND_TIMEOUT 查规划耗时与指令更新；GAZEBO_UPDATE_TIMEOUT 查暂停或卡顿 |
-| 阶段 / 任务超时 | TASK_OR_STAGE_TIMEOUT 查 task_events 最后阶段、实际轨迹是否停滞和 TEB 耗时，再判断运动设置与超时预算是否匹配 |
-| 时间重置 / 执行保护 | SIMULATION_TIME_RESET 需整套重启；碰撞、IK、入口或终点不匹配需查执行状态、World/scene/模型一致性及是否拖动过模型 |
-
-
-## 场景与机器人启动入口
-
-入口按职责划分，场景和机器人共用 `master_uri`，所有 ROS 节点使用仿真时间；两个终端运行时也需使用相同 ROS_DOMAIN_ID。默认观察三层场景，不加载机器人。本手册前面的机器人示例均显式选择 `scene:=two_steps robot:=true`。
-
-```text
-launch/
-├── simulation.launch.py       总入口：选择场景，组合场景与可选机器人
-├── scene.launch.py            Gazebo、场景插件、可选可视化
-└── robot.launch.py            向已有 two_steps 场景加载机器人、规划控制
-
-src/
-├── scene_visualization.cpp    整楼、单层、内部透视、三层同屏，共用显示逻辑
-├── scene_controller.cpp       当前实现行人往返控制，独立于 GUI 运行
-├── robot_executor.cpp         机器人执行器
-└── planning_node.cpp          机器人规划节点
-```
-
-宿主机进入容器并加载环境：
-
-```bash
-docker exec -it hfun-navi-simulation-dev-1 bash
-source /opt/ros/humble/setup.bash
-source /workspace/sim_ws/install/setup.bash
-```
-
-**总入口**，下面的命令按需单独运行，退出旧实例后再切换：
-
-```bash
-# 默认三层场景、整楼总览，不加载机器人
-ros2 launch sim_bringup simulation.launch.py
-
-# 第二层俯视或内部透视；floor 支持 1、2、3
-ros2 launch sim_bringup simulation.launch.py floor:=2 view:=top
-ros2 launch sim_bringup simulation.launch.py floor:=2 view:=interior
-
-# 三层同屏，目标 5 倍速度
-ros2 launch sim_bringup simulation.launch.py view:=split real_time_factor:=5
-
-# 原 two_steps 场景与机器人，不开启规划
-ros2 launch sim_bringup simulation.launch.py scene:=two_steps robot:=true
-
-# 原 two_steps 完整自主任务；规划与控制逻辑不变
-ros2 launch sim_bringup simulation.launch.py scene:=two_steps robot:=true \
-  planning:=true local_planning:=true foot_planning:=true autonomous:=true
-```
-
-**分开启动**时，两个终端均先加载环境。终端一只运行场景：
-
-```bash
-ros2 launch sim_bringup scene.launch.py scene:=two_steps
-```
-
-终端二加载机器人和可选规划，不再启动第二个 Gazebo：
-
-```bash
-ros2 launch sim_bringup robot.launch.py scene:=two_steps planning:=true
-```
-
-`spawn_entity` 自行等待 Gazebo 的服务就绪，无固定延时加载机器人。单独启动 robot 入口前应确认服务端是 two_steps，且两个终端共用同一通信域和 Gazebo master；该入口不会自动探测或切换已有场景。
-
-| 场景参数 | 默认值 | 说明 |
-|---|---|---|
-| `scene` | `three_floor` | 总入口、场景入口的默认场景；机器人子入口默认 two_steps |
-| `robot` | `false` | 仅总入口提供，当前只允许搭配 two_steps |
-| `gui` | `true` | 关闭后仍运行场景动态控制与机器人节点 |
-| `view` | `exterior` | exterior、top、interior、split；two_steps 支持总览和俯视 |
-| `floor` | `0` | 三层场景中 0 表示整楼，top/interior 指定 1、2、3，split 为 0；two_steps 为 0 |
-| `real_time_factor` | `1` | 目标倍率 1～10，实际受负载限制；行人观察可用 5，机器人闭环任务默认 1 |
-| `snapshot_after` | `2` | 三层观察就绪后经过的仿真秒数，保存一次截图，之后继续实时显示 |
-| `output_dir` | 自动生成的时间戳目录 | 容器 ~/.local/state/simulation/ 下，保存运行时 World 与截图 |
-| `master_uri` | `http://127.0.0.1:11345` | 三个入口共用；同机多实例须使用不同端口和 ROS_DOMAIN_ID |
-
-入口整理阶段的历史记录：目标 5 倍运行原 two_steps 闭环自主任务时，新入口和 Git 原入口均出现 `TEB_EXECUTION_PLAN: START_FOOTPRINT_COLLISION`；该倍率下未通过完整任务验收。构建、场景观察、机器人加载和三类静态规划输出已检查通过；本次未修改规划算法、执行器或保护阈值。
-
-`scene:=three_floor robot:=true` 暂不支持，直接报错。没有机器人却开启规划，或开启自主任务却缺少所需规划开关，也会在启动进程前报错。该总入口仍用于场景观察；三层楼同层导航通过 HMI 的点位任务快照启动，操作见 [面板说明](sim_ws/src/simulation_hmi/README.md)。
-
-正式图片保存在 [doc/f2](doc/f2)：整楼总览、三层各自俯视图和内部透视图，以及三层同屏路线图。单层图片来自静态场景完成时，同屏图保留当时的行人路线；当前路线以 World 配置为准。新运行保存 `scene_view.png` 或 `three_floors_top.png`，不覆盖文档图片。场景的楼层隐藏、平移和剖面仅改变 GUI，不修改物理模型或碰撞。
-
-行人速度、路径及停顿直接修改 `worlds/three_floor.world` 中三个 `pedestrian_patrol` 插件：`speed` 为 m/s，`start_delay` 为秒，`initial_direction` 为 forward / reverse；waypoint 的 position 是世界坐标、pause 是秒。脚底 Z 为 0 / 3.2 / 6.4 m。路径依次经过门洞及走廊中间点，到终点后原路返回。三层统一从左下房间 `(-4, -4.45)` 到右下房间 `(4, -4.45)` 水平直线往返，端点各停 8 s；各层速度与启动延迟保留。
-
-`scene_controller.cpp` 目前只实现带真实 Box 碰撞体的运动学行人，不包含腿部动画、自主避障或电梯控制。World 中加载 `libscene_controller.so`；GUI 使用 `libscene_visualization.so`。场景 Launch 显式设置插件路径，不再依赖 env-hooks。直接用 gzserver 打开 World 时需自行设置 GAZEBO_PLUGIN_PATH。
-
-修改源码或源 World 后，在容器中重新构建并重启：
-
-```bash
-source /opt/ros/humble/setup.bash
-cd /workspace/sim_ws
-colcon build --packages-select sim_bringup --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-source install/setup.bash
-```
-
-## 图形仿真控制台（HMI 第一版）
-
-独立包为 [simulation_hmi](sim_ws/src/simulation_hmi/README.md)。容器内构建、启动：
-
-```bash
-source /opt/ros/humble/setup.bash
-cd /workspace/sim_ws
-colcon build --packages-up-to simulation_hmi --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
 source install/setup.bash
 ros2 launch simulation_hmi hmi.launch.py
 ```
 
-启动面板后依次选择场景 → 启动仿真 → 选择出生点/目标点 → 生成机器人。两级台阶 A→B 支持“仅规划 → 开始执行”，三层楼九个点只支持放置与目标标记；其他两级台阶组合也只放置。停止/完成后需移除并重新生成机器人再开始新任务。
+已完成构建后，每个新容器终端只需加载环境并启动：
 
-Gazebo 独立窗口支持总览、俯视、楼层剖视、三层同屏和机器人跟随。消息框和状态来自实际 ROS 反馈，关闭面板时清理它自己启动的进程。预设点位集中在 [presets.yaml](sim_ws/src/simulation_hmi/config/presets.yaml)。
+```bash
+source /opt/ros/humble/setup.bash
+source /workspace/sim_ws/install/setup.bash
+ros2 launch simulation_hmi hmi.launch.py
+```
 
-默认使用独立 ROS_DOMAIN_ID=91 和 Gazebo master 11355；面板运行时，其他终端查询需 `export ROS_DOMAIN_ID=91`。它不接管已有命令行启动的仿真。中文依赖 `fonts-noto-cjk`，Qt 依赖 `python3-pyqt5`，均已加入 Dockerfile。现有容器已补齐字体，新建镜像会自动安装。
+### 3. HMI 界面与操作
 
-导航改造范围、分阶段状态及实际验收结果见 [导航 PRD](doc/prd_navigation.md)。
+![HMI 实际界面：三层楼同层任务已完成规划，等待开始执行](doc/f2/hmi_panel.png)
+
+上图为实际启动后的面板，选择三层楼 **F1-ENTRY→F1-ROOM**、5 倍目标倍率，已生成机器人并完成“仅规划”，尚未执行；Gazebo 场景在独立窗口显示。
+
+| 界面区域 | 用途与操作 |
+|---|---|
+| **1 · 仿真场景** | 选择两级台阶／三层楼及倍率；“启动仿真”创建会话，“关闭仿真”结束整套会话。更换场景或倍率需先关闭仿真 |
+| **2 · 机器人与预设点位** | 选择出生点、目标点，核对下方地面坐标与朝向，再“生成机器人”；重选出生点使用“移除机器人 / 重选出生点” |
+| **3 · 规划与执行** | “仅规划”生成路径；成功后“开始执行”可用；“停止运动”取消本次任务并停车 |
+| **4 · 观察视角** | 总览看整体，俯视／内部透视配合楼层选择，三层同屏同时观察各层；“跟随机器人”启用第三人称宽视野，“恢复所选视角”退出跟随 |
+| **底部状态与消息框** | 查看实际仿真时间、机器人位置、任务状态与失败原因；按钮不可用时，先检查是否就绪、点位组合及倍率是否受支持 |
+
+以三层楼一层任务为例：
+
+1. 选择“三层楼”和“正常速度 · 1 倍”，点击“启动仿真”，等待场景就绪。
+2. 出生点选 `F1-ENTRY`、目标点选 `F1-ROOM`，点击“生成机器人”，等待实际位置和执行器就绪。
+3. 点击“仅规划”。成功后可在 Gazebo 查看路径，此时机器人保持静止。
+4. 点击“开始执行”，在消息框观察阶段变化。`WAIT_OBSTACLE` 表示正在安全等待行人，条件允许后自动恢复；`DONE` 表示完成并停车，`FAILED` 需查看原因。
+5. 观察时可选“俯视 + F1”或“跟随机器人”。需要中止时点“停止运动”；停止或完成后，移除并重新生成机器人才能开始新任务。结束使用时点“关闭仿真”。
+
+两级台阶选择 **A→B**，三层楼选择**同一层的不同预设点**；三层跨层组合不能规划。出生点生成后锁定，执行期间不能更改任务。当前算法通过配置文件选择，面板没有算法切换菜单。
+
+首次建议运行 **两级台阶 A→B，正常速度**，或 **三层楼 F1-ENTRY→F1-ROOM，正常速度**。三层同层闭环支持正常／5 倍目标倍率，10 倍仅用于场景观察；两级台阶闭环使用正常速度。目标倍率不代表实际达到的倍率。
+
+HMI 使用独立的 `ROS_DOMAIN_ID=91`、Gazebo master `http://127.0.0.1:11355`；Compose 普通终端默认域为 `73`。另开终端查询 HMI 的 ROS 状态时，先执行 `export ROS_DOMAIN_ID=91`。面板不接管已有命令行仿真。点位、界面操作与会话参数详见 [HMI 使用说明](sim_ws/src/simulation_hmi/README.md)。
+
+### 命令行入口
+
+以下命令在容器中加载环境后，按需单独运行，切换前用 `Ctrl+C` 退出旧实例。
+
+```bash
+# 默认观察三层楼，不加载机器人
+ros2 launch sim_bringup simulation.launch.py
+
+# 三层同屏，目标 5 倍速度
+ros2 launch sim_bringup simulation.launch.py view:=split real_time_factor:=5
+
+# 第二层内部透视；俯视使用 view:=top
+ros2 launch sim_bringup simulation.launch.py floor:=2 view:=interior
+
+# 两级台阶完整自动任务：规划、轮足切换、执行、停车
+ros2 launch sim_bringup simulation.launch.py scene:=two_steps robot:=true \
+  planning:=true local_planning:=true foot_planning:=true autonomous:=true
+```
+
+总入口默认 `scene:=three_floor robot:=false`，目前 `robot:=true` 只允许搭配 `two_steps`。三层导航由 HMI 生成任务快照，再启动机器人与规划节点。查看入口参数可执行 `ros2 launch sim_bringup simulation.launch.py --show-args`；无界面运行可加 `gui:=false`。
+
+## 技术栈
+
+| 类别 | 核心技术 | 职责 |
+|---|---|---|
+| 语言 | C++17、Python 3 | 规划库与 Gazebo 插件；HMI、任务配置与启动组织 |
+| 通信 | ROS 2 Humble：rclcpp、rclpy、Launch | 任务服务、指令、实际反馈及进程启动 |
+| 仿真与模型 | Gazebo Classic 11、Gazebo ROS、URDF/Xacro | 场景、模型、碰撞、机器人生成及运动学执行 |
+| 规划算法 | A*、TEB、足步 A* 与五次轨迹 | 全局路径、轮式局部轨迹、足式落脚与身体轨迹 |
+| 数值优化 | Ceres | TEB 非线性轨迹优化 |
+| 界面与显示 | PyQt5、Qt5、Gazebo 渲染接口 | HMI、场景剖视、路径绘制与机器人跟随 |
+| 配置与构建 | YAML / yaml-cpp、colcon、CMake、ament | 场景及算法参数、ROS 包构建与安装 |
+| 环境 | Docker、Compose、NVIDIA / X11 | 开发环境与图形仿真运行 |
+
+依赖安装见 [Dockerfile](docker/Dockerfile)，GPU、显示、挂载与通信域配置见 [compose.yaml](docker/compose.yaml)。
+
+## 系统架构
+
+系统分为操作、导航、算法、仿真执行与显示。`planning` 是独立 C++ 算法库；`planning_node` 是调用它的 ROS 节点；执行器和场景控制器是加载到 Gazebo 服务端的插件。
+
+```mermaid
+flowchart LR
+    HMI["simulation_hmi<br/>任务选择、会话管理、状态展示"]
+    Launch["sim_bringup / launch<br/>场景与机器人启动"]
+    Nav["planning_node<br/>任务调度、统一校验、闭环控制"]
+    Alg["planning 算法库<br/>A* / TEB / 足步规划"]
+    Geo["scene_geometry<br/>提取碰撞体与地面支撑"]
+    World["runtime.world<br/>实际加载的场景"]
+    subgraph Server["Gazebo 服务端：gzserver"]
+        Exec["robot_executor<br/>机器人执行、反馈与保护"]
+        Dynamic["scene_controller<br/>行人往返控制"]
+    end
+    View["Gazebo GUI：gzclient<br/>scene_visualization：场景、路径、跟随"]
+    HMI -->|启动进程| Launch
+    Launch -->|启动服务端与 GUI| Server
+    Launch --> View
+    HMI -->|规划 / 执行 / 停止服务| Nav
+    Nav -->|任务状态| HMI
+    Nav -->|统一 C++ 接口| Alg
+    World --> Geo
+    Geo --> Nav
+    Nav -->|速度 / 形态 / 足式轨迹| Exec
+    Exec -->|实际位姿、速度、执行状态| Nav
+    Dynamic -->|行人实际状态| Nav
+    Exec -->|模型位姿| View
+    Dynamic -->|行人位姿| View
+    Nav -->|路径点| View
+```
+
+| 模块 | 职责与边界 |
+|---|---|
+| `simulation_hmi` | 选择场景与预设点、生成任务快照、管理会话进程、调用服务并展示反馈；不实现规划算法 |
+| `planning_node.cpp` | 装配几何与算法参数、组织任务、校验规划结果、跟踪轨迹、等待／重规划、记录结果 |
+| `planning` | 通过全局、轮式局部、足式局部三类接口输出结果；不读取 World、不操作机器人、不依赖 ROS |
+| `scene_geometry.cpp` | 三层任务从实际加载的 World 提取碰撞体、旋转朝向和楼板支撑；楼梯洞不能作为平地 |
+| `robot_executor.cpp` | 在 gzserver 内执行运动与轮足形态切换，发布实际反馈并保留独立保护；不能独立 `ros2 run` |
+| `scene_controller.cpp` | 按 World 参数控制三名行人往返；保留真实碰撞，不依赖 GUI |
+| `scene_visualization.cpp` | 楼层显示、剖视、三层同屏、路径与跟随；隐藏或平移楼层只影响显示，物理世界保持原位 |
+
+## 核心流程
+
+### 启动与任务准备
+
+HMI 启动后，用户选择场景，`scene.launch.py` 生成 `runtime.world` 并启动 Gazebo。选择起终点后，面板根据公共配置生成 `robot_scene.yaml` 任务快照，`robot.launch.py` 展开机器人模型、核对轮式几何并生成机器人；规划节点通过实际时钟、里程计与执行器状态确认就绪。
+
+三层任务从当前会话的 `runtime.world` 提取几何，`scene.yaml` 保存公共机器人与任务配置，不重复录入三层家具坐标。两级台阶沿用配置中的已知几何与 A/E/X/B 路段。
+
+### 三层同层导航闭环
+
+```mermaid
+flowchart TD
+    Input["实际场景几何 + 机器人约束 + HMI 起终点"] --> Global["全局规划：生成同层参考路径"]
+    Global -->|成功，开始执行| Local["局部规划：结合实际位姿、速度与当前障碍"]
+    Global -->|失败| Fail["停止并报告原因"]
+    Ped["行人实际状态 + World 往返脚本预测"] --> Local
+    Local --> Check{"轨迹与指令通过<br/>碰撞、支撑、运动及时间校验？"}
+    Check -->|通过| Execute["执行器运行并反馈实际状态"]
+    Check -->|暂不可执行| Wait["WAIT_OBSTACLE：停车等待、重新检查"]
+    Wait -->|具备恢复条件| Local
+    Wait -.->|必要时从实际停车位姿重规划| Global
+    Wait -->|等待超时或保护失败| Fail
+    Execute --> Goal{"实际到达并停车？"}
+    Goal -->|否，使用新反馈| Local
+    Goal -->|是| Done["DONE：记录到达误差与最终速度"]
+```
+
+行人不主动让行。机器人在冲突前检查通行时序，不能安全执行时先停车；反馈失效或预测过期时不沿用旧轨迹。用户停止终止本次任务，晚到的规划结果不会恢复运动。动态障碍信息来自仿真反馈与已知往返脚本，不是传感器感知。
+
+两级台阶的任务流程为 **A→E 轮式 → 展腿 → E→X 足式 → 收腿 → X→B 轮式停车**。此流程已经验证，尚未推广到三层楼上下楼任务。
+
+### 关键接口
+
+| 接口 | 用途 |
+|---|---|
+| `/planning/plan`、`/planning/execute`、`/planning/stop` | HMI 规划、执行、停止服务，类型为 `std_srvs/srv/Trigger`，仅交互模式启用 |
+| `/planning/global_path`、`/planning/local_path` | 全局与局部规划输出，类型为 `nav_msgs/msg/Path` |
+| `/planning/task_status` | 任务阶段、终态、原因及结果目录 |
+| `/robot/cmd_vel`、`/robot/mode_command`、`/robot/foot_trajectory` | 轮式速度、形态／停止指令、足式执行轨迹 |
+| `/robot/odom`、`/robot/foot_feedback`、`/robot/execution_status` | 实际位姿与速度、足式反馈、执行器状态 |
+| `/clock` | 仿真时间；ROS 节点使用 `use_sim_time` |
+
+规划路径表示“准备怎么走”，实际轨迹来自执行器反馈。GUI 对位姿做约 100 ms 的显示插值并同步跟随相机，路径使用轻量线条绘制；这些显示处理不改变控制反馈或碰撞判定。
+
+## 开发与验证
+
+### 源码目录与入口
+
+```text
+simulation/
+├── README.md
+├── docker/                         # Dockerfile、Compose 环境
+├── doc/
+│   ├── f1/                         # 两级台阶演示素材与历史离线手册
+│   ├── f2/                         # 三层楼正式场景图片
+│   └── prd_navigation.md           # 导航范围、阶段状态与验收记录
+└── sim_ws/src/
+    ├── planning/                   # 独立 C++ 算法库
+    │   ├── include/                # 全局、轮式局部、足式局部接口与实现声明
+    │   ├── src/global/             # A* 全局规划
+    │   ├── src/local/wheel/        # TEB 轮式局部规划
+    │   ├── src/local/foot/         # 足步与身体轨迹规划
+    │   └── test/                   # 算法与接口测试
+    ├── sim_bringup/
+    │   ├── launch/                 # simulation 总入口、scene 场景、robot 机器人
+    │   ├── config/                 # scene.yaml、planning.yaml
+    │   ├── worlds/                 # two_steps.world、three_floor.world
+    │   ├── urdf/                   # robot.urdf.xacro
+    │   └── src/                    # 规划调度、几何适配、机器人执行与场景插件
+    └── simulation_hmi/
+        ├── launch/                 # hmi.launch.py
+        ├── config/                 # presets.yaml 预设点位
+        ├── simulation_hmi/         # app、session、ros_bridge、presets
+        └── test/                   # 点位与会话管理测试
+```
+
+`simulation.launch.py` 组合场景与可选机器人；`scene.launch.py` 单独启动场景；`robot.launch.py` 向已有服务端加载机器人。分开启动时，场景与机器人须共用 `master_uri` 和 `ROS_DOMAIN_ID`。HMI 入口只启动面板，由按钮启动本次仿真。
+
+### 关键配置与算法替换
+
+| 文件 | 修改内容 |
+|---|---|
+| [planning.yaml](sim_ws/src/sim_bringup/config/planning.yaml) | `planners` 选择算法与计算预算；`motion` 为公共运动约束；`teb`、`foot` 为算法参数；`task` 为原任务执行约束 |
+| [scene.yaml](sim_ws/src/sim_bringup/config/scene.yaml) | 公共机器人几何、原台阶任务；`scenes.three_floor` 为楼层高度、同层到达标准与等待预算 |
+| [presets.yaml](sim_ws/src/simulation_hmi/config/presets.yaml) | 两级台阶四个点、三层楼九个点；坐标为 `[x, y, 地面z, yaw]`，单位 m / rad |
+| [three_floor.world](sim_ws/src/sim_bringup/worlds/three_floor.world) | 三层物理场景；三个 `pedestrian_patrol` 插件配置行人端点、速度、启动延迟与停顿 |
+| [two_steps.world](sim_ws/src/sim_bringup/worlds/two_steps.world) | 原台阶、平台与障碍，修改时同步原任务几何配置 |
+| [robot.urdf.xacro](sim_ws/src/sim_bringup/urdf/robot.urdf.xacro) | 机器人连杆、关节、碰撞及执行插件；修改时同步规划几何与运动约束 |
+
+算法契约见 [global_planner.h](sim_ws/src/planning/include/global_planner.h)、[local_planner.h](sim_ws/src/planning/include/local_planner.h)。当前实现为 `astar`、`teb`、`footstep`。新增算法需实现相应接口、加入工厂创建与构建项，再通过 `planning.yaml` 选择；当前没有运行时算法插件系统或 HMI 算法菜单。公共 `runPlanner` 校验算法结果，控制流程通过抽象接口调用。
+
+比较算法时固定场景、起终点、机器人几何、公共约束、仿真倍率及行人初始相位，比较耗时、实际路程、到达误差和失败原因；算法内部优化代价不作为通用评分。
+
+修改源码、配置、模型或 World 后，在容器内重新构建，再加载环境并重启相关进程：
+
+```bash
+source /opt/ros/humble/setup.bash
+cd /workspace/sim_ws
+colcon build --packages-up-to simulation_hmi \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+source install/setup.bash
+```
+
+运行读取安装目录中的资源，编辑源文件不会自动刷新现有进程；算法和约束在规划节点启动时固定，运行中修改参数会被拒绝。
+
+### 验证与结果
+
+容器内运行现有算法及 HMI 测试：
+
+```bash
+source /opt/ros/humble/setup.bash
+cd /workspace/sim_ws
+colcon build --packages-up-to simulation_hmi \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+source install/setup.bash
+colcon test --packages-select planning simulation_hmi
+colcon test-result --verbose
+```
+
+实际任务验收看最终 `DONE`、实际到达误差及停车速度，不以规划成功或按钮响应代替完成。当前已验收：原两级台阶完整任务、三层同层 18 个有向点对离线规划、每层一条有行人等待与恢复的实际导航任务，以及 HMI 取消与停止。阶段三跨层任务未开始，详见 [导航 PRD 与验收记录](doc/prd_navigation.md)。
+
+| 结果位置 / 文件 | 用途 |
+|---|---|
+| `~/.local/state/simulation_hmi/<时间>/` | HMI 会话目录：运行时 World、任务快照、视角配置、截图、进程日志及 `planning/` 下的规划结果 |
+| `~/.local/state/simulation/` | CLI 默认场景观察输出；原任务规划默认位于其 `global_planning/` 下，也可用 `results_dir` 指定 |
+| `task_result.csv` | 最终状态、失败原因、到达误差、用时与停车速度 |
+| `task_events.csv`、`actual_trajectory.csv` | 阶段切换、实际运动轨迹 |
+| `path.csv`、`teb_execution.csv` | 全局路径与闭环局部预测记录；对应模式运行后生成 |
+
+`~` 指启动进程的容器用户目录，当前通常是 `/root`，不在项目挂载中；需长期保留的结果应复制到宿主机或挂载目录。`sim_ws/{build,install,log,results}` 为本地构建／运行产物，已由 Git 忽略。手动中断可能没有最终结果文件。
+
+查询 HMI 状态可在另一个已加载环境的容器终端执行：
+
+```bash
+export ROS_DOMAIN_ID=91
+ros2 topic echo /planning/task_status std_msgs/msg/String --once \
+  --qos-durability transient_local --qos-reliability reliable
+ros2 topic echo /robot/odom nav_msgs/msg/Odometry --once
+```
+
+| 常见现象 | 优先检查 |
+|---|---|
+| HMI 或 Gazebo 无法显示 | `DISPLAY`、X11 授权与挂载、NVIDIA 驱动／Toolkit、会话进程日志 |
+| 查询不到反馈 | 是否加载正确 overlay、是否与会话使用同一 ROS 域；HMI 默认 91，普通 CLI 默认 73 |
+| 修改不生效 | `ros2 pkg prefix --share sim_bringup` 是否指向当前安装；重新构建、source 并重启 |
+| 规划或执行失败 | 消息框、`task_result.csv` 的原因、`task_events.csv`；核对碰撞、地面支撑、反馈时效与计算预算 |
+| 跨层组合不能规划 | 当前只开放三层同层任务；不是按钮故障 |
+
+HMI 退出时清理自己创建的会话进程；CLI 用 `Ctrl+C` 退出整套 Launch，关闭 Gazebo 窗口不等于任务停止。重跑使用新会话，不用 Gazebo Reset 代替任务复位。
+
+详细操作见 [HMI 说明](sim_ws/src/simulation_hmi/README.md)，开发范围与阶段结果见 [导航 PRD](doc/prd_navigation.md)。[两级台阶离线手册](doc/f1/simulation-manual.html) 为历史版本，当前入口与能力以本 README 为准。
