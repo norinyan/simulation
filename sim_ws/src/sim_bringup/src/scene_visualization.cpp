@@ -17,21 +17,44 @@
 #include <map>
 #include <chrono>
 #include <cmath>
+#include <algorithm>
+#include <deque>
 namespace gazebo {
 class SceneVisualization final : public GUIPlugin {
  struct State {double t=0,x=0,y=0,z=0,yaw=0,speed=0,wait=0;std::string mode="WAITING";};
- transport::NodePtr node_;transport::SubscriberPtr sub_,pose_sub_;event::ConnectionPtr render_;
+ transport::NodePtr node_;transport::SubscriberPtr sub_,pose_sub_,overlay_sub_;event::ConnectionPtr render_,capture_;
  msgs::Scene data_;std::vector<rendering::VisualPtr> visuals_;std::map<std::string,State> states_;
  std::map<std::string,rendering::VisualPtr> people_,robot_links_,models_;
  struct Surface {rendering::VisualPtr visual;float transparency;};
  std::vector<Surface> occluders_;
- std::map<std::string,ignition::math::Pose3d> robot_poses_;std::mutex mutex_;
- std::string config_text_;bool follow_=false;std::vector<rendering::DynamicLines*> lines_;
+ struct TimedPose {double wall,stamp;ignition::math::Pose3d pose;};
+ using PoseHistory=std::deque<TimedPose>;
+ std::map<std::string,PoseHistory> robot_poses_,pedestrian_poses_;std::mutex mutex_;
+ struct Overlay {std::string text;std::vector<ignition::math::Vector3d> points;bool dirty=true;};
+ std::map<std::string,Overlay> overlays_;
+ std::map<std::string,rendering::DynamicLines*> overlay_lines_;
+ bool refresh_overlays_=true;
+ std::string config_text_;bool follow_=false,capture_pending_=false;std::vector<rendering::DynamicLines*> lines_;
  std::chrono::steady_clock::time_point config_check_{};
  ignition::math::Vector3d marker_start_,marker_goal_;bool markers_=false;
  int robot_floor_=0;
  QLabel *labels_[3]{};std::string out_,world_,view_;int floor_=0;bool split_=false;bool ready_=false,saved_=false;double start_=-1,snapshot_after_=2;
- std::chrono::steady_clock::time_point previous_{};
+ static double Wall(){return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();}
+ static void Remember(PoseHistory& history,double stamp,const ignition::math::Pose3d& pose){
+  if(!history.empty() && stamp<history.back().stamp)history.clear();
+  if(!history.empty() && stamp==history.back().stamp){history.back().pose=pose;return;}
+  history.push_back({Wall(),stamp,pose});
+  while(history.size()>128)history.pop_front();
+ }
+ static ignition::math::Pose3d Sample(const PoseHistory& history,double wall){
+  for(std::size_t i=1;i<history.size();++i)if(history[i].wall>=wall){
+   const auto& a=history[i-1];const auto& b=history[i];
+   const double t=std::clamp((wall-a.wall)/(b.wall-a.wall),0.,1.);
+   return ignition::math::Pose3d(a.pose.Pos()+(b.pose.Pos()-a.pose.Pos())*t,
+     ignition::math::Quaterniond::Slerp(t,a.pose.Rot(),b.pose.Rot(),true));
+  }
+  return history.back().pose;
+ }
  static int Floor(const std::string &s){return s.size()>1 && s[0]=='f' && s[1]>='1' && s[1]<='3'?s[1]-'0':0;}
  ignition::math::Pose3d DisplayPose(ignition::math::Pose3d p,int floor) const {
   if(split_){p.Pos().X()+=(floor-2)*22.;p.Pos().Z()-=(floor-1)*3.2;}
@@ -52,19 +75,52 @@ class SceneVisualization final : public GUIPlugin {
   }else{setGeometry(0,0,0,0);hide();}
   node_.reset(new transport::Node());node_->Init(world_);sub_=node_->Subscribe("~/pedestrians/state",&SceneVisualization::Feedback,this);
   pose_sub_=node_->Subscribe("~/pose/info",&SceneVisualization::Poses,this);
-  render_=event::Events::ConnectPostRender(std::bind(&SceneVisualization::Render,this));
+  overlay_sub_=node_->Subscribe("~/planning/path_overlay",&SceneVisualization::PathOverlay,this);
+  render_=event::Events::ConnectPreRender(std::bind(&SceneVisualization::Render,this));
+  capture_=event::Events::ConnectPostRender(std::bind(&SceneVisualization::Capture,this));
  }
  private:void Feedback(ConstGzStringPtr &message){
   try{const auto n=YAML::Load(message->data());State s;s.t=n["sim_s"].as<double>();s.x=n["x"].as<double>();s.y=n["y"].as<double>();s.z=n["z"].as<double>();s.yaw=n["yaw"].as<double>();s.wait=n["wait_remaining"].as<double>();s.mode=n["state"].as<std::string>();
    std::lock_guard<std::mutex> lock(mutex_);auto it=states_.find(n["name"].as<std::string>());
    if(it!=states_.end() && s.t>it->second.t)s.speed=std::hypot(s.x-it->second.x,s.y-it->second.y)/(s.t-it->second.t);
    states_[n["name"].as<std::string>()]=s;
+   Remember(pedestrian_poses_[n["name"].as<std::string>()],s.t,ignition::math::Pose3d(s.x,s.y,s.z,0,0,s.yaw));
   }catch(const std::exception &e){gzerr<<"Invalid pedestrian feedback: "<<e.what()<<"\n";}
  }
  void Poses(ConstPosesStampedPtr &message){
   std::lock_guard<std::mutex> lock(mutex_);
   for(const auto &pose:message->pose())if(pose.name()=="wheel_leg_robot" || pose.name().find("wheel_leg_robot::")==0)
-   robot_poses_[pose.name()]=msgs::ConvertIgn(pose);
+   Remember(robot_poses_[pose.name()],message->time().sec()+message->time().nsec()*1e-9,msgs::ConvertIgn(pose));
+ }
+ void PathOverlay(ConstGzStringPtr& message){
+  try{
+   const auto data=YAML::Load(message->data());const auto name=data["group"].as<std::string>();
+   if(name!="global_0" && name!="global_1" && name!="global_2" && name!="local_0" && name!="local_1")return;
+   std::lock_guard<std::mutex> lock(mutex_);auto& overlay=overlays_[name];
+   if(overlay.text==message->data())return;
+   overlay.text=message->data();overlay.points.clear();
+   for(const auto& p:data["points"])overlay.points.emplace_back(p[0].as<double>(),p[1].as<double>(),p[2].as<double>());
+   overlay.dirty=true;
+  }catch(const std::exception& e){gzerr<<"Path overlay: "<<e.what()<<"\n";}
+ }
+ void DrawOverlays(const rendering::ScenePtr& scene){
+  std::map<std::string,std::vector<ignition::math::Vector3d>> changes;
+  {std::lock_guard<std::mutex> lock(mutex_);for(auto& entry:overlays_)if(entry.second.dirty || refresh_overlays_){
+   changes[entry.first]=entry.second.points;entry.second.dirty=false;
+  }}
+  refresh_overlays_=false;
+  for(const auto& entry:changes){
+   auto& line=overlay_lines_[entry.first];
+   if(!line){line=scene->WorldVisual()->CreateDynamicLine(rendering::RENDERING_LINE_STRIP);
+    line->setMaterial(entry.first.find("local_")==0?"Gazebo/Green":entry.first=="global_1"?"Gazebo/Orange":"Gazebo/Blue");}
+   line->Clear();
+   for(auto point:entry.second){
+    const int floor=world_=="three_floor"?int(std::round(point.Z()/3.2))+1:0;
+    if(world_=="three_floor" && !Visible("path",floor))continue;
+    line->AddPoint(DisplayPose(ignition::math::Pose3d(point,ignition::math::Quaterniond::Identity),floor).Pos());
+   }
+   line->Update();
+  }
  }
  void Configure(const rendering::ScenePtr &scene){
   const auto now=std::chrono::steady_clock::now();
@@ -88,6 +144,7 @@ class SceneVisualization final : public GUIPlugin {
     // Retain model/link visuals across view switches. Reusing their names after
     // removal races Gazebo's render cache and can produce an empty viewport.
     ready_=false;saved_=false;start_=-1;
+    refresh_overlays_=true;
     const bool next_split=view_=="split";
     if(next_split && !labels_[0]){
      auto layout=new QHBoxLayout(this);
@@ -122,6 +179,7 @@ class SceneVisualization final : public GUIPlugin {
   return show;
  }
  void SetCamera(const rendering::UserCameraPtr &camera){
+  camera->SetRenderRate(60);
   if(split_){camera->SetHFOV(ignition::math::Angle(M_PI/3));camera->SetWorldPose(ignition::math::Pose3d(0,0,57,0,M_PI/2,M_PI/2));return;}
   camera->SetHFOV(ignition::math::Angle(follow_?80*M_PI/180:M_PI/3));
   const double z=(std::max(floor_,1)-1)*3.2;
@@ -139,6 +197,8 @@ class SceneVisualization final : public GUIPlugin {
  }
  void Build(const rendering::ScenePtr &scene){
   auto response=transport::request(world_,"scene_info");if(!response)return;if(!data_.ParseFromString(response->serialized_data()) || data_.model_size()==0)return;
+  // Hide editor gizmos, while keeping every light and its illumination active.
+  for(uint32_t i=0;i<scene->LightCount();++i)scene->LightByIndex(i)->ShowVisual(false);
   for(const auto &m:data_.model()){
    auto old=scene->GetVisual(m.name());if(old)old->SetVisible(false);
    for(const auto &l:m.link())for(const auto &v:l.visual()){auto original=scene->GetVisual(v.name());if(original)original->SetVisible(false);}
@@ -193,13 +253,15 @@ class SceneVisualization final : public GUIPlugin {
   return !error;
  }
  void Render(){
-  auto wall=std::chrono::steady_clock::now();if(std::chrono::duration<double>(wall-previous_).count()<.045)return;previous_=wall;
   auto camera=gui::get_active_camera();if(!camera||!camera->GetScene())return;auto scene=camera->GetScene();
-  camera->SetCaptureData(true);
   Configure(scene);
+  if(saved_){camera->SetCaptureData(false);capture_pending_=false;}
   if(!ready_){Build(scene);if(ready_)SetCamera(camera);return;}
   std::map<std::string,ignition::math::Pose3d> robot;
-  {std::lock_guard<std::mutex> lock(mutex_);robot=robot_poses_;}
+  // A 100 ms display buffer absorbs transport jitter. It never changes physics,
+  // collision checks or planning feedback, and never extrapolates stale poses.
+  const double display_time=Wall()-.1;
+  {std::lock_guard<std::mutex> lock(mutex_);for(const auto& entry:robot_poses_)robot[entry.first]=Sample(entry.second,display_time);}
   for(const auto &pose:robot){
    auto visual=robot_links_.find(pose.first);if(visual==robot_links_.end())continue;
    // Gazebo pose/info model poses are world-relative; link poses are relative
@@ -214,17 +276,30 @@ class SceneVisualization final : public GUIPlugin {
    auto delta=target-position;camera->SetWorldPose(ignition::math::Pose3d(position,ignition::math::Quaterniond(0,std::atan2(-delta.Z(),std::hypot(delta.X(),delta.Y())),std::atan2(delta.Y(),delta.X()))));
   }
   std::map<std::string,State> states;{std::lock_guard<std::mutex> lock(mutex_);states=states_;}
+  DrawOverlays(scene);
   if(split_)setFixedWidth(camera->ImageWidth());
   if(split_)for(int f=1;f<=3;++f){auto it=states.find("f"+std::to_string(f)+"_pedestrian");if(it!=states.end()){auto &s=it->second;labels_[f-1]->setText(QString("F%1 | %2 | sim %3 s<br/>actual speed %4 m/s | pause %5 s").arg(f).arg(QString::fromStdString(s.mode)).arg(s.t,0,'f',1).arg(s.speed,0,'f',2).arg(s.wait,0,'f',1));}}
-  double sim=0;for(const auto &s:states){sim=std::max(sim,s.second.t);auto p=people_.find(s.first);if(p!=people_.end())p->second->SetWorldPose(DisplayPose(ignition::math::Pose3d(s.second.x,s.second.y,s.second.z,0,0,s.second.yaw),Floor(s.first)));}
+  {std::lock_guard<std::mutex> lock(mutex_);for(const auto& entry:pedestrian_poses_){
+   auto p=people_.find(entry.first);if(p!=people_.end())p->second->SetWorldPose(DisplayPose(Sample(entry.second,display_time),Floor(entry.first)));
+  }}
+ }
+ void Capture(){
+  if(!ready_ || saved_)return;
+  auto camera=gui::get_active_camera();if(!camera)return;
+  const auto wall=std::chrono::steady_clock::now();
+  std::map<std::string,State> states;{std::lock_guard<std::mutex> lock(mutex_);states=states_;}
+  double sim=0;for(const auto& entry:states)sim=std::max(sim,entry.second.t);
   if(saved_)return;
   if(world_=="three_floor" && states.size()!=3)return;
   if(world_!="three_floor")sim=std::chrono::duration<double>(wall.time_since_epoch()).count();
   if(start_<0)start_=sim;
   if(sim-start_<snapshot_after_)return;
+  // GPU-to-CPU readback is needed only for the requested snapshot, not every
+  // subsequent frame of an interactive simulation.
+  if(!capture_pending_){capture_pending_=true;camera->SetCaptureData(true);return;}
   const auto *bytes=camera->ImageData();if(!bytes)return;int w=camera->ImageWidth(),h=camera->ImageHeight();
   QImage image(bytes,w,h,w*3,QImage::Format_RGB888);
-  if(!split_){saved_=SaveImage(image,"scene_view.png");return;}
+  if(!split_){saved_=SaveImage(image,"scene_view.png");if(saved_){camera->SetCaptureData(false);capture_pending_=false;}return;}
   int crop=std::min(h,w*720/1920);QImage view=image.copy(0,(h-crop)/2,w,crop).scaled(1920,720,Qt::IgnoreAspectRatio,Qt::SmoothTransformation);
   QPainter painter(&view);painter.fillRect(0,0,1920,90,QColor(14,26,38));QFont font("DejaVu Sans",15);painter.setFont(font);
   for(int f=1;f<=3;++f){const auto &s=states.at("f"+std::to_string(f)+"_pedestrian");QColor color=f==1?QColor(240,95,70):f==2?QColor(80,170,250):QColor(85,220,120);painter.setPen(color);int x=(f-1)*640+18;
@@ -239,6 +314,7 @@ class SceneVisualization final : public GUIPlugin {
    for(auto wp=p->GetElement("waypoint");wp;wp=wp->GetNextElement("waypoint")){auto point=wp->Get<ignition::math::Vector3d>("position");double x=(w/2.+(point.X()+(Floor(m.name())-2)*22.)*scale)*1920/w;double y=(h/2.-point.Y()*scale-(h-crop)/2.)*720/crop;painter.drawEllipse(QPointF(x,y),5,5);painter.drawText(QPointF(x+7,y-7),QString::number(++k));}
   }
   painter.end();saved_=SaveImage(view,"three_floors_top.png");
+  if(saved_){camera->SetCaptureData(false);capture_pending_=false;}
  }
 };GZ_REGISTER_GUI_PLUGIN(SceneVisualization)
 }

@@ -6,24 +6,13 @@
 namespace planning
 {
 
-struct FootstepOptions
+struct FootstepOptions : FootMotionLimits
 {
   double resolution{0.05};
-  double max_step{0.50};
-  double edge_margin{0.025};
-  double swing_clearance{0.08};
-  double step_duration{9.0};
-  double sample_dt{0.02};
-  double max_foot_v{0.8};
-  double max_foot_a{3.0};
-  double max_body_v{0.3};
-  double max_body_a{1.0};
-  double max_joint_v{1.0};
-  double max_joint_a{20.0};
-  double body_height{0.43};
-  double wheel_lift{0.13};
   int max_expansions{10000};
 };
+
+std::unique_ptr<FootLocalPlanner> makeFootPlanner(const std::string& name, FootstepOptions options = {});
 
 // Alternating planar footstep A* and C2, lift/translate/lower quintic swings,
 // migrated from wheel_leg_demo/foot_planner.hpp. Geometry/kinematics only;

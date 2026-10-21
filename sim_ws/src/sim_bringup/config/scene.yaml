@@ -7,6 +7,8 @@ scene:
   frame: world
   units: {length: m, angle: rad}
   world_file: worlds/two_steps.world
+  # Existing wheel -> foot -> wheel task adapter; point names are data.
+  task_route: [A, E, X, B]
 
   # [xmin, xmax, ymin, ymax], along the INNER faces of the perimeter walls.
   # lower_bounds describes the exposed lower surface, not the entire base slab.
@@ -115,3 +117,21 @@ robot:
   foot_size: [0.18, 0.10, 0.035]
   # Foot collision center relative to its ankle/foot link, not the foot tip.
   foot_center_offset_x: 0.0725
+
+# Shared robot geometry above; scene-specific data contains no furniture copy.
+scenes:
+  three_floor:
+    name: three_floor
+    frame: world
+    units: {length: m, angle: rad}
+    world_file: worlds/three_floor.world
+    live_geometry: true
+    task_type: wheel_navigation
+    task_route: [start, goal]
+    floors: [0.0, 3.2, 6.4]
+    navigation:
+      position_tolerance: 0.03
+      yaw_tolerance: 0.04
+      approach_gain: 1.0
+      wait_timeout: 90.0
+      obstacle_timeout: 0.5

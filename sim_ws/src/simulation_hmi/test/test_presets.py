@@ -33,7 +33,12 @@ def test_storey_placement_enables_actual_geometry(tmp_path):
     scene = yaml.safe_load(output.read_text())['scene']
     assert scene['live_geometry'] is True
     assert scene['name'] == 'three_floor'
-    assert scene['waypoints']['A'][2] == 6.4
+    assert scene['waypoints']['start'][2] == 6.4
+    assert scene['task_type'] == 'wheel_navigation'
+    assert scene['floors'] == [0.0, 3.2, 6.4]
+    scenes = load_presets(ROOT/'config/presets.yaml')
+    assert task_supported(scenes['three_floor'], 'F1-ENTRY', 'F1-ROOM')
+    assert not task_supported(scenes['three_floor'], 'F1-ENTRY', 'F2-ROOM')
 
 
 def test_parked_presets_do_not_intersect_configured_pedestrian_sweeps():

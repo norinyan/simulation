@@ -29,7 +29,7 @@ target_include_directories(scene_visualization PRIVATE ${OGRE_INCLUDE_DIRS} ${OG
 target_link_libraries(scene_visualization PkgConfig::GAZEBO Qt5::Widgets yaml-cpp)
 install(TARGETS scene_visualization LIBRARY DESTINATION lib)
 
-add_executable(planning_node src/planning_node.cpp)
+add_executable(planning_node src/planning_node.cpp src/scene_geometry.cpp)
 target_compile_features(planning_node PRIVATE cxx_std_17)
 ament_target_dependencies(planning_node rclcpp nav_msgs geometry_msgs std_msgs std_srvs trajectory_msgs gazebo_dev)
 target_link_libraries(planning_node planning::planning planning::teb_optimizer planning::footstep_planner yaml-cpp)

@@ -5,6 +5,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 
 namespace
 {
@@ -24,6 +25,17 @@ planning::PlanRequest request()
   r.safety_margin = .05;
   return r;
 }
+
+struct StubGlobal final : planning::GlobalPlanner
+{
+  bool called{false},slow{false},cancel{false};
+  planning::PlanResult plan(const planning::PlanRequest& r) override {
+    called=true;
+    if(slow) std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    if(cancel && r.control.cancelled) r.control.cancelled->store(true);
+    return {true,{r.start,r.goal},{}};
+  }
+};
 
 // Independent sampled swept-rectangle checks, including terminal docking.
 void verify(const planning::PlanRequest& r, const planning::PlanResult& result)
@@ -86,6 +98,7 @@ int main()
     r.footprint = {.54, .78};
     r.obstacles = {{-2, 0, .4, .8, .8, .8}};
     verify(r, planner.plan(r));
+    verify(r, planning::runPlanner(planner,r));
 
     r = request();
     r.bounds = {-5, 5, -5, 5};
@@ -128,6 +141,34 @@ int main()
     bool invalid_options = false;
     try { planning::AStar invalid({0, 100}); } catch (const std::invalid_argument&) { invalid_options = true; }
     expect(invalid_options, "Accepted zero resolution");
+    auto selected=planning::makeGlobalPlanner("astar");
+    verify(request(),planning::runPlanner(*selected,request()));
+    bool unknown=false;
+    try { planning::makeGlobalPlanner("missing"); } catch(const std::invalid_argument&) {unknown=true;}
+    expect(unknown,"Unknown algorithm silently fell back");
+    StubGlobal stub;
+    r=request();
+    verify(r,planning::runPlanner(stub,r));
+    expect(stub.called,"Global interface did not dispatch");
+    r.obstacles={{0,0,.5,1,2,1}};
+    expect(planning::runPlanner(stub,r).failure_reason=="INVALID_GLOBAL_GEOMETRY","Trusted unsafe algorithm output");
+    r=request();stub.slow=true;
+    r.control.deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(2);
+    expect(planning::runPlanner(stub,r).failure_reason=="PLANNING_TIMEOUT","Accepted late algorithm result");
+    r=request();stub.slow=false;stub.cancel=true;
+    r.control.cancelled=std::make_shared<std::atomic_bool>(false);
+    expect(planning::runPlanner(stub,r).failure_reason=="PLANNING_CANCELLED","Accepted cancelled result");
+    r=request();r.bounds={-3,3,-3,3};r.start={0,-2,0,std::acos(-1.)/2};r.goal={0,2,0,std::acos(-1.)/2};
+    r.footprint={.54,.78};r.require_support=true;r.supports={{0,0,-.1,6,6,.2}};
+    r.obstacles={{-1.75,0,.5,2.5,.15,1},{1.75,0,.5,2.5,.15,1}};
+    expect(planning::runPlanner(planner,r).success,"Rejected physically passable rectangular doorway");
+    r.obstacles.clear();r.start={0,0,0,0};r.goal={1,0,0,0};
+    r.supports={{-1.505,0,-.1,2.99,6,.2},{1.505,0,-.1,2.99,6,.2}};
+    expect(!planning::isPoseCollisionFree(r.start,r),"Missed thin unsupported gap inside footprint");
+    r.supports={{-1.5,0,-.1,3,6,.2},{1.5,0,-.1,3,6,.2}};
+    expect(planning::isPoseCollisionFree(r.start,r),"Rejected adjacent coplanar support union");
+    r.obstacles={{0,0,.5,.2,3,1,std::acos(-1.)/4}};
+    expect(!planning::isPoseCollisionFree(r.start,r),"Ignored rotated obstacle");
     std::cout << "PASS: bypass, oriented docking, collision, thin barrier, invalid input, height and grid-limit cases\n";
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';

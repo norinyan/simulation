@@ -251,9 +251,9 @@ Gazebo 中双击机器人聚焦，左键拖动平移、中键拖动旋转、滚�
 | 参数 | 当前值 | 作用 |
 |---|---|---|
 | `resolution` / `safety_margin` | 0.05 / 0.05 m | 全局网格 / 额外净距 |
-| `teb.max_v` / `teb.max_w` | 0.30 m/s / 0.80 rad/s | 轮式速度上限 |
-| `teb.max_a` / `teb.max_alpha` | 0.30 m/s² / 1.0 rad/s² | 轮式加速度上限 |
-| `teb.time_horizon` / `teb.spacing` | 6.0 s / 0.15 m | 预测时域 / 初始空间采样 |
+| `motion.max_v` / `motion.max_w` | 0.30 m/s / 0.80 rad/s | 轮式速度上限 |
+| `motion.max_a` / `motion.max_alpha` | 0.30 m/s² / 1.0 rad/s² | 轮式加速度上限 |
+| `motion.time_horizon` / `teb.spacing` | 6.0 s / 0.15 m | 预测时域 / 初始空间采样 |
 | `teb.iterations` / `teb.solver_time_limit` | 30 / 0.10 s | 单次求解上限，闭环会收紧时间预算 |
 | `foot.max_step` / `foot.swing_clearance` | 0.50 / 0.08 m | 最大步长 / 摆脚抬高量 |
 | `foot.step_duration` / `foot.sample_dt` | 4.5 / 0.02 s | 每步时长 / 轨迹采样间隔 |
@@ -265,7 +265,7 @@ Gazebo 中双击机器人聚焦，左键拖动平移、中键拖动旋转、滚�
 | `task.feedback_timeout` / `task.command_timeout` | 1.0 / 0.8 s | 反馈与心跳保护 / 速度指令有效期 |
 | `task.stage_timeout` / `task.timeout` | 240 / 600 s | 阶段 / 总任务仿真时间上限，另有墙钟保护 |
 
-未加载 YAML 时，C++ 默认 `teb.time_horizon=2.2 s`、`foot.step_duration=9.0 s`、`foot.max_joint_v=1.0 rad/s`，与上表不同。URDF 腿关节限速为 2.0 rad/s，相对安装角范围为 ±1.57 rad。
+未加载 YAML 时，C++ 默认 `motion.time_horizon=2.2 s`、`foot.step_duration=9.0 s`、`foot.max_joint_v=1.0 rad/s`，与上表不同。URDF 腿关节限速为 2.0 rad/s，相对安装角范围为 ±1.57 rad。
 
 足式提速需同时满足关节、机身、足端速度/加速度及可达性、支撑和碰撞约束；减小 `sample_dt` 只增加采样，加快播帧不能替代轨迹提速。
 
@@ -276,6 +276,16 @@ Gazebo 中双击机器人聚焦，左键拖动平移、中键拖动旋转、滚�
 - **足部碰撞中心 Z**：落地时为支撑面 +0.0175 m，且相对足 link 向前偏移 0.0725 m。
 
 Launch 固定加载安装目录的 `worlds/two_steps.world`，只改 `scene.world_file` 不会换场景。当前为普通 colcon 安装，配置、模型和 Launch 改后也需重新安装并重启；`ros2 param set` 不会让规划与执行插件同步实时生效。
+
+### 统一规划接口与同层导航
+
+算法选择位于 `planning.yaml` 的 `planners.global / wheel / foot`，默认 `astar / teb / footstep`；公共轮式约束位于 `motion`，TEB 求解器设置留在 `teb`。显式传入的旧 `teb.max_v` 等 ROS 参数仍作为公共参数别名；YAML 已统一迁移。参数在启动时固定，修改算法或约束须重启节点。
+
+`scene.yaml` 的 `task_route: [A, E, X, B]` 解析为轮式、足式、轮式路段。三层楼同层任务采用 `[start, goal]`，从 HMI 生成的任务快照及实际加载的 World 提取障碍和楼板支撑；三层楼跨层任务尚未开放。
+
+开发新算法时，实现 `GlobalPlanner`、`WheelLocalPlanner` 或 `FootLocalPlanner`，在对应 `make*Planner` 工厂中注册并加入构建。节点统一通过 `runPlanner` 调用、校验结果；无需修改 HMI、World 或执行器。算法不读 ROS/Gazebo，须遵守请求的运动约束及 `PlanControl` 协作式取消／时间预算。
+
+规划与局部求解在工作线程执行，ROS 回调继续处理停止和反馈。取消、超时和不合法输出不能产生后续运动。旧 CSV 列保持不变；每次结果目录增加 `planner_config.yaml`，记录算法、参数和场景快照。
 
 ### 修改入口与验证
 
@@ -345,7 +355,7 @@ ros2 topic list -t
 ros2 node info /planning_node
 ros2 topic info /robot/odom --verbose
 ros2 pkg prefix --share sim_bringup
-ros2 param get /planning_node teb.time_horizon
+ros2 param get /planning_node motion.time_horizon
 ```
 
 **读取任务和执行状态：** 持续观察时去掉 `--once`。
@@ -388,7 +398,7 @@ find "$simulation_log_dir" -type f -name '*.log' \
 | 节点或 Topic 不存在 | 查 Launch 开关、启动日志、overlay 和域 73；task_status 仅在 autonomous 下出现。clock 不前进会阻止首次规划，spawn/插件错误查 gzserver |
 | 修改未生效 | 确认包安装路径，重新安装、source 并重启；param get 不证明插件已重读配置 |
 | 全局规划失败 | 查 planning/status、result.csv；检查边界、端点、占用、安全余量和栅格上限 |
-| TEB 不可行 | 查 local_status、local_result.csv 或任务中的 TEB_EXECUTION_PLAN 原因；检查初始碰撞、参考路径距离、净距、运动约束、时域与采样 |
+| TEB 不可行 | 查 local_status、local_result.csv 或任务中的 LOCAL_EXECUTION_PLAN 原因；检查初始碰撞、参考路径距离、净距、运动约束、时域与采样 |
 | 足式规划失败 | 查 foot_status；检查落脚支撑、边缘余量、IK、限位、碰撞及机身/足端/关节运动约束，不只调整步长或周期 |
 | 执行器未就绪 / 姿态不符 | EXECUTOR_STARTUP_TIMEOUT 查模型、插件、订阅者；INITIAL_POSE_OR_MODE_MISMATCH 查 A 点 odom 和 READY_WHEEL，不只重启任务节点接管半途机器人 |
 | 反馈或指令超时 | EXECUTION_FEEDBACK_TIMEOUT 查反馈时间戳和频率；PLANNER_HEARTBEAT_TIMEOUT、VELOCITY_COMMAND_TIMEOUT 查规划耗时与指令更新；GAZEBO_UPDATE_TIMEOUT 查暂停或卡顿 |
@@ -468,13 +478,13 @@ ros2 launch sim_bringup robot.launch.py scene:=two_steps planning:=true
 | `output_dir` | 自动生成的时间戳目录 | 容器 ~/.local/state/simulation/ 下，保存运行时 World 与截图 |
 | `master_uri` | `http://127.0.0.1:11345` | 三个入口共用；同机多实例须使用不同端口和 ROS_DOMAIN_ID |
 
-实测目标 5 倍运行原 two_steps 闭环自主任务时，新入口和 Git 原入口均出现 `TEB_EXECUTION_PLAN: START_FOOTPRINT_COLLISION`；该倍率下未通过完整任务验收。构建、场景观察、机器人加载和三类静态规划输出已检查通过；本次未修改规划算法、执行器或保护阈值。
+入口整理阶段的历史记录：目标 5 倍运行原 two_steps 闭环自主任务时，新入口和 Git 原入口均出现 `TEB_EXECUTION_PLAN: START_FOOTPRINT_COLLISION`；该倍率下未通过完整任务验收。构建、场景观察、机器人加载和三类静态规划输出已检查通过；本次未修改规划算法、执行器或保护阈值。
 
-`scene:=three_floor robot:=true` 暂不支持，直接报错。没有机器人却开启规划，或开启自主任务却缺少所需规划开关，也会在启动进程前报错。三层任务配置和轨迹已按清理要求移除，本次结构整理不恢复这项功能。
+`scene:=three_floor robot:=true` 暂不支持，直接报错。没有机器人却开启规划，或开启自主任务却缺少所需规划开关，也会在启动进程前报错。该总入口仍用于场景观察；三层楼同层导航通过 HMI 的点位任务快照启动，操作见 [面板说明](sim_ws/src/simulation_hmi/README.md)。
 
-正式图片保存在 [doc/f2](doc/f2)：整楼总览、三层各自俯视图和内部透视图，以及三层同屏路线图。单层图片来自静态场景完成时，同屏图包含最终行人路线。新运行保存 `scene_view.png` 或 `three_floors_top.png`，不覆盖文档图片。场景的楼层隐藏、平移和剖面仅改变 GUI，不修改物理模型或碰撞。
+正式图片保存在 [doc/f2](doc/f2)：整楼总览、三层各自俯视图和内部透视图，以及三层同屏路线图。单层图片来自静态场景完成时，同屏图保留当时的行人路线；当前路线以 World 配置为准。新运行保存 `scene_view.png` 或 `three_floors_top.png`，不覆盖文档图片。场景的楼层隐藏、平移和剖面仅改变 GUI，不修改物理模型或碰撞。
 
-行人速度、路径及停顿直接修改 `worlds/three_floor.world` 中三个 `pedestrian_patrol` 插件：`speed` 为 m/s，`start_delay` 为秒，`initial_direction` 为 forward / reverse；waypoint 的 position 是世界坐标、pause 是秒。脚底 Z 为 0 / 3.2 / 6.4 m。路径依次经过门洞及走廊中间点，到终点后原路返回。F1 左下房间到右上房间，F2 电梯门外到右下房间，F3 中间最左房间到中间最右房间。
+行人速度、路径及停顿直接修改 `worlds/three_floor.world` 中三个 `pedestrian_patrol` 插件：`speed` 为 m/s，`start_delay` 为秒，`initial_direction` 为 forward / reverse；waypoint 的 position 是世界坐标、pause 是秒。脚底 Z 为 0 / 3.2 / 6.4 m。路径依次经过门洞及走廊中间点，到终点后原路返回。三层统一从左下房间 `(-4, -4.45)` 到右下房间 `(4, -4.45)` 水平直线往返，端点各停 8 s；各层速度与启动延迟保留。
 
 `scene_controller.cpp` 目前只实现带真实 Box 碰撞体的运动学行人，不包含腿部动画、自主避障或电梯控制。World 中加载 `libscene_controller.so`；GUI 使用 `libscene_visualization.so`。场景 Launch 显式设置插件路径，不再依赖 env-hooks。直接用 gzserver 打开 World 时需自行设置 GAZEBO_PLUGIN_PATH。
 
@@ -504,3 +514,5 @@ ros2 launch simulation_hmi hmi.launch.py
 Gazebo 独立窗口支持总览、俯视、楼层剖视、三层同屏和机器人跟随。消息框和状态来自实际 ROS 反馈，关闭面板时清理它自己启动的进程。预设点位集中在 [presets.yaml](sim_ws/src/simulation_hmi/config/presets.yaml)。
 
 默认使用独立 ROS_DOMAIN_ID=91 和 Gazebo master 11355；面板运行时，其他终端查询需 `export ROS_DOMAIN_ID=91`。它不接管已有命令行启动的仿真。中文依赖 `fonts-noto-cjk`，Qt 依赖 `python3-pyqt5`，均已加入 Dockerfile。现有容器已补齐字体，新建镜像会自动安装。
+
+导航改造范围、分阶段状态及实际验收结果见 [导航 PRD](doc/prd_navigation.md)。

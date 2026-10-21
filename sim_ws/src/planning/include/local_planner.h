@@ -4,9 +4,27 @@
 #include "global_planner.h"
 
 #include <array>
+#include <map>
+#include <optional>
 
 namespace planning
 {
+
+struct WheelMotionLimits
+{
+  double max_v{.30}, max_w{.80}, max_a{.30}, max_alpha{1.0};
+  double time_horizon{2.2}, max_lateral_velocity{.01};
+  double collision_translation_step{.01}, collision_rotation_step{.02};
+};
+
+struct FootMotionLimits
+{
+  double max_step{.50}, edge_margin{.025}, swing_clearance{.08};
+  double step_duration{9.0}, sample_dt{.02};
+  double max_foot_v{.8}, max_foot_a{3.0}, max_body_v{.3}, max_body_a{1.0};
+  double max_joint_v{1.0}, max_joint_a{20.0};
+  double body_height{.43}, wheel_lift{.13};
+};
 
 // Wheel-mode input/output types; retain their existing names for callers.
 struct LocalPlanRequest
@@ -16,6 +34,7 @@ struct LocalPlanRequest
   std::vector<Pose> reference_path;  // One wheel-mode section only.
   double initial_linear_velocity{0.0};
   double initial_angular_velocity{0.0};
+  std::optional<WheelMotionLimits> limits;
 };
 
 struct TrajectoryPoint
@@ -46,6 +65,8 @@ struct LocalPlanResult
   double max_angular_acceleration{0.0};
   double max_lateral_velocity{0.0};
   int candidates_evaluated{0};
+  // Optional logging only. Controllers must not depend on solver diagnostics.
+  std::map<std::string, double> diagnostics;
 };
 
 class LocalPlanner
@@ -59,6 +80,8 @@ class WheelLocalPlanner : public LocalPlanner
 public:
   virtual LocalPlanResult plan(const LocalPlanRequest& request) = 0;
 };
+
+LocalPlanResult runPlanner(WheelLocalPlanner& planner, const LocalPlanRequest& request);
 
 struct FootRobotGeometry
 {
@@ -87,6 +110,7 @@ struct FootLocalPlanRequest
   std::vector<Pose> reference_path;
   std::vector<BoxObstacle> terrain;  // Actual solid slabs/steps, not obstacles.
   FootRobotGeometry robot;
+  std::optional<FootMotionLimits> limits;
 };
 
 struct Footstep
@@ -123,6 +147,8 @@ class FootLocalPlanner : public LocalPlanner
 public:
   virtual FootLocalPlanResult plan(const FootLocalPlanRequest& request) = 0;
 };
+
+FootLocalPlanResult runPlanner(FootLocalPlanner& planner, const FootLocalPlanRequest& request);
 
 }  // namespace planning
 

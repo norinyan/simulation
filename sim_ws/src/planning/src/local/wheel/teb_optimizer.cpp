@@ -21,45 +21,29 @@ double distance(const Pose& a, const Pose& b) { return std::hypot(a.x-b.x, a.y-b
 struct Config : TebOptions
 {
   double length, width, margin;
+  bool oriented{false};
 };
 
 bool footprintFree(const Pose& p, const PlanRequest& r, double extra = 0)
 {
-  const double cs = std::cos(p.yaw), sn = std::sin(p.yaw);
-  const double hx = r.footprint.length/2+r.safety_margin+extra;
-  const double hy = r.footprint.width/2+r.safety_margin+extra;
-  const double ex = std::abs(cs)*hx+std::abs(sn)*hy;
-  const double ey = std::abs(sn)*hx+std::abs(cs)*hy;
-  const auto& b = r.bounds;
-  if (p.x-ex < b.min_x || p.x+ex > b.max_x || p.y-ey < b.min_y || p.y+ey > b.max_y) return false;
-  for (const auto& o : r.obstacles) {
-    if (o.center_z+o.size_z/2 <= p.z+kTolerance) continue;
-    const double dx = o.center_x-p.x, dy = o.center_y-p.y;
-    if (std::abs(dx) > ex+o.size_x/2 || std::abs(dy) > ey+o.size_y/2) continue;
-    if (std::abs(dx*cs+dy*sn) > hx+std::abs(cs)*o.size_x/2+std::abs(sn)*o.size_y/2) continue;
-    if (std::abs(-dx*sn+dy*cs) > hy+std::abs(sn)*o.size_x/2+std::abs(cs)*o.size_y/2) continue;
-    return false;
-  }
-  return true;
+  return isPoseCollisionFree(p,r,extra);
 }
 
 bool sweptFree(const Pose& a, const Pose& b, const PlanRequest& r, const TebOptions& c)
 {
-  const double turn = wrap(b.yaw-a.yaw), d = distance(a, b);
-  const double count = std::ceil(std::max(d/c.collision_translation_step,
-                                        std::abs(turn)/c.collision_rotation_step));
-  if (!std::isfinite(count) || count > 100000) return false;
-  const int n = std::max(1, static_cast<int>(count));
-  // Unlike unpadded point samples, this bound covers the motion between samples:
-  // half a translation step plus the furthest corner's half-step rotation.
-  const double radius = std::hypot(r.footprint.length, r.footprint.width)/2;
-  const double padding = d/(2*n)+2*radius*std::sin(std::abs(turn)/(4*n));
-  for (int i = 0; i <= n; ++i) {
-    const double t = static_cast<double>(i)/n;
-    if (!footprintFree({a.x+t*(b.x-a.x), a.y+t*(b.y-a.y), a.z, a.yaw+t*turn}, r, padding)) return false;
-  }
-  return true;
+  return isMotionCollisionFree(a,b,r,c.collision_translation_step,c.collision_rotation_step);
 }
+
+class BudgetCallback final : public ceres::IterationCallback
+{
+public:
+  explicit BudgetCallback(const PlanControl& control) : control_(control) {}
+  ceres::CallbackReturnType operator()(const ceres::IterationSummary&) override {
+    return control_.failure().empty() ? ceres::SOLVER_CONTINUE : ceres::SOLVER_ABORT;
+  }
+private:
+  const PlanControl& control_;
+};
 
 // Residual families/weights follow the old Demo: differential-drive motion,
 // velocity/acceleration limits, initial velocity, reference and clearance.
@@ -121,10 +105,10 @@ struct InitialVelocity
 
 struct Reference
 {
-  Pose p;
+  Pose p; double weight;
   template<typename T> bool operator()(const T* x, T* r) const
   {
-    r[0] = T(.25)*(x[0]-T(p.x)); r[1] = T(.25)*(x[1]-T(p.y)); return true;
+    r[0] = T(weight)*(x[0]-T(p.x)); r[1] = T(weight)*(x[1]-T(p.y)); return true;
   }
 };
 
@@ -133,11 +117,21 @@ struct Clearance
   BoxObstacle o; Config c;
   template<typename T> bool operator()(const T* p, T* r) const
   {
-    using std::abs; using std::sqrt;
-    const T dx = positive(abs(p[0]-T(o.center_x))-T(o.size_x/2));
-    const T dy = positive(abs(p[1]-T(o.center_y))-T(o.size_y/2));
-    const T gap = sqrt(dx*dx+dy*dy+T(1e-8));
-    r[0] = T(45)*positive(T(std::hypot(c.length,c.width)/2+c.margin+.025)-gap);
+    using std::abs; using std::sin; using std::cos; using std::sqrt;
+    const T x=p[0]-T(o.center_x),y=p[1]-T(o.center_y);
+    if(!c.oriented) {
+      const T dx=positive(abs(x)-T(o.size_x/2)),dy=positive(abs(y)-T(o.size_y/2));
+      r[0]=T(45)*positive(T(std::hypot(c.length,c.width)/2+c.margin+.025)-sqrt(dx*dx+dy*dy+T(1e-8)));
+      return true;
+    }
+    T gap=T(-1e6);
+    for(const T axis:std::array<T,4>{p[2],p[2]+T(std::acos(-1.)/2),T(o.yaw),T(o.yaw+std::acos(-1.)/2)}) {
+      const T separation=abs(x*cos(axis)+y*sin(axis))-
+        T(c.length/2+c.margin)*abs(cos(p[2]-axis))-T(c.width/2+c.margin)*abs(sin(p[2]-axis))-
+        T(o.size_x/2)*abs(cos(T(o.yaw)-axis))-T(o.size_y/2)*abs(sin(T(o.yaw)-axis));
+      if(separation>gap)gap=separation;
+    }
+    r[0] = T(45)*positive(-gap);
     return true;
   }
 };
@@ -164,13 +158,17 @@ Band optimizeBand(const std::vector<Pose>& seed, const LocalPlanRequest& request
   const auto& bounds = request.geometry.bounds;
   for (std::size_t i = 0; i < poses.size(); ++i) {
     auto* p = poses[i].data();
-    problem.AddResidualBlock(new ceres::AutoDiffCostFunction<Reference,2,3>(new Reference{seed[i]}),nullptr,p);
+    problem.AddResidualBlock(new ceres::AutoDiffCostFunction<Reference,2,3>(new Reference{seed[i],c.oriented?2.:.25}),nullptr,p);
     problem.SetParameterLowerBound(p,0,bounds.min_x+c.length/2+c.margin);
     problem.SetParameterUpperBound(p,0,bounds.max_x-c.length/2-c.margin);
     problem.SetParameterLowerBound(p,1,bounds.min_y+c.width/2+c.margin);
     problem.SetParameterUpperBound(p,1,bounds.max_y-c.width/2-c.margin);
     for (const auto& o : request.geometry.obstacles) {
       if (o.center_z+o.size_z/2 <= request.geometry.start.z+kTolerance) continue;
+      const double reach=std::hypot(c.length/2+c.margin,c.width/2+c.margin)+1.;
+      const double ex=(std::abs(std::cos(o.yaw))*o.size_x+std::abs(std::sin(o.yaw))*o.size_y)/2;
+      const double ey=(std::abs(std::sin(o.yaw))*o.size_x+std::abs(std::cos(o.yaw))*o.size_y)/2;
+      if(std::abs(seed[i].x-o.center_x)>ex+reach || std::abs(seed[i].y-o.center_y)>ey+reach)continue;
       problem.AddResidualBlock(new ceres::AutoDiffCostFunction<Clearance,1,3>(new Clearance{o,c}),nullptr,p);
     }
     if (i+1 < poses.size()) {
@@ -192,7 +190,9 @@ Band optimizeBand(const std::vector<Pose>& seed, const LocalPlanRequest& request
   options.max_num_iterations = c.iterations;
   options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
   options.num_threads = 1;
-  options.max_solver_time_in_seconds = c.solver_time_limit;
+  options.max_solver_time_in_seconds = std::max(1e-6,std::min(c.solver_time_limit,request.geometry.control.remaining()));
+  BudgetCallback budget(request.geometry.control);
+  options.callbacks.push_back(&budget);
   options.minimizer_progress_to_stdout = false;
   ceres::Solver::Summary summary;
   ceres::Solve(options,&problem,&summary);
@@ -260,6 +260,18 @@ std::vector<Pose> seed(const LocalPlanRequest& request, const Config& c, double 
   }
   for (std::size_t i = 1; i+1 < points.size(); ++i) {
     points[i].yaw = std::atan2(points[i+1].y-points[i-1].y,points[i+1].x-points[i-1].x);
+  }
+  // Preserve measured turning motion in the first seed knot. Projecting it
+  // straight onto a reference corner can seed an impossible instantaneous
+  // reversal of angular velocity; the optimizer still validates every result.
+  if(points.size()>2 && request.initial_linear_velocity>.02 &&
+     std::abs(request.initial_angular_velocity)>.05) {
+    const double dt=std::clamp(c.spacing/request.initial_linear_velocity,.05,.5);
+    const double turn=request.initial_angular_velocity*dt;
+    const auto& start=request.geometry.start;
+    points[1]={start.x+request.initial_linear_velocity*dt*std::cos(start.yaw+turn/2),
+               start.y+request.initial_linear_velocity*dt*std::sin(start.yaw+turn/2),
+               start.z,start.yaw+turn};
   }
   // Unwrap before Ceres so midpoint headings do not jump at +/-pi.
   for (std::size_t i = 1; i < points.size(); ++i) points[i].yaw = points[i-1].yaw+wrap(points[i].yaw-points[i-1].yaw);
@@ -411,10 +423,15 @@ LocalPlanResult TebOptimizer::plan(const LocalPlanRequest& request)
   LocalPlanResult best;
   int evaluated = 0;
   try {
-    validateRequest(request,options_);
-    Config c; static_cast<TebOptions&>(c) = options_;
+    auto options = options_;
+    if(request.limits) static_cast<WheelMotionLimits&>(options) = *request.limits;
+    validateRequest(request,options);
+    if(const auto reason=request.geometry.control.failure();!reason.empty()) throw std::runtime_error(reason);
+    Config c; static_cast<TebOptions&>(c) = options;
     c.length = request.geometry.footprint.length; c.width = request.geometry.footprint.width;
     c.margin = request.geometry.safety_margin;
+    c.oriented=request.geometry.require_support || std::any_of(request.geometry.obstacles.begin(),request.geometry.obstacles.end(),
+      [](const auto& box){return std::abs(box.yaw)>1e-8;});
     const double begin = closestArc(request.reference_path,request.geometry.start);
     const auto closest = at(request.reference_path,begin);
     if (distance(closest,request.geometry.start) > std::max(c.spacing,1e-3)) throw std::invalid_argument("START_TOO_FAR_FROM_REFERENCE");
@@ -423,33 +440,43 @@ LocalPlanResult TebOptimizer::plan(const LocalPlanRequest& request)
                          c.max_v*(c.time_horizon-accelerate);
     const double end = std::min(pathLength(request.reference_path),begin+reach);
     if (end-begin < 1e-5) throw std::invalid_argument("NO_REFERENCE_PROGRESS");
-    for (int side : {0,1,-1}) {
-      ++evaluated;
-      auto band = optimizeBand(seed(request,c,begin,end,side),request,c);
-      if (!band.usable || !retime(band,request,c)) continue;
-      LocalPlanResult candidate;
-      auto window = prefix(band,c.time_horizon,true);
-      bool valid = validateBand(window,request,c,candidate);
-      if (!valid) {
-        candidate = {};
-        window = prefix(band,c.time_horizon,false);
-        valid = validateBand(window,request,c,candidate);
+    const double base_spacing=c.spacing;
+    for(double spacing : {base_spacing,base_spacing*2/3,base_spacing/3}) {
+      c.spacing=spacing;
+      if(std::isfinite(request.geometry.control.remaining()))
+        c.solver_time_limit=std::min(options.solver_time_limit,request.geometry.control.remaining()/9);
+      for (int side : {0,1,-1}) {
+        if(const auto reason=request.geometry.control.failure();!reason.empty()) throw std::runtime_error(reason);
+        ++evaluated;
+        auto band = optimizeBand(seed(request,c,begin,end,side),request,c);
+        if (!band.usable || !retime(band,request,c)) continue;
+        LocalPlanResult candidate;
+        auto window = prefix(band,c.time_horizon,true);
+        bool valid = validateBand(window,request,c,candidate);
+        if (!valid) {
+          candidate = {};
+          window = prefix(band,c.time_horizon,false);
+          valid = validateBand(window,request,c,candidate);
+        }
+        if (valid && candidate.duration < c.time_horizon-kTolerance &&
+            end < pathLength(request.reference_path)-kTolerance) {
+          // A partial final interval can tighten acceleration checks. If only a
+          // whole-knot prefix is valid, slow that optimized prefix to fill the
+          // requested prediction window, then check all constraints again.
+          const double scale = c.time_horizon/candidate.duration;
+          for (auto& dt : window.dt) dt *= scale;
+          candidate = {};
+          valid = validateBand(window,request,c,candidate);
+        }
+        if (valid && (!best.success || candidate.optimization_cost < best.optimization_cost)) {
+          candidate.success = true;
+          candidate.diagnostics["seed_spacing_m"]=spacing;
+          best = std::move(candidate);
+        }
+        // Preserve Demo's preference for the reference seed if already feasible.
+        if (side == 0 && best.success) break;
       }
-      if (valid && candidate.duration < c.time_horizon-kTolerance &&
-          end < pathLength(request.reference_path)-kTolerance) {
-        // A partial final interval can tighten acceleration checks. If only a
-        // whole-knot prefix is valid, slow that optimized prefix to fill the
-        // requested prediction window, then check all constraints again.
-        const double scale = c.time_horizon/candidate.duration;
-        for (auto& dt : window.dt) dt *= scale;
-        candidate = {};
-        valid = validateBand(window,request,c,candidate);
-      }
-      if (valid && (!best.success || candidate.optimization_cost < best.optimization_cost)) {
-        candidate.success = true; best = std::move(candidate);
-      }
-      // Preserve Demo's preference for the reference seed if already feasible.
-      if (side == 0 && best.success) break;
+      if(best.success) break;
     }
     if (!best.success) best.failure_reason = "NO_FEASIBLE_TIMED_BAND";
   } catch (const std::exception& error) {
@@ -458,6 +485,78 @@ LocalPlanResult TebOptimizer::plan(const LocalPlanRequest& request)
   best.candidates_evaluated = evaluated;
   best.planning_ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin_time).count();
   return best;
+}
+
+std::unique_ptr<WheelLocalPlanner> makeWheelPlanner(const std::string& name, TebOptions options)
+{
+  if(name=="teb") return std::make_unique<TebOptimizer>(options);
+  throw std::invalid_argument("Unknown wheel local planner: "+name);
+}
+
+LocalPlanResult runPlanner(WheelLocalPlanner& planner, const LocalPlanRequest& request)
+{
+  LocalPlanResult result;
+  try {
+    const auto& control=request.geometry.control;
+    if(const auto reason=control.failure();!reason.empty()) throw std::runtime_error(reason);
+    if(!request.limits) throw std::invalid_argument("WHEEL_MOTION_LIMITS_REQUIRED");
+    const auto& c=*request.limits;
+    for(double value:{c.max_v,c.max_w,c.max_a,c.max_alpha,c.time_horizon,c.max_lateral_velocity,
+                      c.collision_translation_step,c.collision_rotation_step})
+      if(!std::isfinite(value)||value<=0) throw std::invalid_argument("INVALID_WHEEL_LIMITS");
+    if(!std::isfinite(request.initial_linear_velocity) || !std::isfinite(request.initial_angular_velocity) ||
+       request.initial_linear_velocity<0 || request.initial_linear_velocity>c.max_v+1e-6 ||
+       std::abs(request.initial_angular_velocity)>c.max_w+1e-6)
+      throw std::invalid_argument("INVALID_INITIAL_VELOCITY");
+    result=planner.plan(request);
+    if(const auto reason=control.failure();!reason.empty()) throw std::runtime_error(reason);
+    if(!result.success) throw std::runtime_error(result.failure_reason.empty()?"PLANNER_FAILED":result.failure_reason);
+    const auto& points=result.trajectory;
+    if(points.size()<2 || points.size()>20000) throw std::runtime_error("INVALID_LOCAL_SAMPLE_COUNT");
+    const auto& first=points.front();
+    if(!finitePose(first.pose) || distance(first.pose,request.geometry.start)>1e-6 ||
+       std::abs(first.pose.z-request.geometry.start.z)>1e-6 ||
+       std::abs(wrap(first.pose.yaw-request.geometry.start.yaw))>1e-6 ||
+       !std::isfinite(first.linear_acceleration) || !std::isfinite(first.angular_acceleration) ||
+       first.time_from_start!=0 || first.linear_velocity!=request.initial_linear_velocity ||
+       first.angular_velocity!=request.initial_angular_velocity)
+      throw std::runtime_error("INVALID_LOCAL_INITIAL_STATE");
+    double path_length=0,max_v=0,max_w=0,max_a=0,max_alpha=0,max_lateral=0;
+    for(std::size_t i=1;i<points.size();++i) {
+      const auto& a=points[i-1]; const auto& p=points[i];
+      const double dt=p.time_from_start-a.time_from_start;
+      if(!finitePose(p.pose) || !std::isfinite(dt) || dt<=0 ||
+         !std::isfinite(p.linear_velocity) || !std::isfinite(p.angular_velocity) ||
+         !std::isfinite(p.linear_acceleration) || !std::isfinite(p.angular_acceleration) ||
+         std::abs(p.pose.z-request.geometry.start.z)>1e-6)
+        throw std::runtime_error("INVALID_LOCAL_SAMPLE");
+      const double mid=a.pose.yaw+wrap(p.pose.yaw-a.pose.yaw)/2;
+      const double dx=p.pose.x-a.pose.x,dy=p.pose.y-a.pose.y;
+      const double v=(dx*std::cos(mid)+dy*std::sin(mid))/dt;
+      const double w=wrap(p.pose.yaw-a.pose.yaw)/dt;
+      const double interval=i==1?dt/2:(p.time_from_start-points[i-2].time_from_start)/2;
+      const double acc=(v-a.linear_velocity)/interval,alpha=(w-a.angular_velocity)/interval;
+      const double lateral=std::abs(-dx*std::sin(mid)+dy*std::cos(mid))/dt;
+      if(std::abs(v-p.linear_velocity)>1e-6 || std::abs(w-p.angular_velocity)>1e-6 ||
+         std::abs(acc-p.linear_acceleration)>1e-6 || std::abs(alpha-p.angular_acceleration)>1e-6 ||
+         v < -1e-6 || v>c.max_v+1e-6 || std::abs(w)>c.max_w+1e-6 ||
+         std::abs(acc)>c.max_a+1e-6 || std::abs(alpha)>c.max_alpha+1e-6 ||
+         lateral>c.max_lateral_velocity+1e-6 ||
+         !isMotionCollisionFree(a.pose,p.pose,request.geometry,c.collision_translation_step,c.collision_rotation_step))
+        throw std::runtime_error("INVALID_LOCAL_MOTION");
+      path_length+=distance(a.pose,p.pose);
+      max_v=std::max(max_v,std::abs(v));max_w=std::max(max_w,std::abs(w));
+      max_a=std::max(max_a,std::abs(acc));max_alpha=std::max(max_alpha,std::abs(alpha));
+      max_lateral=std::max(max_lateral,lateral);
+    }
+    if(points.back().time_from_start>c.time_horizon+1e-6) throw std::runtime_error("LOCAL_HORIZON_EXCEEDED");
+    if(const auto reason=control.failure();!reason.empty()) throw std::runtime_error(reason);
+    result.duration=points.back().time_from_start; result.path_length=path_length;
+    result.max_linear_velocity=max_v;result.max_angular_velocity=max_w;
+    result.max_linear_acceleration=max_a;result.max_angular_acceleration=max_alpha;
+    result.max_lateral_velocity=max_lateral;
+  } catch(const std::exception& e) {result={};result.failure_reason=e.what();}
+  return result;
 }
 
 }  // namespace planning

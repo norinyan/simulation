@@ -71,8 +71,8 @@ class CollisionChecker
 {
 public:
   explicit CollisionChecker(const PlanRequest& request)
-  : request_(request), radius_(std::hypot(request.footprint.length, request.footprint.width)/2
-                               + request.safety_margin) {}
+  : request_(request), radius_(std::hypot(request.footprint.length/2+request.safety_margin,
+                                        request.footprint.width/2+request.safety_margin)) {}
 
   double radius() const { return radius_; }
 
@@ -136,11 +136,10 @@ bool validate(const PlanRequest& r)
       !finite(r.footprint.length) || !finite(r.footprint.width) ||
       r.footprint.length <= 0 || r.footprint.width <= 0 ||
       !finite(r.safety_margin) || r.safety_margin < 0) return false;
-  for (const auto& o : r.obstacles) {
+  for(const auto* collection:{&r.obstacles,&r.supports})for (const auto& o : *collection)
     if (!finite(o.center_x) || !finite(o.center_y) || !finite(o.center_z) ||
         !finite(o.size_x) || !finite(o.size_y) || !finite(o.size_z) ||
-        o.size_x <= 0 || o.size_y <= 0 || o.size_z <= 0) return false;
-  }
+        o.size_x <= 0 || o.size_y <= 0 || o.size_z <= 0 || !finite(o.yaw)) return false;
   return finite(std::hypot(r.footprint.length, r.footprint.width)/2+r.safety_margin);
 }
 
@@ -169,6 +168,113 @@ void appendDistinct(std::vector<Pose>& path, const Pose& point)
 {
   if (path.empty() || distance(path.back(), point) > kEpsilon) path.push_back(point);
 }
+// Position/yaw lattice for rectangular robots in doorways and on finite slabs.
+// Rotations are real swept motions; no circular-envelope rejection at door throats.
+PlanResult orientedPlan(const PlanRequest& r,const AStarOptions& options) {
+  auto failure=[](const std::string& reason){return PlanResult{false,{},reason};};
+  if(!isPoseCollisionFree(r.start,r))return failure("START_COLLISION_OR_UNSUPPORTED");
+  if(!isPoseCollisionFree(r.goal,r))return failure("GOAL_COLLISION_OR_UNSUPPORTED");
+  constexpr int headings=8;
+  const double pi=std::acos(-1.),step=options.resolution;
+  const double min_x=r.start.x-std::floor((r.start.x-r.bounds.min_x)/step)*step;
+  const double min_y=r.start.y-std::floor((r.start.y-r.bounds.min_y)/step)*step;
+  const int nx=static_cast<int>(std::floor((r.bounds.max_x-min_x)/step))+1;
+  const int ny=static_cast<int>(std::floor((r.bounds.max_y-min_y)/step))+1;
+  if(nx<=0 || ny<=0 || static_cast<double>(nx)*ny*headings>options.max_grid_cells)return failure("GRID_LIMIT_EXCEEDED");
+  const std::size_t count=static_cast<std::size_t>(nx)*ny*headings,none=std::numeric_limits<std::size_t>::max();
+  auto id=[&](int x,int y,int h){return (static_cast<std::size_t>(y)*nx+x)*headings+h;};
+  auto point=[&](std::size_t i){const int h=i%headings; i/=headings;
+    return Pose{min_x+(i%nx)*step,min_y+(i/nx)*step,r.start.z,h*pi/4};};
+  auto heading=[&](double yaw){int h=static_cast<int>(std::llround(yaw/(pi/4)))%headings;return (h+headings)%headings;};
+  auto connect=[&](const Pose& a,const Pose& b) {
+    std::vector<Pose> path{a};
+    if(distance(a,b)>1e-8) {
+      const double yaw=std::atan2(b.y-a.y,b.x-a.x);
+      path.push_back({a.x,a.y,a.z,yaw});path.push_back({b.x,b.y,b.z,yaw});
+    }
+    path.push_back(b);
+    for(std::size_t i=1;i<path.size();++i)
+      if(!isMotionCollisionFree(path[i-1],path[i],r,.01,.02))return std::vector<Pose>{};
+    return path;
+  };
+  const int sx=std::llround((r.start.x-min_x)/step),sy=std::llround((r.start.y-min_y)/step);
+  const auto source=id(sx,sy,heading(r.start.yaw));
+  auto start_path=connect(r.start,point(source));
+  if(start_path.empty())return failure("START_ORIENTATION_BLOCKED");
+  const int gx=std::llround((r.goal.x-min_x)/step),gy=std::llround((r.goal.y-min_y)/step);
+  std::size_t target=none;std::vector<Pose> goal_path;double gap=INFINITY;
+  for(int y=gy-2;y<=gy+2;++y)for(int x=gx-2;x<=gx+2;++x) {
+    if(x<0||y<0||x>=nx||y>=ny)continue;
+    const auto candidate=id(x,y,heading(r.goal.yaw));const auto p=point(candidate);
+    if(distance(p,r.goal)>=gap)continue;
+    auto path=connect(p,r.goal);
+    if(!path.empty()){target=candidate;gap=distance(p,r.goal);goal_path=std::move(path);}
+  }
+  if(target==none)return failure("GOAL_APPROACH_BLOCKED");
+  std::vector<double> costs(count,INFINITY);std::vector<std::size_t> parent(count,none);
+  std::vector<signed char> free(count,-1);std::vector<bool> closed(count,false);
+  using Item=std::pair<double,std::size_t>;std::priority_queue<Item,std::vector<Item>,std::greater<Item>> open;
+  costs[source]=0;open.push({distance(point(source),r.goal),source});
+  const std::array<int,8> dx{{1,1,0,-1,-1,-1,0,1}},dy{{0,1,1,1,0,-1,-1,-1}};
+  auto valid=[&](std::size_t i){
+    if(free[i]<0)free[i]=!isPoseCollisionFree(point(i),r)?0:(isPoseCollisionFree(point(i),r,.04)?1:2);
+    return free[i]>0;
+  };
+  while(!open.empty()) {
+    if(const auto reason=r.control.failure();!reason.empty())return failure(reason);
+    const auto current=open.top().second;open.pop();if(closed[current])continue;closed[current]=true;
+    if(current==target)break;
+    const int h=current%headings,x=(current/headings)%nx,y=(current/headings)/nx;
+    for(int action:{0,-1,1}) {
+      int xx=x,yy=y,hh=h;double edge;
+      if(action==0){xx+=dx[h];yy+=dy[h];edge=step*std::hypot(dx[h],dy[h]);}
+      else{hh=(h+action+headings)%headings;edge=std::hypot(r.footprint.length,r.footprint.width)/2*pi/4;}
+      if(xx<0||yy<0||xx>=nx||yy>=ny)continue;
+      const auto next=id(xx,yy,hh);
+      if(closed[next] || !valid(next))continue;
+      if(free[next]==2)edge*=3;  // Prefer tracking room; retain legal narrow doors.
+      if(costs[current]+edge>=costs[next])continue;
+      if(!isMotionCollisionFree(point(current),point(next),r,.01,.02))continue;
+      costs[next]=costs[current]+edge;parent[next]=current;
+      open.push({costs[next]+distance(point(next),r.goal),next});
+    }
+  }
+  if(!closed[target])return failure("NO_PATH");
+  std::vector<Pose> lattice;
+  for(auto i=target;i!=none;i=parent[i])lattice.push_back(point(i));
+  std::reverse(lattice.begin(),lattice.end());
+  std::vector<Pose> path=start_path;
+  for(const auto& p:lattice) {
+    if(path.size()>=2) {
+      auto& a=path[path.size()-2];auto& b=path.back();
+      const bool same_yaw=std::cos(a.yaw-b.yaw)>1-1e-8 && std::cos(b.yaw-p.yaw)>1-1e-8;
+      const bool same_position=distance(a,b)<1e-8 && distance(b,p)<1e-8;
+      if((same_yaw || same_position) && isMotionCollisionFree(a,p,r,.01,.02)){b=p;continue;}
+    }
+    path.push_back(p);
+  }
+  path.insert(path.end(),goal_path.begin()+1,goal_path.end());
+  path.front()=r.start;path.back()=r.goal;
+  // Remove grid zigzags through open space. Every shortcut still consists of
+  // swept rotation, forward translation and final rotation; doors remain checked.
+  std::vector<Pose> smooth{path.front()};
+  for(std::size_t begin=0;begin+1<path.size();) {
+    bool joined=false;
+    for(std::size_t end=path.size()-1;end>begin+1;--end) {
+      if(!r.control.failure().empty())return failure(r.control.failure());
+      auto shortcut=connect(path[begin],path[end]);
+      if(shortcut.empty())continue;
+      smooth.insert(smooth.end(),shortcut.begin()+1,shortcut.end());begin=end;joined=true;break;
+    }
+    if(!joined)smooth.push_back(path[++begin]);
+  }
+  std::vector<Pose> distinct;
+  for(const auto& p:smooth)
+    if(distinct.empty() || distance(distinct.back(),p)>1e-8 || std::cos(distinct.back().yaw-p.yaw)<1-1e-8)
+      distinct.push_back(p);
+  distinct.front()=r.start;distinct.back()=r.goal;
+  return {true,distinct,{}};
+}
 }  // namespace
 
 AStar::AStar(AStarOptions options) : options_(options)
@@ -181,8 +287,11 @@ AStar::AStar(AStarOptions options) : options_(options)
 PlanResult AStar::plan(const PlanRequest& request)
 {
   auto failure = [](const std::string& reason) { return PlanResult{false, {}, reason}; };
+  if (const auto reason = request.control.failure(); !reason.empty()) return failure(reason);
   if (!validate(request)) return failure("INVALID_REQUEST");
   if (std::abs(request.start.z-request.goal.z) > 1e-6) return failure("NON_PLANAR_REQUEST");
+  if(request.require_support || std::any_of(request.obstacles.begin(),request.obstacles.end(),
+      [](const auto& box){return std::abs(box.yaw)>1e-8;})) return orientedPlan(request,options_);
   const CollisionChecker checker(request);
   Pose start, goal;
   if (!endpointAnchor(request.start, true, options_.resolution, checker, start)) {
@@ -230,6 +339,7 @@ PlanResult AStar::plan(const PlanRequest& request)
   costs[source] = 0;
   open.emplace(distance(point(source), point(target)), source);
   while (!open.empty()) {
+    if (const auto reason = request.control.failure(); !reason.empty()) return failure(reason);
     const auto id = open.top().second;
     open.pop();
     if (closed[id]) continue;
@@ -275,6 +385,164 @@ PlanResult AStar::plan(const PlanRequest& request)
   }
   path.back() = request.goal;
   return PlanResult{true, std::move(path), {}};
+}
+
+std::unique_ptr<GlobalPlanner> makeGlobalPlanner(const std::string& name, AStarOptions options)
+{
+  if (name == "astar") return std::make_unique<AStar>(options);
+  throw std::invalid_argument("Unknown global planner: "+name);
+}
+
+namespace {
+struct Point {double x,y;};
+using Polygon=std::vector<Point>;
+Polygon clip(const Polygon& polygon,double nx,double ny,double offset) {
+  Polygon out;
+  if(polygon.empty())return out;
+  auto previous=polygon.back();double pd=nx*previous.x+ny*previous.y-offset;
+  for(const auto& current:polygon) {
+    const double d=nx*current.x+ny*current.y-offset;
+    if((pd<=0)!=(d<=0)) {
+      const double t=pd/(pd-d);
+      out.push_back({previous.x+t*(current.x-previous.x),previous.y+t*(current.y-previous.y)});
+    }
+    if(d<=0)out.push_back(current);
+    previous=current;pd=d;
+  }
+  return out;
+}
+double area(const Polygon& polygon) {
+  double value=0;
+  for(std::size_t i=0;i<polygon.size();++i){const auto& a=polygon[i];const auto& b=polygon[(i+1)%polygon.size()];value+=a.x*b.y-a.y*b.x;}
+  return std::abs(value)/2;
+}
+bool supported(const Pose& p,const PlanRequest& r,double padding) {
+  if(!r.require_support)return true;
+  const double hx=r.footprint.length/2+r.safety_margin+padding,hy=r.footprint.width/2+r.safety_margin+padding;
+  const double c=std::cos(p.yaw),s=std::sin(p.yaw);
+  Polygon footprint;
+  for(auto v:std::array<Point,4>{{{-hx,-hy},{hx,-hy},{hx,hy},{-hx,hy}}})
+    footprint.push_back({p.x+c*v.x-s*v.y,p.y+s*v.x+c*v.y});
+  // Most poses lie on one slab. Avoid polygon subtraction in that common case;
+  // retain the exact union test below for slab joins and floor openings.
+  for(const auto& box:r.supports) {
+    if(std::abs(box.center_z+box.size_z/2-p.z)>.003)continue;
+    const double cs=std::cos(box.yaw),sn=std::sin(box.yaw);
+    bool contained=true;
+    for(const auto& v:footprint) {
+      const double x=v.x-box.center_x,y=v.y-box.center_y;
+      if(std::abs(cs*x+sn*y)>box.size_x/2 || std::abs(-sn*x+cs*y)>box.size_y/2){contained=false;break;}
+    }
+    if(contained)return true;
+  }
+  std::vector<Polygon> uncovered{footprint};
+  for(const auto& support:r.supports) {
+    if(!finite(support.yaw) || support.size_x<=0 || support.size_y<=0 ||
+       std::abs(support.center_z+support.size_z/2-p.z)>.003)continue;
+    const double cs=std::cos(support.yaw),sn=std::sin(support.yaw);
+    std::vector<Polygon> next;
+    for(auto inside:uncovered) {
+      for(auto axis:std::array<std::array<double,3>,4>{{{cs,sn,support.size_x/2},{-cs,-sn,support.size_x/2},
+                                                    {-sn,cs,support.size_y/2},{sn,-cs,support.size_y/2}}}) {
+        const double edge=axis[0]*support.center_x+axis[1]*support.center_y+axis[2];
+        auto outside=clip(inside,-axis[0],-axis[1],-edge);
+        if(area(outside)>1e-10)next.push_back(std::move(outside));
+        inside=clip(inside,axis[0],axis[1],edge);
+        if(inside.empty())break;
+      }
+    }
+    uncovered=std::move(next);
+    if(uncovered.empty())return true;
+    if(uncovered.size()>10000)return false;
+  }
+  return false;
+}
+}
+
+bool isPoseCollisionFree(const Pose& p, const PlanRequest& r, double padding)
+{
+  if (!poseFinite(p) || !validate(r) || !std::isfinite(padding) || padding < 0) return false;
+  const double hx = r.footprint.length/2+r.safety_margin+padding;
+  const double hy = r.footprint.width/2+r.safety_margin+padding;
+  const double c=std::cos(p.yaw),s=std::sin(p.yaw);
+  const double ex=std::abs(c)*hx+std::abs(s)*hy,ey=std::abs(s)*hx+std::abs(c)*hy;
+  if(p.x-ex<r.bounds.min_x-kEpsilon || p.x+ex>r.bounds.max_x+kEpsilon ||
+     p.y-ey<r.bounds.min_y-kEpsilon || p.y+ey>r.bounds.max_y+kEpsilon)return false;
+  for(const auto& box:r.obstacles) {
+    if(box.center_z+box.size_z/2<=p.z+1e-6)continue;
+    const double dx=box.center_x-p.x,dy=box.center_y-p.y;
+    const double radius=(box.size_x+box.size_y)/2;
+    if(std::abs(dx)>ex+radius || std::abs(dy)>ey+radius)continue;
+    bool separated=false;
+    for(double axis:{p.yaw,p.yaw+std::acos(-1.)/2,box.yaw,box.yaw+std::acos(-1.)/2}) {
+      const double d=std::abs(dx*std::cos(axis)+dy*std::sin(axis));
+      const double extent=hx*std::abs(std::cos(p.yaw-axis))+hy*std::abs(std::sin(p.yaw-axis))+
+                          box.size_x/2*std::abs(std::cos(box.yaw-axis))+box.size_y/2*std::abs(std::sin(box.yaw-axis));
+      if(d>extent){separated=true;break;}
+    }
+    if(!separated)return false;
+  }
+  return supported(p,r,padding);
+}
+
+bool isMotionCollisionFree(const Pose& a, const Pose& b, const PlanRequest& r,
+                           double translation_step, double rotation_step)
+{
+  if (!poseFinite(a) || !poseFinite(b) || std::abs(a.z-b.z)>1e-6 ||
+      !std::isfinite(translation_step) || !std::isfinite(rotation_step) ||
+      translation_step<=0 || rotation_step<=0) return false;
+  const double turn = std::atan2(std::sin(b.yaw-a.yaw),std::cos(b.yaw-a.yaw));
+  const double d = distance(a,b);
+  if(std::abs(turn)<1e-10) {
+    // A fixed-heading translation has an exact swept rectangle when aligned
+    // with the body. Its rectangle bound is conservative for lateral motion.
+    auto swept=r;
+    const double dx=b.x-a.x,dy=b.y-a.y,c=std::cos(a.yaw),s=std::sin(a.yaw);
+    swept.footprint.length+=std::abs(c*dx+s*dy);
+    swept.footprint.width+=std::abs(-s*dx+c*dy);
+    return isPoseCollisionFree({(a.x+b.x)/2,(a.y+b.y)/2,a.z,a.yaw},swept);
+  }
+  const double count = std::ceil(std::max(d/translation_step,std::abs(turn)/rotation_step));
+  if (!std::isfinite(count) || count>100000) return false;
+  const int n = std::max(1,static_cast<int>(count));
+  const double radius=std::hypot(r.footprint.length,r.footprint.width)/2;
+  const double padding=d/(2*n)+2*radius*std::sin(std::abs(turn)/(4*n));
+  if(!validate(r))return false;
+  auto nearby=r;nearby.obstacles.clear();
+  const double reach=radius+std::sqrt(2.)*(r.safety_margin+padding);
+  for(const auto& box:r.obstacles) {
+    const double extent=(box.size_x+box.size_y)/2;
+    if(box.center_x+extent<std::min(a.x,b.x)-reach || box.center_x-extent>std::max(a.x,b.x)+reach ||
+       box.center_y+extent<std::min(a.y,b.y)-reach || box.center_y-extent>std::max(a.y,b.y)+reach)continue;
+    nearby.obstacles.push_back(box);
+  }
+  for(int i=0;i<=n;i++) {
+    const double t=static_cast<double>(i)/n;
+    if(!isPoseCollisionFree({a.x+t*(b.x-a.x),a.y+t*(b.y-a.y),a.z,a.yaw+t*turn},nearby,padding)) return false;
+  }
+  return true;
+}
+
+PlanResult runPlanner(GlobalPlanner& planner, const PlanRequest& request)
+{
+  try {
+    if (const auto reason=request.control.failure(); !reason.empty()) return {false,{},reason};
+    auto result=planner.plan(request);
+    if (const auto reason=request.control.failure(); !reason.empty()) return {false,{},reason};
+    if(!result.success) return {false,{},result.failure_reason.empty()?"PLANNER_FAILED":result.failure_reason};
+    auto matches=[](const Pose& a,const Pose& b) {
+      return poseFinite(a) && distance(a,b)<1e-6 && std::abs(a.z-b.z)<1e-6 &&
+        std::abs(std::atan2(std::sin(a.yaw-b.yaw),std::cos(a.yaw-b.yaw)))<1e-6;
+    };
+    if(!validate(request) || result.path.empty() || !matches(result.path.front(),request.start) ||
+        !matches(result.path.back(),request.goal)) return {false,{},"INVALID_GLOBAL_ENDPOINTS"};
+    for(std::size_t i=0;i<result.path.size();++i) {
+      if(std::abs(result.path[i].z-request.start.z)>1e-6 || !isPoseCollisionFree(result.path[i],request) ||
+          (i && !isMotionCollisionFree(result.path[i-1],result.path[i],request)))
+        return {false,{},"INVALID_GLOBAL_GEOMETRY"};
+    }
+    return result;
+  } catch(const std::exception& e) { return {false,{},e.what()}; }
 }
 
 }  // namespace planning

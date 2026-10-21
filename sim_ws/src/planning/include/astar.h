@@ -16,8 +16,9 @@ struct AStarOptions
 
 // Plan on one horizontal surface per request. Boxes extending above that surface
 // are conservatively projected to XY; this interface has no robot height.
-// Search/turns use a circumscribed circle. Short, heading-aligned endpoint
-// connectors use the swept rectangle to permit docking near platform edges.
+// Legacy planar maps use a circumscribed circle with rectangular docking.
+// Maps with finite supports or rotated obstacles use a position/yaw lattice
+// and swept rectangular bodies, including in-place turns and floor openings.
 class AStar final : public GlobalPlanner
 {
 public:
@@ -27,6 +28,8 @@ public:
 private:
   AStarOptions options_;
 };
+
+std::unique_ptr<GlobalPlanner> makeGlobalPlanner(const std::string& name, AStarOptions options = {});
 
 }  // namespace planning
 

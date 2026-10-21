@@ -223,6 +223,10 @@ bool footMotionValid(const std::vector<Sample>& samples, const Context& c, std::
   double old_time = 0;
   const auto& o = c.options;
   for (std::size_t i = 0; i < samples.size(); ++i) {
+    if(const auto reason=c.request.geometry.control.failure();!reason.empty()) {
+      if(why) *why=reason;
+      return false;
+    }
     const auto& s = samples[i];
     if (!footPoseValid(s, c, why)) return false;
     const auto l = footJoints(s, 0, c), r = footJoints(s, 1, c);
@@ -294,6 +298,7 @@ void validateRequest(const FootLocalPlanRequest& r, const FootstepOptions& o)
 
 FootLocalPlanResult planFeet(const FootLocalPlanRequest& request, const FootstepOptions& options)
 {
+  if(const auto reason=request.geometry.control.failure();!reason.empty()) throw std::runtime_error(reason);
   validateRequest(request, options);
   FootLocalPlanResult out;
   std::vector<double> heights;
@@ -340,6 +345,7 @@ FootLocalPlanResult planFeet(const FootLocalPlanRequest& request, const Footstep
   State finish{}; bool found = false;
   std::string rejected;
   while (!open.empty() && out.expanded < options.max_expansions) {
+    if(const auto reason=request.geometry.control.failure();!reason.empty()) throw std::runtime_error(reason);
     const auto item = open.top(); open.pop(); const auto s = item.state;
     if (item.g > costs[s]+1e-9) continue;
     ++out.expanded;
@@ -407,10 +413,73 @@ FootLocalPlanResult FootstepPlanner::plan(const FootLocalPlanRequest& request)
 {
   const auto begin = std::chrono::steady_clock::now();
   FootLocalPlanResult out;
-  try { out = planFeet(request, options_); }
+  try {
+    auto options=options_;
+    if(request.limits) static_cast<FootMotionLimits&>(options)=*request.limits;
+    // Validate shared limits with the same constructor checks as defaults.
+    FootstepPlanner checked(options);
+    out = planFeet(request, options);
+  }
   catch (const std::exception& e) { out.failure_reason = e.what(); }
   out.planning_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-begin).count();
   return out;
+}
+
+std::unique_ptr<FootLocalPlanner> makeFootPlanner(const std::string& name, FootstepOptions options)
+{
+  if(name=="footstep") return std::make_unique<FootstepPlanner>(options);
+  throw std::invalid_argument("Unknown foot local planner: "+name);
+}
+
+FootLocalPlanResult runPlanner(FootLocalPlanner& planner, const FootLocalPlanRequest& request)
+{
+  FootLocalPlanResult result;
+  try {
+    const auto& control=request.geometry.control;
+    if(const auto reason=control.failure();!reason.empty()) throw std::runtime_error(reason);
+    if(!request.limits) throw std::invalid_argument("FOOT_MOTION_LIMITS_REQUIRED");
+    FootstepOptions options;
+    static_cast<FootMotionLimits&>(options)=*request.limits;
+    FootstepPlanner checked(options);
+    validateRequest(request,options);
+    result=planner.plan(request);
+    if(const auto reason=control.failure();!reason.empty()) throw std::runtime_error(reason);
+    if(!result.success) throw std::runtime_error(result.failure_reason.empty()?"PLANNER_FAILED":result.failure_reason);
+    if(result.trajectory.size()<2 || result.trajectory.size()>20000)
+      throw std::runtime_error("INVALID_FOOT_SAMPLE_COUNT");
+    const auto& first=result.trajectory.front(); const auto& last=result.trajectory.back();
+    auto matches=[&](const Pose& body,const Pose& ground) {
+      return finitePose(body) && std::hypot(body.x-ground.x,body.y-ground.y)<1e-6 &&
+        std::abs(body.z-ground.z-options.body_height)<1e-6 && std::abs(body.yaw-ground.yaw)<1e-6;
+    };
+    if(first.time_from_start!=0 || !matches(first.body,request.geometry.start) || !matches(last.body,request.geometry.goal))
+      throw std::runtime_error("INVALID_FOOT_ENDPOINTS");
+    const Context context{request,options,0};
+    for(std::size_t i=0;i<result.trajectory.size();++i) {
+      const auto& sample=result.trajectory[i];
+      if(std::abs(sample.body.y-request.geometry.start.y)>1e-6 || std::abs(sample.body.yaw)>1e-6)
+        throw std::runtime_error("INVALID_FOOT_BODY_PLANE");
+      if(!std::isfinite(sample.time_from_start) ||
+         (i && sample.time_from_start-result.trajectory[i-1].time_from_start>.05+1e-9))
+        throw std::runtime_error("INVALID_FOOT_TIME");
+      for(const auto& values:{sample.velocity,sample.acceleration}) for(double v:values)
+        if(!std::isfinite(v)) throw std::runtime_error("NONFINITE_FOOT_DERIVATIVE");
+      int supported=0;
+      for(int side=0;side<2;++side) {
+        const auto& foot=sample.feet[side];
+        if(std::abs(foot.y-footY(side,context))>1e-6 || std::abs(foot.yaw)>1e-6)
+          throw std::runtime_error("INVALID_FOOT_PLANE");
+        if(footLanding(foot.x,side,context) &&
+           std::abs(foot.z-request.robot.foot_size[2]/2-footGround(foot.x,side,context))<1e-6) ++supported;
+      }
+      if(supported==0 || ((i==0 || i+1==result.trajectory.size()) && supported!=2))
+        throw std::runtime_error("INVALID_FOOT_SUPPORT");
+    }
+    std::string reason;
+    if(!footMotionValid(result.trajectory,context,&reason)) throw std::runtime_error("INVALID_FOOT_MOTION: "+reason);
+    if(const auto reason=control.failure();!reason.empty()) throw std::runtime_error(reason);
+  } catch(const std::exception& e) {result={};result.failure_reason=e.what();}
+  return result;
 }
 
 }  // namespace planning

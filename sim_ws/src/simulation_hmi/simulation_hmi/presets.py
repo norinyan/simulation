@@ -20,6 +20,8 @@ def load_presets(path):
 
 
 def task_supported(scene, start, goal):
+    if scene.get('same_floor_navigation'):
+        return start != goal and abs(scene['points'][start]['pose'][2]-scene['points'][goal]['pose'][2]) < .003
     return [start, goal] in scene['executable_routes']
 
 
@@ -30,14 +32,17 @@ def atomic_yaml(path, data):
     temporary.replace(path)
 
 
-def placement_scene(source, name, pose, output):
-    """Use live World geometry on storeys; never reuse two_steps bounds there."""
+def placement_scene(source, name, pose, output, goal=None, world_file=None):
+    """Freeze the selected task and actual runtime World; share robot geometry."""
     data = copy.deepcopy(yaml.safe_load(Path(source).read_text()))
+    scenes = data.pop('scenes', {})
     if name == 'three_floor':
-        data['scene']['name'] = name
-        data['scene']['world_file'] = 'worlds/three_floor.world'
-        data['scene']['live_geometry'] = True
-    data['scene']['waypoints']['A'] = list(pose)
+        data['scene'] = copy.deepcopy(scenes[name])
+        data['scene']['waypoints'] = {'start': list(pose), 'goal': list(goal if goal is not None else pose)}
+        if world_file is not None:
+            data['scene']['world_file'] = str(Path(world_file).resolve())
+    else:
+        data['scene']['waypoints'][data['scene']['task_route'][0]] = list(pose)
     atomic_yaml(output, data)
 
 

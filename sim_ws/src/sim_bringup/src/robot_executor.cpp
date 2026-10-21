@@ -295,7 +295,7 @@ public:
       mount_={r("folded_shoulder_pitch"),r("folded_knee_pitch"),r("folded_ankle_pitch")};
       body_height_=config_["foot"]["body_height"].as<double>();lift_target_=config_["foot"]["wheel_lift"].as<double>();
       morph_time_=t["morph_duration"].as<double>();command_timeout_=t["command_timeout"].as<double>();feedback_timeout_=t["feedback_timeout"].as<double>();
-      max_v_=config_["teb"]["max_v"].as<double>();max_w_=config_["teb"]["max_w"].as<double>();max_a_=config_["teb"]["max_a"].as<double>();max_alpha_=config_["teb"]["max_alpha"].as<double>();
+      max_v_=config_["motion"]["max_v"].as<double>();max_w_=config_["motion"]["max_w"].as<double>();max_a_=config_["motion"]["max_a"].as<double>();max_alpha_=config_["motion"]["max_alpha"].as<double>();
       const auto p=model_->WorldPose();x_=p.Pos().X();y_=p.Pos().Y();z_=p.Pos().Z();yaw_=p.Rot().Yaw();ground_=z_-wheel_height_;folded();
       odom_=node_->create_publisher<nav_msgs::msg::Odometry>("/robot/odom",10);
       joints_=node_->create_publisher<sensor_msgs::msg::JointState>("/joint_states",10);

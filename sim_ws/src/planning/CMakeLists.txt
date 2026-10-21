@@ -19,7 +19,7 @@ target_include_directories(teb_optimizer PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(teb_optimizer PRIVATE Ceres::ceres)
+target_link_libraries(teb_optimizer PUBLIC planning PRIVATE Ceres::ceres)
 
 add_library(footstep_planner SHARED src/local/foot/footstep_planner.cpp)
 add_library(planning::footstep_planner ALIAS footstep_planner)

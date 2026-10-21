@@ -58,6 +58,13 @@ planning::LocalPlanRequest makeRequest()
   r.reference_path = {r.geometry.start,r.geometry.goal};
   return r;
 }
+
+struct StubLocal final : planning::WheelLocalPlanner
+{
+  planning::LocalPlanResult output;
+  bool called{false};
+  planning::LocalPlanResult plan(const planning::LocalPlanRequest&) override {called=true;return output;}
+};
 }  // namespace
 
 int main()
@@ -103,6 +110,32 @@ int main()
     options.time_horizon = 0;
     try { planning::TebOptimizer bad(options); } catch (const std::invalid_argument&) { invalid = true; }
     expect(invalid,"Accepted zero time horizon");
+    auto selected=planning::makeWheelPlanner("teb");
+    r=makeRequest();r.limits=planning::WheelMotionLimits{};
+    const auto checked=planning::runPlanner(*selected,r);
+    verify(r,planning::TebOptions{},checked);
+    StubLocal stub;stub.output=checked;
+    expect(planning::runPlanner(stub,r).success && stub.called,"Local interface did not dispatch");
+    stub.output.trajectory[1].linear_velocity=42;
+    expect(!planning::runPlanner(stub,r).success,"Trusted false velocity report");
+    stub.output=checked;stub.output.trajectory[1].pose.x=std::numeric_limits<double>::quiet_NaN();
+    expect(!planning::runPlanner(stub,r).success,"Trusted nonfinite local path");
+    stub.output=checked;r.geometry.control.cancelled=std::make_shared<std::atomic_bool>(true);
+    stub.called=false;
+    expect(planning::runPlanner(stub,r).failure_reason=="PLANNING_CANCELLED" && !stub.called,"Ran cancelled request");
+    bool unknown=false;
+    try {planning::makeWheelPlanner("missing");} catch(const std::invalid_argument&) {unknown=true;}
+    expect(unknown,"Unknown local planner silently fell back");
+    // Actual rolling-control corner: a seed must retain measured angular
+    // velocity instead of asking the first knot to reverse it instantaneously.
+    r=makeRequest();r.geometry.bounds={-6.85,2,-3.825,3.825};
+    r.geometry.goal={1.6,0,0,0};r.geometry.obstacles={{-2,0,.4,.8,.8,.8}};
+    r.reference_path={{-4.5,0,0,0},{-2.5,-.975,0,.025},{-.5,-.925,0,.443},{1.45,0,0,0},{1.6,0,0,0}};
+    r.geometry.start={-.61221078127149231,-.92094166785356546,0,.13915135078138616};
+    r.initial_linear_velocity=.29844650360376668;r.initial_angular_velocity=.43840790949915631;
+    planning::TebOptions corner;corner.time_horizon=6.;r.limits=corner;
+    auto corner_planner=planning::makeWheelPlanner("teb",corner);
+    verify(r,corner,planning::runPlanner(*corner_planner,r));
     std::cout << "PASS: Ceres bands, real wheel sections, temporal/motion bounds, wrapping and invalid inputs\n";
   } catch (const std::exception& e) {
     std::cerr << "FAIL: " << e.what() << '\n'; return 1;

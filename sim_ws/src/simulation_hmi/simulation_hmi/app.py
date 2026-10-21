@@ -183,8 +183,11 @@ class ControlPanel(QMainWindow):
             return
         start, goal = self.selected_pose(self.start_point), self.selected_pose(self.goal_point)
         self.coordinates.setText(f'出生地面坐标：{tuple(start[:3])} m   朝向：{start[3]:.2f} rad\n目标地面坐标：{tuple(goal[:3])} m')
-        self.route_note.setText('可执行任务：A → E → X → B。出生点生成后锁定。' if self.supported()
-                                else '当前组合仅支持机器人放置和目标标记；未接入导航。')
+        self.route_note.setText(('同层轮式导航；跨层任务暂未开放。' if self.scene() == 'three_floor'
+                                 else '可执行任务：A → E → X → B。出生点生成后锁定。') if self.supported()
+                                else '当前组合仅支持放置和目标标记；跨层导航暂未开放。')
+        if self.spawned and self.scene() == 'three_floor':
+            self.write_task()
         self.plan_ready = False
         self.write_view()
         self.update_buttons()
@@ -262,7 +265,7 @@ class ControlPanel(QMainWindow):
             pose = self.selected_pose(self.start_point)
             check_static_placement(self.share/'worlds'/f'{self.scene()}.world', pose)
             self.scene_file = self.session_dir/'robot_scene.yaml'
-            placement_scene(self.share/'config/scene.yaml', self.scene(), pose, self.scene_file)
+            self.write_task()
         except (OSError, ValueError) as error:
             self.message('生成被拒绝：'+str(error))
             return
@@ -274,20 +277,28 @@ class ControlPanel(QMainWindow):
         self.message('正在生成机器人，等待实际里程计与执行器状态。')
         self.update_buttons()
 
+    def write_task(self):
+        placement_scene(self.share/'config/scene.yaml', self.scene(), self.selected_pose(self.start_point), self.scene_file,
+                        goal=self.selected_pose(self.goal_point), world_file=self.session_dir/'runtime.world')
+
+    def factor_supported(self):
+        return self.factor.currentData() <= self.presets[self.scene()].get('max_navigation_factor', 1)
+
     def start_planner(self):
         self.launch('planner', ['ros2', 'run', 'sim_bringup', 'planning_node', '--ros-args',
                                 '--params-file', str(self.share/'config/planning.yaml'),
                                 '-p', 'scene_file:='+str(self.scene_file),
                                 '-p', 'output_dir:='+str(self.session_dir/'planning'),
                                 '-p', 'use_sim_time:=true', '-p', 'local_enabled:=true',
-                                '-p', 'foot_enabled:=true', '-p', 'autonomous:=false', '-p', 'interactive:=true'])
+                                '-p', 'foot_enabled:='+str(self.scene() == 'two_steps').lower(), '-p', 'autonomous:=false', '-p', 'interactive:=true'])
 
     def plan(self):
         if not self.spawned or not self.supported() or self.busy or self.task_used:
             return
-        if self.factor.currentData() != 1:
-            self.message('机器人闭环任务本版仅开放正常速度；请重新启动为 1 倍。')
+        if not self.factor_supported():
+            self.message('当前场景不支持此闭环倍率，请降低倍率后重新启动。')
             return
+        self.write_task()
         self.busy, self.plan_ready = True, False
         self.task_text = '正在规划'
         self.message('请求仅规划；机器人将保持静止。')
@@ -296,8 +307,9 @@ class ControlPanel(QMainWindow):
 
     def plan_response(self, response, error):
         self.busy = False
-        self.plan_ready = bool(response and response.success)
-        self.task_text = '规划就绪' if self.plan_ready else '规划未就绪'
+        self.plan_ready = bool(response and response.success and not self.task_used and not self.stop_requested)
+        if not self.task_used and not self.stop_requested:
+            self.task_text = '规划就绪' if self.plan_ready else '规划未就绪'
         self.message(response.message if response else error)
         self.update_buttons()
 
@@ -389,7 +401,7 @@ class ControlPanel(QMainWindow):
             self.generation += 1
             self.write_view()
             self.message('已收到机器人实际反馈。')
-            if not self.task_used and self.scene() == 'two_steps' and self.start_point.currentData() == 'A':
+            if not self.task_used and (self.scene() == 'three_floor' or self.start_point.currentData() == 'A'):
                 self.start_planner()
         if self.stop_requested and abs(msg.twist.twist.linear.x)<.001 and abs(msg.twist.twist.angular.z)<.001:
             self.task_active = False
@@ -485,7 +497,7 @@ class ControlPanel(QMainWindow):
         self.spawn_button.setEnabled(self.ready and not self.stopping and not self.spawned and not self.spawning and not robot_nodes)
         self.remove_button.setEnabled(self.spawned and not self.task_active and not self.busy and not self.removing and not self.stopping)
         planner_ready = hasattr(self, 'ros') and self.ros.clients['plan'].service_is_ready()
-        self.plan_button.setEnabled(self.spawned and self.supported() and planner_ready and not self.task_used and not self.busy and self.factor.currentData() == 1 and not self.stopping)
+        self.plan_button.setEnabled(self.spawned and self.supported() and planner_ready and not self.task_used and not self.busy and self.factor_supported() and not self.stopping)
         self.execute_button.setEnabled(self.plan_ready and self.supported() and not self.task_used and not self.busy and not self.stopping)
         self.stop_button.setEnabled(self.spawned and not self.stopping)
         self.follow_button.setEnabled(self.spawned and not self.stopping)

@@ -3,19 +3,26 @@ planning_node:
     resolution: 0.05       # A* grid spacing, metres
     safety_margin: 0.05    # Additional footprint clearance, metres
     max_grid_cells: 2000000
-    teb:
+    planners:
+      global: astar
+      wheel: teb
+      foot: footstep
+      timeout: 25.0          # Whole offline request, wall seconds.
+      local_timeout: 0.6    # One execution prediction, wall seconds.
+    motion:
       max_v: 0.30
       max_w: 0.80
       max_a: 0.30
       max_alpha: 1.0
       safety_margin: 0.05
       time_horizon: 6.0       # Seconds per rolling prediction.
-      spacing: 0.15
-      iterations: 30
-      solver_time_limit: 0.10
       max_lateral_velocity: 0.01
       collision_translation_step: 0.01
       collision_rotation_step: 0.02
+    teb:
+      spacing: 0.15
+      iterations: 30
+      solver_time_limit: 0.10
     foot:
       resolution: 0.05
       max_step: 0.50

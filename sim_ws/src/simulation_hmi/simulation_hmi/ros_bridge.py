@@ -42,7 +42,8 @@ class RosBridge(QObject):
         self.timer.start()
 
     def spin(self):
-        for _ in range(5):
+        # 5x navigation produces several hundred feedback callbacks per second.
+        for _ in range(20):
             rclpy.spin_once(self.node, timeout_sec=0)
         now = time.monotonic()
         for item in list(self.pending):
