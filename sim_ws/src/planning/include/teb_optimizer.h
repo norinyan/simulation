@@ -13,8 +13,6 @@ struct TebOptions : WheelMotionLimits
   double solver_time_limit{0.10};
 };
 
-std::unique_ptr<WheelLocalPlanner> makeWheelPlanner(const std::string& name, TebOptions options = {});
-
 // Ceres timed elastic band migrated from wheel_leg_demo. Planning only:
 // no ROS/Gazebo, feedback, commands, or execution. The output is a validated
 // prediction up to time_horizon, not the result of traversing a whole section.

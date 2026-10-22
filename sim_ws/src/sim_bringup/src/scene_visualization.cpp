@@ -40,7 +40,7 @@ class SceneVisualization final : public GUIPlugin {
  std::string config_text_;bool follow_=false,capture_pending_=false;std::vector<rendering::DynamicLines*> lines_;
  std::chrono::steady_clock::time_point config_check_{};
  ignition::math::Vector3d marker_start_,marker_goal_;bool markers_=false;
- int robot_floor_=0;
+ int robot_floor_=0;bool robot_present_=false;
  QLabel *labels_[3]{};std::string out_,world_,view_;int floor_=0;bool split_=false;bool ready_=false,saved_=false;double start_=-1,snapshot_after_=2;
  static double Wall(){return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();}
  static void Remember(PoseHistory& history,double stamp,const ignition::math::Pose3d& pose){
@@ -166,7 +166,7 @@ class SceneVisualization final : public GUIPlugin {
    const bool layout=view!=view_||floor!=floor_||config["robot_generation"].as<int>(0)!=generation_;
    if(generation_!=config["robot_generation"].as<int>(0)){
     for(auto& marker:foot_markers_)scene->RemoveVisual(marker);foot_markers_.clear();
-    std::lock_guard<std::mutex> lock(mutex_);foot_data_.clear();drawn_foot_data_.clear();
+    std::lock_guard<std::mutex> lock(mutex_);foot_data_.clear();drawn_foot_data_.clear();robot_poses_.clear();
    }
    generation_=config["robot_generation"].as<int>(0);
    view_=view;floor_=floor;follow_=config["follow"].as<bool>(false);
@@ -232,6 +232,7 @@ class SceneVisualization final : public GUIPlugin {
  }
  void Build(const rendering::ScenePtr &scene){
   auto response=transport::request(world_,"scene_info");if(!response)return;if(!data_.ParseFromString(response->serialized_data()) || data_.model_size()==0)return;
+  robot_present_=false;
   // Hide editor gizmos, while keeping every light and its illumination active.
   for(uint32_t i=0;i<scene->LightCount();++i)scene->LightByIndex(i)->ShowVisual(false);
   for(const auto &m:data_.model()){
@@ -241,7 +242,7 @@ class SceneVisualization final : public GUIPlugin {
    const int floor=robot?int(std::round((m.pose().position().z()-.32)/3.2))+1:Floor(m.name());
    if(!robot && !floor && world_=="three_floor")continue;
    const bool show=world_!="three_floor" || Visible(m.name(),floor);
-   if(robot)robot_floor_=floor;
+   if(robot){robot_floor_=floor;robot_present_=true;}
    auto found=models_.find(m.name());
    if(found==models_.end()){
     const auto name="scene_view::"+m.name();rendering::VisualPtr root(new rendering::Visual(name,scene->WorldVisual()));root->Load();visuals_.push_back(root);models_[m.name()]=root;
@@ -270,9 +271,9 @@ class SceneVisualization final : public GUIPlugin {
    }
   }
   // A removed robot has no physical model in the fresh Scene response.
-  if(models_.count("wheel_leg_robot")){
-   bool present=false;for(const auto &m:data_.model())if(m.name()=="wheel_leg_robot")present=true;
-   if(!present)models_.at("wheel_leg_robot")->SetVisible(false);
+  if(!robot_present_){
+   if(models_.count("wheel_leg_robot"))models_.at("wheel_leg_robot")->SetVisible(false);
+   std::lock_guard<std::mutex> lock(mutex_);robot_poses_.clear();
   }
   // A wide follow camera may sit behind a room wall. Fade only render surfaces;
   // the physical walls, doors and windows retain their original collisions.
@@ -296,7 +297,7 @@ class SceneVisualization final : public GUIPlugin {
   // A 100 ms display buffer absorbs transport jitter. It never changes physics,
   // collision checks or planning feedback, and never extrapolates stale poses.
   const double display_time=Wall()-.1;
-  {std::lock_guard<std::mutex> lock(mutex_);for(const auto& entry:robot_poses_)robot[entry.first]=Sample(entry.second,display_time);}
+  {std::lock_guard<std::mutex> lock(mutex_);if(robot_present_)for(const auto& entry:robot_poses_)robot[entry.first]=Sample(entry.second,display_time);}
   auto tracked=robot.find("wheel_leg_robot");
   if(world_=="three_floor" && tracked!=robot.end()){
    const int level=std::clamp(int(std::floor((tracked->second.Pos().Z()-.32+.005)/3.2))+1,1,3);

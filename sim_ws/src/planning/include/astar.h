@@ -30,7 +30,7 @@ private:
   AStarOptions options_;
 };
 
-std::unique_ptr<GlobalPlanner> makeGlobalPlanner(const std::string& name, AStarOptions options = {});
+
 
 }  // namespace planning
 

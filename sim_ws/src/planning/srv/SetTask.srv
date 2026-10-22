@@ -1,0 +1,8 @@
+geometry_msgs/Pose start
+geometry_msgs/Pose goal
+string global_planner
+string wheel_planner
+string foot_planner
+---
+bool success
+string message

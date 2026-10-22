@@ -3,6 +3,7 @@ from datetime import datetime
 from pathlib import Path
 import math
 import os
+from uuid import uuid4
 import xml.etree.ElementTree as ET
 
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
@@ -43,6 +44,17 @@ def setup(context):
         node = ET.SubElement(physics, 'real_time_factor')
     node.text = str(factor)
     world = output/'runtime.world'
+    root = tree.getroot().find('world')
+    for patrol in root.findall('model/plugin'):
+        if patrol.get('filename') == 'libscene_controller.so':
+            paused = patrol.find('paused')
+            if paused is None:
+                paused = ET.SubElement(patrol, 'paused')
+            paused.text = value('pedestrians_paused')
+    plugin = ET.SubElement(root, 'plugin', name='scene_map', filename='libscene_map.so')
+    ET.SubElement(plugin, 'scene_file').text = str(Path(value('scene_file')).resolve())
+    ET.SubElement(plugin, 'world_file').text = str(world)
+    ET.SubElement(plugin, 'version').text = uuid4().hex
     tree.write(world, encoding='utf-8', xml_declaration=True)
     plugin_path = str(lib)+os.pathsep+os.environ.get('GAZEBO_PLUGIN_PATH', '')
     env = dict(os.environ, GAZEBO_MASTER_URI=value('master_uri'), GAZEBO_PLUGIN_PATH=plugin_path,
@@ -64,11 +76,13 @@ def setup(context):
 def generate_launch_description():
     output = Path.home()/'.local/state/simulation'/datetime.now().strftime('scene_%Y%m%d_%H%M%S_%f')
     return LaunchDescription([
+        DeclareLaunchArgument('scene_file', default_value=str(Path(get_package_share_directory('sim_bringup'))/'config/scene.yaml')),
         DeclareLaunchArgument('scene', default_value='three_floor', choices=['three_floor', 'two_steps']),
         DeclareLaunchArgument('gui', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument('view', default_value='exterior', choices=['exterior', 'top', 'interior', 'split']),
         DeclareLaunchArgument('floor', default_value='0', choices=['0', '1', '2', '3']),
         DeclareLaunchArgument('real_time_factor', default_value='1'),
+        DeclareLaunchArgument('pedestrians_paused', default_value='false', choices=['true', 'false']),
         DeclareLaunchArgument('snapshot_after', default_value='2'),
         DeclareLaunchArgument('output_dir', default_value=str(output)),
         DeclareLaunchArgument('master_uri', default_value='http://127.0.0.1:11345'),

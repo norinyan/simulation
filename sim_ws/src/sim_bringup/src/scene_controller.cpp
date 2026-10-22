@@ -3,6 +3,8 @@
 #include <gazebo/physics/physics.hh>
 #include <gazebo/transport/transport.hh>
 #include <gazebo/msgs/msgs.hh>
+#include <gazebo_ros/node.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <cmath>
 #include <iomanip>
 #include <sstream>
@@ -16,19 +18,24 @@ class SceneController final : public ModelPlugin {
   event::ConnectionPtr update_;
   transport::NodePtr node_;
   transport::PublisherPtr state_;
+  gazebo_ros::Node::SharedPtr ros_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr feedback_;
   std::vector<Waypoint> points_;
   std::vector<Phase> phases_;
   double speed_{0}, delay_{0}, period_{0}, last_publish_{-1};
   double initial_yaw_{0};
-  bool reverse_{false};
+  bool reverse_{false}, paused_{false};
  public:
   void Load(physics::ModelPtr model, sdf::ElementPtr sdf) override {
     try {
+      ros_=gazebo_ros::Node::Get(sdf,model->GetName());
+      feedback_=ros_->create_publisher<nav_msgs::msg::Odometry>("/scene/pedestrians",rclcpp::QoS(20).reliable());
       model_=model; speed_=sdf->Get<double>("speed");
       delay_=sdf->HasElement("start_delay") ? sdf->Get<double>("start_delay") : 0.;
       const std::string direction=sdf->HasElement("initial_direction") ? sdf->Get<std::string>("initial_direction") : "forward";
       if(direction!="forward" && direction!="reverse")throw std::runtime_error("initial_direction must be forward or reverse");
       reverse_=direction=="reverse";
+      paused_=sdf->HasElement("paused") && sdf->Get<bool>("paused");
       if(!std::isfinite(speed_) || speed_<=0 || !std::isfinite(delay_) || delay_<0)throw std::runtime_error("invalid speed/start_delay");
       if(!sdf->HasElement("waypoint"))throw std::runtime_error("missing waypoints");
       for(auto p=sdf->GetElement("waypoint");p;p=p->GetNextElement("waypoint")) {
@@ -63,8 +70,9 @@ class SceneController final : public ModelPlugin {
     const double now=info.simTime.Double(), elapsed=now-delay_;
     size_t at=reverse_?points_.size()-1:0;auto pos=points_[at].p;
     double yaw=initial_yaw_,remaining=std::max(0.,-elapsed);int dir=reverse_?-1:1;
-    std::string mode="DELAY";
-    if(elapsed>=0){
+    std::string mode=paused_?"PAUSED":"DELAY";
+    if(paused_)remaining=0;
+    if(!paused_ && elapsed>=0){
       const double t=std::fmod(elapsed,period_);
       for(const auto &p:phases_)if(t<p.begin+p.duration){
         at=p.from;dir=p.direction;mode=p.wait?"PAUSE":(dir>0?"FORWARD":"RETURN");remaining=p.wait?p.begin+p.duration-t:0.;
@@ -80,6 +88,8 @@ class SceneController final : public ModelPlugin {
         <<"{\"name\":\""<<model_->GetName()<<"\",\"sim_s\":"<<now<<",\"x\":"<<actual.Pos().X()<<",\"y\":"<<actual.Pos().Y()<<",\"z\":"<<actual.Pos().Z()
         <<",\"yaw\":"<<actual.Rot().Yaw()<<",\"state\":\""<<mode<<"\",\"speed\":"<<(mode=="FORWARD"||mode=="RETURN"?speed_:0)
         <<",\"wait_remaining\":"<<remaining<<",\"waypoint\":"<<at<<",\"direction\":"<<dir<<",\"period\":"<<period_<<"}";
+      nav_msgs::msg::Odometry feedback;feedback.header.stamp=rclcpp::Time(int64_t(now*1e9));feedback.header.frame_id="world";feedback.child_frame_id=model_->GetName();
+      feedback.pose.pose.position.x=actual.Pos().X();feedback.pose.pose.position.y=actual.Pos().Y();feedback.pose.pose.position.z=actual.Pos().Z();feedback.pose.pose.orientation.z=actual.Rot().Z();feedback.pose.pose.orientation.w=actual.Rot().W();feedback.twist.twist.linear.x=mode=="FORWARD"||mode=="RETURN"?speed_:0;feedback_->publish(feedback);
       msgs::GzString message;message.set_data(out.str());state_->Publish(message);last_publish_=now;
     }
   }

@@ -1,64 +1,48 @@
 cmake_minimum_required(VERSION 3.8)
 project(planning)
-
 find_package(ament_cmake REQUIRED)
 find_package(Ceres REQUIRED)
-
-add_library(planning SHARED src/global/astar.cpp src/local/foot_motion.cpp)
-add_library(planning::planning ALIAS planning)
-target_compile_features(planning PUBLIC cxx_std_17)
-target_include_directories(planning PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>
-)
-
+find_package(rclcpp REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
+find_package(builtin_interfaces REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+find_package(ignition-math6 REQUIRED)
+find_package(gazebo_dev REQUIRED)
+find_package(yaml_cpp_vendor REQUIRED)
+find_package(yaml-cpp REQUIRED)
+rosidl_generate_interfaces(${PROJECT_NAME}
+  msg/Box.msg msg/SupportRegion.msg msg/StairConnection.msg
+  msg/PatrolPhase.msg msg/MovingObstacle.msg msg/SceneMap.msg msg/ExecutionCommand.msg
+  srv/SetTask.srv
+  DEPENDENCIES std_msgs geometry_msgs trajectory_msgs builtin_interfaces)
+rosidl_get_typesupport_target(typesupport ${PROJECT_NAME} rosidl_typesupport_cpp)
+add_library(planning_common SHARED src/geometry.cpp src/motion.cpp src/scene_data.cpp)
+add_library(global_astar SHARED src/global/astar.cpp)
 add_library(teb_optimizer SHARED src/local/wheel/teb_optimizer.cpp)
-add_library(planning::teb_optimizer ALIAS teb_optimizer)
-target_compile_features(teb_optimizer PUBLIC cxx_std_17)
-target_include_directories(teb_optimizer PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>
-)
-target_link_libraries(teb_optimizer PUBLIC planning PRIVATE Ceres::ceres)
-
 add_library(footstep_planner SHARED src/local/foot/footstep_planner.cpp)
-add_library(planning::footstep_planner ALIAS footstep_planner)
-target_compile_features(footstep_planner PUBLIC cxx_std_17)
-target_include_directories(footstep_planner PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>
-)
-
-target_link_libraries(footstep_planner PUBLIC planning)
-
+add_library(planner_api SHARED src/planner_api.cpp)
+foreach(target planning_common global_astar teb_optimizer footstep_planner planner_api)
+ target_compile_features(${target} PUBLIC cxx_std_17)
+ target_include_directories(${target} PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
+endforeach()
+target_link_libraries(planning_common PUBLIC ignition-math6::ignition-math6)
+target_link_libraries(global_astar PUBLIC planning_common)
+target_link_libraries(teb_optimizer PUBLIC planning_common PRIVATE Ceres::ceres)
+target_link_libraries(footstep_planner PUBLIC planning_common)
+target_link_libraries(planner_api PUBLIC planning_common PRIVATE global_astar teb_optimizer footstep_planner)
+add_executable(planning_node src/planning_node.cpp src/navigator.cpp)
+target_compile_features(planning_node PRIVATE cxx_std_17)
+ament_target_dependencies(planning_node rclcpp nav_msgs geometry_msgs std_msgs std_srvs trajectory_msgs gazebo_dev)
+target_link_libraries(planning_node planner_api yaml-cpp ${typesupport})
 install(DIRECTORY include/ DESTINATION include)
-install(TARGETS planning teb_optimizer footstep_planner EXPORT export_planning
-  LIBRARY DESTINATION lib
-  ARCHIVE DESTINATION lib
-  RUNTIME DESTINATION bin
-)
-
+install(TARGETS planning_common global_astar teb_optimizer footstep_planner planner_api EXPORT export_planning LIBRARY DESTINATION lib ARCHIVE DESTINATION lib RUNTIME DESTINATION bin)
+install(TARGETS planning_node DESTINATION lib/${PROJECT_NAME})
+install(DIRECTORY launch config DESTINATION share/${PROJECT_NAME})
 ament_export_targets(export_planning HAS_LIBRARY_TARGET)
 ament_export_include_directories(include)
-
-if(BUILD_TESTING)
-  # Reuse private geometry helpers without copying the planner implementation.
-  # This variant exports only acceptance functions; production exports only planners.
-  add_library(foot_acceptance STATIC src/local/foot/footstep_planner.cpp)
-  target_compile_features(foot_acceptance PRIVATE cxx_std_17)
-  target_compile_definitions(foot_acceptance PRIVATE PLANNING_FOOT_ACCEPTANCE_ONLY)
-  target_link_libraries(foot_acceptance PUBLIC planning)
-  install(TARGETS foot_acceptance EXPORT export_planning ARCHIVE DESTINATION lib)
-  enable_testing()
-  add_executable(astar_test test/astar_test.cpp)
-  target_link_libraries(astar_test planning)
-  add_test(NAME astar_test COMMAND astar_test)
-  add_executable(teb_test test/teb_test.cpp)
-  target_link_libraries(teb_test planning teb_optimizer)
-  add_test(NAME teb_test COMMAND teb_test)
-  add_executable(foot_test test/foot_test.cpp)
-  target_link_libraries(foot_test planning)
-  add_test(NAME foot_test COMMAND foot_test)
-endif()
-
+ament_export_dependencies(ignition-math6 rosidl_default_runtime)
 ament_package()

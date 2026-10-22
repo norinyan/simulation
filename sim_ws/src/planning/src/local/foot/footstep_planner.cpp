@@ -1,7 +1,4 @@
 #include "footstep_planner.h"
-#ifdef PLANNING_FOOT_ACCEPTANCE_ONLY
-#include "foot_acceptance.h"
-#endif
 
 #include <algorithm>
 #include <chrono>
@@ -158,22 +155,23 @@ double dot(const Vec& a,const Vec& b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
 Vec cross(const Vec& a,const Vec& b){return {a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]};}
 bool boxHit(const Part& a,const Part& b)
 {
+  const Vec d{a.box.center_x-b.box.center_x,a.box.center_y-b.box.center_y,a.box.center_z-b.box.center_z};
+  const Vec ah{a.box.size_x/2,a.box.size_y/2,a.box.size_z/2},bh{b.box.size_x/2,b.box.size_y/2,b.box.size_z/2};
+  // Most World solids are distant: reject them before constructing OBB axes.
+  // This is the same conservative sphere test used below previously.
+  if(dot(d,d)>std::pow(std::sqrt(dot(ah,ah))+std::sqrt(dot(bh,bh)),2))return false;
   auto axes=[](const Part& p){
     const double y=p.box.yaw,t=p.pitch+p.box.pitch,r=p.box.roll;
     const double cy=std::cos(y),sy=std::sin(y),ct=std::cos(t),st=std::sin(t),cr=std::cos(r),sr=std::sin(r);
     return std::array<Vec,3>{Vec{cy*ct,sy*ct,-st},Vec{cy*st*sr-sy*cr,sy*st*sr+cy*cr,ct*sr},Vec{cy*st*cr+sy*sr,sy*st*cr-cy*sr,ct*cr}};
   };
   const auto aa=axes(a),bb=axes(b);
-  const Vec d{a.box.center_x-b.box.center_x,a.box.center_y-b.box.center_y,a.box.center_z-b.box.center_z};
-  const Vec ah{a.box.size_x/2,a.box.size_y/2,a.box.size_z/2},bh{b.box.size_x/2,b.box.size_y/2,b.box.size_z/2};
   auto separated=[&](Vec axis){
     const double n=std::sqrt(dot(axis,axis));if(n<1e-8)return false;
     for(auto& v:axis)v/=n;
     double e=0;for(int i=0;i<3;++i)e+=ah[i]*std::abs(dot(axis,aa[i]))+bh[i]*std::abs(dot(axis,bb[i]));
     return std::abs(dot(d,axis))>=e-kEpsilon;
   };
-  // Cheap bounding sphere rejection before the separating axes.
-  if(dot(d,d)>std::pow(std::sqrt(dot(ah,ah))+std::sqrt(dot(bh,bh)),2))return false;
   for(int i=0;i<3;++i){if(separated(aa[i])||separated(bb[i]))return false;
     for(int j=0;j<3;++j)if(separated(cross(aa[i],bb[j])))return false;}
   return true;
@@ -747,7 +745,7 @@ FootLocalPlanResult planSpatial(const FootLocalPlanRequest& request,const Footst
  canonicalizeFootCoordinates(out.trajectory);
  // Pack long individual segments into the existing 20k message contract.
  // Preserve every coordinate's stationary/moving boundary and <=50 ms knots;
- // the public validator checks the resulting execution polynomials at <=5 ms.
+ // Preserve phase boundaries and the executor sampling interval.
  if(out.trajectory.size()>20000){
    std::vector<Sample> knots;knots.push_back(out.trajectory.front());
    for(std::size_t i=1;i+1<out.trajectory.size();++i){
@@ -767,81 +765,7 @@ FootLocalPlanResult planSpatial(const FootLocalPlanRequest& request,const Footst
 }
 } // namespace
 
-#ifdef PLANNING_FOOT_ACCEPTANCE_ONLY
-void validateSpatialFootTrajectory(const FootLocalPlanRequest& r,const FootLocalPlanResult& out){
- if(!r.limits || out.trajectory.size()<2 || out.trajectory.size()>20000)throw std::runtime_error("SPATIAL_SAMPLE_COUNT");
- const auto& o=*r.limits;
- const auto& first=out.trajectory.front();const auto& last=out.trajectory.back();
- for(int side=0;side<2;++side){
-  const auto expected=standingFoot(last.body,side,r.robot,r.geometry.goal.z);const auto& actual=last.feet[side];
-  if(std::hypot(expected.x-actual.x,expected.y-actual.y)>1e-5 || std::abs(expected.z-actual.z)>1e-5 || !supportedFoot(actual,r) || std::abs(std::atan2(std::sin(expected.yaw-actual.yaw),std::cos(expected.yaw-actual.yaw)))>1e-5)
-   throw std::runtime_error("SPATIAL_FINAL_STANCE_MISMATCH");
- }
- for(const auto* endpoint_sample:{&first,&last})for(const auto* derivatives:{&endpoint_sample->spatial_velocity,&endpoint_sample->spatial_acceleration})for(const auto& d:*derivatives)
-   if(std::max({std::abs(d.x),std::abs(d.y),std::abs(d.z),std::abs(d.yaw)})>1e-9)throw std::runtime_error("SPATIAL_ENDPOINT_DERIVATIVE");
- auto endpoint=[&](const Sample& s,const Pose& p){return std::hypot(s.body.x-p.x,s.body.y-p.y)<1e-5 && std::abs(s.body.z-p.z-o.body_height)<1e-5 && std::abs(std::atan2(std::sin(s.body.yaw-p.yaw),std::cos(s.body.yaw-p.yaw)))<1e-5;};
- if(first.time_from_start!=0 || !endpoint(first,r.geometry.start)||!endpoint(last,r.geometry.goal))throw std::runtime_error("SPATIAL_ENDPOINT_MISMATCH");
- if(r.current_body){
-   const std::array<Pose,3> expected{*r.current_body,r.current_feet[0],r.current_feet[1]},actual{first.body,first.feet[0],first.feet[1]};
-   if(!r.supported[0]&&!r.supported[1])throw std::runtime_error("INITIAL_SUPPORT_STATE_REQUIRED");
-   for(int side=0;side<2;++side)if(r.supported[side]!=supportedFoot(r.current_feet[side],r))throw std::runtime_error("INITIAL_SUPPORT_STATE_MISMATCH");
-   for(int j=0;j<3;++j)if(std::hypot(expected[j].x-actual[j].x,expected[j].y-actual[j].y)>1e-9 || std::abs(expected[j].z-actual[j].z)>1e-9 || std::abs(expected[j].yaw-actual[j].yaw)>1e-9)throw std::runtime_error("ACTUAL_INITIAL_FOOT_STATE_MISMATCH");
- }
- std::vector<Sample> continuous;continuous.reserve(out.trajectory.size()*4);
- for(std::size_t i=1;i<out.trajectory.size();++i){
-   const auto& a=out.trajectory[i-1];const auto& b=out.trajectory[i];const double dt=b.time_from_start-a.time_from_start;
-   if(!std::isfinite(dt)||dt<=0||dt>.05+1e-8)throw std::runtime_error("SPATIAL_TIME");
-   const int count=std::max(4,int(std::ceil(dt/.005)));
-   for(int j=0;j<count;++j)continuous.push_back(interpolateFootTrajectory(a,b,double(j)/count));
- }continuous.push_back(last);
- std::array<double,20> previous{},velocity{};double previous_dt=0;
- for(std::size_t i=0;i<continuous.size();++i){
-  if(const auto why=r.geometry.control.failure();!why.empty())throw std::runtime_error(why);
-  const auto& s=continuous[i];spatialPoseValid(s,r);
-  for(int j=0;j<3;++j){
-   const auto& v=s.spatial_velocity[j];const auto& a=s.spatial_acceleration[j];
-   if(!finitePose(v)||!finitePose(a))throw std::runtime_error("NONFINITE_SPATIAL_DERIVATIVE");
-   const double vmax=j?o.max_foot_v:o.max_body_v,amax=j?o.max_foot_a:o.max_body_a;
-   if(std::max({std::abs(v.x),std::abs(v.y),std::abs(v.z)})>vmax+1e-5 ||
-      std::max({std::abs(a.x),std::abs(a.y),std::abs(a.z)})>amax+1e-4 ||
-      std::abs(v.yaw)>o.max_joint_v+1e-5 || std::abs(a.yaw)>o.max_joint_a+1e-4)
-    throw std::runtime_error("SPATIAL_DERIVATIVE_LIMIT");
-  }
-  const auto left=footInverseKinematics(s.body,s.feet[0],0,r.robot),right=footInverseKinematics(s.body,s.feet[1],1,r.robot);
-  std::array<double,20> values{s.body.x,s.body.y,s.body.z,s.body.yaw,s.feet[0].x,s.feet[0].y,s.feet[0].z,s.feet[0].yaw,s.feet[1].x,s.feet[1].y,s.feet[1].z,s.feet[1].yaw};
-  for(int j=0;j<4;++j){values[12+j]=left.joints[j];values[16+j]=right.joints[j];}
-  if(i){
-   const double dt=s.time_from_start-continuous[i-1].time_from_start;
-   if(!std::isfinite(dt)||dt<=0||dt>.05+1e-8)throw std::runtime_error("SPATIAL_TIME");
-   for(int j=0;j<20;++j){
-    const double v=(values[j]-previous[j])/dt,a=2*(v-velocity[j])/(dt+previous_dt);
-    const double vmax=j<3?o.max_body_v:j%4==3||j>=12?o.max_joint_v:o.max_foot_v;
-    const double amax=j<3?o.max_body_a:j%4==3||j>=12?o.max_joint_a:o.max_foot_a;
-    if(std::abs(v)>vmax+1e-5 || (i>1&&std::abs(a)>amax+1e-4))throw std::runtime_error("SPATIAL_MOTION_LIMIT axis="+std::to_string(j)+" t="+std::to_string(s.time_from_start)+" v="+std::to_string(v)+" a="+std::to_string(a));
-    velocity[j]=v;
-   }
-   previous_dt=dt;
-   const auto& prev=continuous[i-1];
-   bool fixed_support=false;
-   for(int side=0;side<2;++side){
-     const auto& a=prev.feet[side];const auto& b=s.feet[side];
-     if(supportedFoot(a,r)&&supportedFoot(b,r) && std::hypot(a.x-b.x,a.y-b.y)<1e-12 && std::abs(a.z-b.z)<1e-12 && std::abs(a.yaw-b.yaw)<1e-12){
-       for(const auto* d:{&prev.spatial_velocity[side+1],&s.spatial_velocity[side+1],&prev.spatial_acceleration[side+1],&s.spatial_acceleration[side+1]})
-         if(std::abs(d->x)+std::abs(d->y)+std::abs(d->z)+std::abs(d->yaw)>1e-12)throw std::runtime_error("CONTACT_INTERPOLATION_DERIVATIVE");
-       fixed_support=true;
-     }
-   }
-   if(!fixed_support)throw std::runtime_error("NO_CONTINUOUS_PLANTED_SUPPORT");
 
-
-  }
-  previous=values;
- }
-}
-
-#endif
-
-#ifndef PLANNING_FOOT_ACCEPTANCE_ONLY
 FootstepPlanner::FootstepPlanner(FootstepOptions options) : options_(options)
 {
   for (double v : {options.resolution, options.max_step, options.swing_clearance, options.step_duration,
@@ -870,79 +794,4 @@ FootLocalPlanResult FootstepPlanner::plan(const FootLocalPlanRequest& request)
   return out;
 }
 
-std::unique_ptr<FootLocalPlanner> makeFootPlanner(const std::string& name, FootstepOptions options)
-{
-  if(name=="footstep") return std::make_unique<FootstepPlanner>(options);
-  throw std::invalid_argument("Unknown foot local planner: "+name);
-}
-
-#endif
-
-#ifdef PLANNING_FOOT_ACCEPTANCE_ONLY
-FootLocalPlanResult validateFootTrajectory(const FootLocalPlanRequest& request, FootLocalPlanResult result)
-{
-  try {
-    const auto& control=request.geometry.control;
-    if(const auto reason=control.failure();!reason.empty()) throw std::runtime_error(reason);
-    if(!request.limits) throw std::invalid_argument("FOOT_MOTION_LIMITS_REQUIRED");
-    FootstepOptions options;
-    static_cast<FootMotionLimits&>(options)=*request.limits;
-    if(!request.spatial)validateRequest(request,options);
-    if(const auto reason=control.failure();!reason.empty()) throw std::runtime_error(reason);
-    if(!result.success) throw std::runtime_error(result.failure_reason.empty()?"PLANNER_FAILED":result.failure_reason);
-    if(result.trajectory.size()<2 || result.trajectory.size()>20000)
-      throw std::runtime_error("INVALID_FOOT_SAMPLE_COUNT count="+std::to_string(result.trajectory.size()));
-    const auto validation_begin=std::chrono::steady_clock::now();
-    if(request.spatial){validateSpatialFootTrajectory(request,result);result.validation_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-validation_begin).count();return result;}
-    const auto& first=result.trajectory.front(); const auto& last=result.trajectory.back();
-    auto matches=[&](const Pose& body,const Pose& ground) {
-      return finitePose(body) && std::hypot(body.x-ground.x,body.y-ground.y)<1e-6 &&
-        std::abs(body.z-ground.z-options.body_height)<1e-6 && std::abs(body.yaw-ground.yaw)<1e-6;
-    };
-    if(first.time_from_start!=0 || !matches(first.body,request.geometry.start) || !matches(last.body,request.geometry.goal))
-      throw std::runtime_error("INVALID_FOOT_ENDPOINTS");
-    const Context context{request,options,0};
-    for(std::size_t i=0;i<result.trajectory.size();++i) {
-      const auto& sample=result.trajectory[i];
-      if(std::abs(sample.body.y-request.geometry.start.y)>1e-6 || std::abs(sample.body.yaw)>1e-6)
-        throw std::runtime_error("INVALID_FOOT_BODY_PLANE");
-      if(!std::isfinite(sample.time_from_start) ||
-         (i && sample.time_from_start-result.trajectory[i-1].time_from_start>.05+1e-9))
-        throw std::runtime_error("INVALID_FOOT_TIME");
-      for(const auto& values:{sample.spatial_velocity,sample.spatial_acceleration}) for(const auto& d:values)
-        if(!finitePose(d)) throw std::runtime_error("NONFINITE_FOOT_DERIVATIVE");
-      int supported=0;
-      for(int side=0;side<2;++side) {
-        const auto& foot=sample.feet[side];
-        if(std::abs(foot.y-footY(side,context))>1e-6 || std::abs(foot.yaw)>1e-6)
-          throw std::runtime_error("INVALID_FOOT_PLANE");
-        if(footLanding(foot.x,side,context) &&
-           std::abs(foot.z-request.robot.foot_size[2]/2-footGround(foot.x,side,context))<1e-6) ++supported;
-      }
-      if(supported==0 || ((i==0 || i+1==result.trajectory.size()) && supported!=2))
-        throw std::runtime_error("INVALID_FOOT_SUPPORT");
-    }
-    std::string reason;
-    if(!footMotionValid(result.trajectory,context,&reason)) throw std::runtime_error("INVALID_FOOT_MOTION: "+reason);
-    result.validation_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-validation_begin).count();
-    if(const auto reason=control.failure();!reason.empty()) throw std::runtime_error(reason);
-  } catch(const std::exception& e) {result={};result.failure_reason=e.what();}
-  return result;
-}
-
-
-#endif
-
-#ifndef PLANNING_FOOT_ACCEPTANCE_ONLY
-std::unique_ptr<FootLocalPlanner> makeFootPlanner(const std::string& name,const PlannerParameters& parameters) {
-  FootstepOptions options;
-  for(const auto& p:parameters) {
-    if(!std::isfinite(p.second))throw std::invalid_argument("NONFINITE_ALGORITHM_PARAMETER: "+p.first);
-    if(p.first=="resolution")options.resolution=static_cast<double>(p.second);
-    else if(p.first=="max_expansions") {if(p.second<1 || p.second>double(std::numeric_limits<int>::max()) || std::floor(p.second)!=p.second)throw std::invalid_argument("INVALID_ALGORITHM_COUNT");options.max_expansions=static_cast<int>(p.second);}
-    else throw std::invalid_argument("UNKNOWN_ALGORITHM_PARAMETER: "+p.first);
-  }
-  return makeFootPlanner(name,options);
-}
-#endif
 }  // namespace planning

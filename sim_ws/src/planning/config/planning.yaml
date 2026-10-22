@@ -1,0 +1,46 @@
+planning_node:
+  ros__parameters:
+    resolution: 0.05       # A* grid spacing, metres
+    safety_margin: 0.05    # Additional footprint clearance, metres
+    max_grid_cells: 2000000
+    planners:
+      global: astar
+      wheel: teb
+      foot: footstep
+      timeout: 25.0          # Global request, wall seconds.
+      stair_timeout: 60.0   # Cross-floor global search, wall seconds.
+      foot_timeout: 60.0    # Each independent foot segment, wall seconds.
+      local_timeout: 0.6    # One execution prediction, wall seconds.
+    motion:
+      max_v: 0.30
+      max_w: 0.80
+      max_a: 0.30
+      max_alpha: 1.0
+      safety_margin: 0.05
+      time_horizon: 6.0       # Seconds per rolling prediction.
+      max_lateral_velocity: 0.01
+      collision_translation_step: 0.01
+      collision_rotation_step: 0.02
+    teb:
+      spacing: 0.15
+      iterations: 30
+      solver_time_limit: 0.10
+    foot:
+      resolution: 0.05
+      max_step: 0.50
+      edge_margin: 0.025
+      swing_clearance: 0.08
+      step_duration: 4.5      # Geometry sampling reference; each step is retimed to shared motion limits.
+      sample_dt: 0.02
+      max_foot_v: 0.8
+      max_foot_a: 3.0
+      max_body_v: 0.3
+      max_body_a: 1.0
+      max_joint_v: 2.0
+      max_joint_a: 20.0
+      body_height: 0.43       # base_link height above support ground.
+      wheel_lift: 0.13
+      max_expansions: 10000
+    task:
+      stage_timeout: 240.0
+      timeout: 600.0

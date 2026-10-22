@@ -12,8 +12,6 @@ struct FootstepOptions : FootMotionLimits
   int max_expansions{10000};
 };
 
-std::unique_ptr<FootLocalPlanner> makeFootPlanner(const std::string& name, FootstepOptions options = {});
-
 // Alternating planar footstep A* and C2, lift/translate/lower quintic swings,
 // migrated from wheel_leg_demo/foot_planner.hpp. Geometry/kinematics only;
 // no execution, feedback, stability or dynamic-balance controller.

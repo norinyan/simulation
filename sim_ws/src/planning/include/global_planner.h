@@ -153,7 +153,11 @@ bool isPoseCollisionFree(const Pose& pose, const PlanRequest& request, double pa
 bool isMotionCollisionFree(const Pose& start, const Pose& end, const PlanRequest& request,
                            double translation_step = .01, double rotation_step = .02);
 
+std::vector<std::string> plannerNames(const std::string& kind);
+
 using PlannerParameters = std::map<std::string,double>;
+PlannerParameters plannerDefaults(const std::string& kind,const std::string& name);
+std::string plannerParameterPrefix(const std::string& kind,const std::string& name);
 std::unique_ptr<GlobalPlanner> makeGlobalPlanner(const std::string&,const PlannerParameters&);
 
 }  // namespace planning

@@ -50,6 +50,24 @@ struct TrajectoryPoint
   double angular_acceleration{0.0};
 };
 
+// Clip at the nearest segment projection, retaining upcoming in-place turns.
+std::vector<Pose> remainingWheelReference(const std::vector<Pose>& path,const Pose& actual);
+
+// Execution and prediction share wheel tracking and bounded-acceleration math.
+struct WheelTrackingCommand {double linear{0},angular{0};};
+inline constexpr double kWheelBrakingPadding = .003;
+// Follow one checked global-path edge, without a local planner or detour.
+WheelTrackingCommand trackGlobalWheelGoal(const Pose& actual,const Pose& goal,
+    const WheelMotionLimits& limits,double approach_gain,double position_tolerance);
+WheelTrackingCommand trackWheel(const Pose& actual,const Pose& goal,
+    const std::vector<TrajectoryPoint>& band,const WheelMotionLimits& limits,
+    double control_dt,double approach_gain,double position_tolerance,bool path_tracking,
+    double trajectory_elapsed=0);
+Pose integrateWheel(Pose pose,double& v,double& w,WheelTrackingCommand command,
+    const WheelMotionLimits& limits,double dt);
+bool wheelBrakingClear(const Pose& actual,double v,double w,WheelTrackingCommand command,
+    const WheelMotionLimits& limits,const PlanRequest& geometry);
+
 struct LocalPlanResult
 {
   bool success{false};

@@ -50,22 +50,6 @@ planning::BoxObstacle projected(const Pose& p,const Vector& size,double low,doub
 }
 }
 
-planning::BoxObstacle movingBox(const MovingBox& model,const Pose& p) {
-  const auto world=p*model.local_pose;
-  return {world.Pos().X(),world.Pos().Y(),world.Pos().Z(),model.size.X(),model.size.Y(),model.size.Z(),world.Rot().Yaw()};
-}
-
-Pose patrolPose(const MovingBox& model,double time) {
-  if(model.phases.empty() || model.period<=0)throw std::runtime_error("Missing pedestrian patrol phases");
-  const double elapsed=time-model.delay;
-  const double t=elapsed<0?0:std::fmod(elapsed,model.period);
-  for(const auto& phase:model.phases)if(t<phase.begin+phase.duration) {
-    const auto p=phase.from+(phase.to-phase.from)*std::clamp((t-phase.begin)/phase.duration,0.,1.);
-    return Pose(p,ignition::math::Quaterniond(0,0,phase.yaw));
-  }
-  throw std::runtime_error("Invalid pedestrian phase time");
-}
-
 static FloorGeometry extractFloorGeometry(const sdf::ElementPtr& world,
                                 const planning::Pose& start,const planning::Pose& goal,
                                 planning::RobotFootprint footprint,double height,double margin) {
@@ -118,6 +102,11 @@ static FloorGeometry extractFloorGeometry(const sdf::ElementPtr& world,
             auto forward=[&](){for(std::size_t i=0;i+1<points.size();++i)phase(i,i+1);};
             auto backward=[&](){for(std::size_t i=points.size()-1;i>0;--i)phase(i,i-1);};
             if(reverse){backward();forward();}else{forward();backward();}
+            if(patrol->HasElement("paused") && patrol->Get<bool>("paused")) {
+              const auto initial=moving.phases.front();
+              moving.delay=0;moving.period=1;
+              moving.phases={{initial.from,initial.from,0,1,initial.yaw}};
+            }
             result.pedestrians.push_back(std::move(moving));
           }
           continue;
@@ -174,6 +163,16 @@ SceneGeometry loadSceneGeometry(const std::string& filename,
     result->solids.push_back(b);named[name]=b;
    }
   }
+ }
+ if(world_name=="two_steps") {
+  std::vector<double> levels;
+  for(const auto& item:named)if(item.first.find("platform")!=std::string::npos || item.first.find("floor")!=std::string::npos) {
+    const auto& b=item.second; const double z=b.center_z+b.size_z/2;
+    if(std::none_of(levels.begin(),levels.end(),[&](double x){return std::abs(x-z)<.003;}))levels.push_back(z);
+  }
+  // The legacy scene has an infinite ground plane and explicit upper platform;
+  // its existing task adapter retains bounded supports/config geometry.
+  prepared.map=std::move(result);return prepared;
  }
  // Semantic slab/tread names identify topology; all dimensions and heights come
  // from the loaded World, never from preset task names or copied scene geometry.
