@@ -10,6 +10,7 @@ from nav_msgs.msg import Odometry
 from rosgraph_msgs.msg import Clock
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
+from rcl_interfaces.srv import SetParametersAtomically
 
 
 class RosBridge(QObject):
@@ -34,6 +35,7 @@ class RosBridge(QObject):
         self.delete = self.node.create_client(DeleteEntity, '/delete_entity')
         self.clients = {name: self.node.create_client(Trigger, '/planning/'+name)
                         for name in ('plan', 'execute', 'stop')}
+        self.parameters = self.node.create_client(SetParametersAtomically, '/planning_node/set_parameters_atomically')
         self.pending = []
         self.last_clock = self.last_odom = 0
         self.timer = QTimer(self)
@@ -67,8 +69,14 @@ class RosBridge(QObject):
             return
         self.pending.append((client.call_async(request), time.monotonic()+timeout, callback))
 
-    def command(self, name, callback):
-        self.request(self.clients[name], Trigger.Request(), callback, 30 if name == 'plan' else 8)
+    def command(self, name, callback, timeout=None):
+        self.request(self.clients[name], Trigger.Request(), callback, timeout if timeout is not None else (30 if name == 'plan' else 8))
+
+    def select_algorithms(self, algorithms, callback):
+        request = SetParametersAtomically.Request()
+        request.parameters = [Parameter('planners.'+key, value=value).to_parameter_msg()
+                              for key, value in algorithms.items()]
+        self.request(self.parameters, request, callback)
 
     def stop_robot(self):
         self.mode.publish(String(data='STOP'))

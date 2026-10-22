@@ -93,11 +93,18 @@ robot:
     left_wheel_joint: 0.0
     right_wheel_joint: 0.0
     left_shoulder_joint: 0.0
+    left_hip_yaw_joint: 0.0
     left_knee_joint: 0.0
     left_ankle_joint: 0.0
     right_shoulder_joint: 0.0
+    right_hip_yaw_joint: 0.0
     right_knee_joint: 0.0
     right_ankle_joint: 0.0
+  # Common macro traversal constraints, separate from algorithm parameters.
+  traversal:
+    max_step_height: 0.17
+    min_tread: 0.18
+    body_ground_clearance: 0.34  # 0.43 m foot body height minus half body thickness.
   body_size: [0.54, 0.30, 0.18]
   wheel_radius: 0.14
   wheel_width: 0.08
@@ -114,6 +121,7 @@ robot:
   folded_knee_pitch: -2.30
   folded_ankle_pitch: 1.15
   leg_pitch_limits: [-1.57, 1.57]
+  hip_yaw_limits: [-1.57, 1.57]
   foot_size: [0.18, 0.10, 0.035]
   # Foot collision center relative to its ankle/foot link, not the foot tip.
   foot_center_offset_x: 0.0725

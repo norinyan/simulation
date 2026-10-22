@@ -559,4 +559,16 @@ LocalPlanResult runPlanner(WheelLocalPlanner& planner, const LocalPlanRequest& r
   return result;
 }
 
+
+std::unique_ptr<WheelLocalPlanner> makeWheelPlanner(const std::string& name,const PlannerParameters& parameters) {
+  TebOptions options;
+  for(const auto& p:parameters) {
+    if(!std::isfinite(p.second))throw std::invalid_argument("NONFINITE_ALGORITHM_PARAMETER: "+p.first);
+    if(p.first=="spacing")options.spacing=static_cast<double>(p.second);
+    else if(p.first=="iterations") {if(p.second<1 || p.second>double(std::numeric_limits<int>::max()) || std::floor(p.second)!=p.second)throw std::invalid_argument("INVALID_ALGORITHM_COUNT");options.iterations=static_cast<int>(p.second);}
+    else if(p.first=="solver_time_limit")options.solver_time_limit=static_cast<double>(p.second);
+    else throw std::invalid_argument("UNKNOWN_ALGORITHM_PARAMETER: "+p.first);
+  }
+  return makeWheelPlanner(name,options);
+}
 }  // namespace planning

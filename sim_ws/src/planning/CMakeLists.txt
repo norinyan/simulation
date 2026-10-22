@@ -4,7 +4,7 @@ project(planning)
 find_package(ament_cmake REQUIRED)
 find_package(Ceres REQUIRED)
 
-add_library(planning SHARED src/global/astar.cpp)
+add_library(planning SHARED src/global/astar.cpp src/local/foot_motion.cpp)
 add_library(planning::planning ALIAS planning)
 target_compile_features(planning PUBLIC cxx_std_17)
 target_include_directories(planning PUBLIC
@@ -29,6 +29,8 @@ target_include_directories(footstep_planner PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 
+target_link_libraries(footstep_planner PUBLIC planning)
+
 install(DIRECTORY include/ DESTINATION include)
 install(TARGETS planning teb_optimizer footstep_planner EXPORT export_planning
   LIBRARY DESTINATION lib
@@ -40,6 +42,13 @@ ament_export_targets(export_planning HAS_LIBRARY_TARGET)
 ament_export_include_directories(include)
 
 if(BUILD_TESTING)
+  # Reuse private geometry helpers without copying the planner implementation.
+  # This variant exports only acceptance functions; production exports only planners.
+  add_library(foot_acceptance STATIC src/local/foot/footstep_planner.cpp)
+  target_compile_features(foot_acceptance PRIVATE cxx_std_17)
+  target_compile_definitions(foot_acceptance PRIVATE PLANNING_FOOT_ACCEPTANCE_ONLY)
+  target_link_libraries(foot_acceptance PUBLIC planning)
+  install(TARGETS foot_acceptance EXPORT export_planning ARCHIVE DESTINATION lib)
   enable_testing()
   add_executable(astar_test test/astar_test.cpp)
   target_link_libraries(astar_test planning)
@@ -47,6 +56,9 @@ if(BUILD_TESTING)
   add_executable(teb_test test/teb_test.cpp)
   target_link_libraries(teb_test planning teb_optimizer)
   add_test(NAME teb_test COMMAND teb_test)
+  add_executable(foot_test test/foot_test.cpp)
+  target_link_libraries(foot_test planning)
+  add_test(NAME foot_test COMMAND foot_test)
 endif()
 
 ament_package()

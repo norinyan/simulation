@@ -7,7 +7,9 @@ planning_node:
       global: astar
       wheel: teb
       foot: footstep
-      timeout: 25.0          # Whole offline request, wall seconds.
+      timeout: 25.0          # Global request, wall seconds.
+      stair_timeout: 60.0   # Cross-floor global search, wall seconds.
+      foot_timeout: 60.0    # Each independent foot segment, wall seconds.
       local_timeout: 0.6    # One execution prediction, wall seconds.
     motion:
       max_v: 0.30
@@ -28,7 +30,7 @@ planning_node:
       max_step: 0.50
       edge_margin: 0.025
       swing_clearance: 0.08
-      step_duration: 4.5      # Matches the URDF leg joint limit of 2 rad/s.
+      step_duration: 4.5      # Geometry sampling reference; each step is retimed to shared motion limits.
       sample_dt: 0.02
       max_foot_v: 0.8
       max_foot_a: 3.0

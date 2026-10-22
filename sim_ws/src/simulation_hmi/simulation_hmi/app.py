@@ -38,6 +38,9 @@ class ControlPanel(QMainWindow):
         self.busy = False
         self.generation = 0
         self.stop_requested = False
+        self.task_cancelled = False
+        self.task_id = 0
+        self.stop_acknowledged = False
         self.session_dir = None
         self.last_world_query = 0
         self.querying = False
@@ -58,8 +61,7 @@ class ControlPanel(QMainWindow):
         self.close_button.clicked.connect(self.close_scene)
         self.spawn_button.clicked.connect(self.spawn_robot)
         self.remove_button.clicked.connect(self.remove_robot)
-        self.plan_button.clicked.connect(self.plan)
-        self.execute_button.clicked.connect(self.execute)
+        self.execute_button.clicked.connect(self.start_task)
         self.stop_button.clicked.connect(self.stop_robot)
         self.apply_view.clicked.connect(self.write_view)
         self.follow_button.clicked.connect(self.follow)
@@ -113,10 +115,15 @@ class ControlPanel(QMainWindow):
         layout.addWidget(robot_box)
         task_box = QGroupBox('3 · 规划与执行')
         form = QVBoxLayout(task_box)
-        form.addWidget(QLabel('规划组合：A* 全局 + TEB 轮式局部 + 足步规划'))
+        algorithms = QFormLayout()
+        self.algorithms = {}
+        for key, label, title, value in [('global', '全局规划', 'A*', 'astar'), ('wheel', '轮式局部', 'TEB', 'teb'), ('foot', '足式局部', 'Footstep', 'footstep')]:
+            combo = QComboBox();combo.addItem(title, value)
+            self.algorithms[key] = combo;algorithms.addRow(label, combo)
+        form.addLayout(algorithms)
         buttons = QHBoxLayout()
-        self.plan_button, self.execute_button, self.stop_button = (QPushButton(x) for x in ('仅规划', '开始执行', '停止运动'))
-        for button in (self.plan_button, self.execute_button, self.stop_button):
+        self.execute_button, self.stop_button = (QPushButton(x) for x in ('开始任务', '停止任务'))
+        for button in (self.execute_button, self.stop_button):
             buttons.addWidget(button)
         form.addLayout(buttons)
         layout.addWidget(task_box)
@@ -183,10 +190,9 @@ class ControlPanel(QMainWindow):
             return
         start, goal = self.selected_pose(self.start_point), self.selected_pose(self.goal_point)
         self.coordinates.setText(f'出生地面坐标：{tuple(start[:3])} m   朝向：{start[3]:.2f} rad\n目标地面坐标：{tuple(goal[:3])} m')
-        self.route_note.setText(('同层轮式导航；跨层任务暂未开放。' if self.scene() == 'three_floor'
-                                 else '可执行任务：A → E → X → B。出生点生成后锁定。') if self.supported()
-                                else '当前组合仅支持放置和目标标记；跨层导航暂未开放。')
-        if self.spawned and self.scene() == 'three_floor':
+        self.route_note.setText(('三层楼全部不同点对；轮式／足式由全局路线决定。' if self.scene() == 'three_floor'
+                                  else '可执行任务：A → E → X → B。') if self.supported() else '请选择支持的不同起终点。')
+        if self.spawned and not self.busy and not self.task_active:
             self.write_task()
         self.plan_ready = False
         self.write_view()
@@ -212,7 +218,7 @@ class ControlPanel(QMainWindow):
         except (OSError, ValueError) as error:
             self.message(f'不能启动：端口或通信域已占用。{error}')
             return
-        self.session_dir = Path.home()/'.local/state/simulation_hmi'/datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        self.session_dir = Path(os.environ.get('XDG_STATE_HOME', str(Path.home()/'.local/state')))/'simulation_hmi'/datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         self.session_dir.mkdir(parents=True)
         self.running, self.ready = True, False
         self.scene_started = time.monotonic()
@@ -285,39 +291,62 @@ class ControlPanel(QMainWindow):
         return self.factor.currentData() <= self.presets[self.scene()].get('max_navigation_factor', 1)
 
     def start_planner(self):
+        self.task_text = '地图初始化中'
         self.launch('planner', ['ros2', 'run', 'sim_bringup', 'planning_node', '--ros-args',
                                 '--params-file', str(self.share/'config/planning.yaml'),
                                 '-p', 'scene_file:='+str(self.scene_file),
                                 '-p', 'output_dir:='+str(self.session_dir/'planning'),
                                 '-p', 'use_sim_time:=true', '-p', 'local_enabled:=true',
-                                '-p', 'foot_enabled:='+str(self.scene() == 'two_steps').lower(), '-p', 'autonomous:=false', '-p', 'interactive:=true'])
+                                '-p', 'foot_enabled:=true',
+                                *sum((['-p', 'planners.'+key+':='+combo.currentData()] for key, combo in self.algorithms.items()), []), '-p', 'autonomous:=false', '-p', 'interactive:=true'])
 
-    def plan(self):
-        if not self.spawned or not self.supported() or self.busy or self.task_used:
+    def task_callback(self, callback):
+        task_id = self.task_id
+        return lambda response, error: callback(response, error) if task_id == self.task_id else None
+
+    def start_task(self):
+        if not self.spawned or not self.supported() or self.busy or self.task_active:
             return
         if not self.factor_supported():
-            self.message('当前场景不支持此闭环倍率，请降低倍率后重新启动。')
-            return
-        self.write_task()
+            self.message('当前场景不支持此闭环倍率，请降低倍率后重新启动。');return
+        self.task_id += 1
+        self.stop_requested = self.task_cancelled = False
         self.busy, self.plan_ready = True, False
-        self.task_text = '正在规划'
-        self.message('请求仅规划；机器人将保持静止。')
-        self.ros.command('plan', self.plan_response)
+        self.task_text = '冻结算法配置'
+        self.task_started_wall = time.monotonic()
+        self.task_algorithms = {key: combo.currentData() for key, combo in self.algorithms.items()}
+        self.write_task()
+        self.ros.select_algorithms(self.task_algorithms, self.task_callback(self.algorithms_selected))
+        self.update_buttons()
+
+    def algorithms_selected(self, response, error):
+        if self.task_cancelled:
+            return
+        if not response or not response.result.successful:
+            self.busy = False;self.task_text = '算法选择失败'
+            self.message(error or response.result.reason);self.update_buttons();return
+        self.task_text = '全局规划中'
+        self.message('开始任务：'+str(self.task_algorithms))
+        self.ros.command('plan', self.task_callback(self.plan_response), timeout=65)
         self.update_buttons()
 
     def plan_response(self, response, error):
         self.busy = False
-        self.plan_ready = bool(response and response.success and not self.task_used and not self.stop_requested)
-        if not self.task_used and not self.stop_requested:
+        self.plan_ready = bool(response and response.success and not self.task_cancelled)
+        if not self.task_cancelled:
             self.task_text = '规划就绪' if self.plan_ready else '规划未就绪'
+        if not self.plan_ready:
+            self.task_active = False
         self.message(response.message if response else error)
         self.update_buttons()
+        if self.plan_ready:
+            self.execute()
 
     def execute(self):
-        if not self.plan_ready or self.busy or self.task_used:
+        if not self.plan_ready or self.busy or self.stop_requested:
             return
         self.busy = True
-        self.ros.command('execute', self.execute_response)
+        self.ros.command('execute', self.task_callback(self.execute_response))
         self.update_buttons()
 
     def execute_response(self, response, error):
@@ -326,21 +355,28 @@ class ControlPanel(QMainWindow):
             self.task_active = self.task_used = True
             self.plan_ready = False
             self.task_text = '执行请求已接受'
+        else:
+            self.task_active = False
         self.message(response.message if response else error)
         self.update_buttons()
 
     def stop_robot(self):
+        self.task_id += 1
+        self.task_cancelled = True
         self.ros.stop_robot()
         self.plan_ready = False
         self.task_used = True
         self.stop_requested = True
+        self.stop_acknowledged = False
         if 'planner' in self.sessions and self.ros.clients['stop'].service_is_ready():
-            self.ros.command('stop', self.stop_response)
-        self.message('已发送停止请求，等待实际速度为零；继续任务需移除并重新生成机器人。')
+            self.ros.command('stop', self.task_callback(self.stop_response))
+        self.message('已发送停止请求，等待实际速度为零；足式安全姿态保留，重新开始须满足实际轮式起点状态。')
         self.update_buttons()
 
     def stop_response(self, response, error):
+        self.stop_acknowledged = bool(response and response.success)
         self.message(response.message if response else error)
+        self.complete_stop()
         if not response or not response.success:
             # A failed task service must not leave a scheduler sending motion commands.
             if 'planner' in self.sessions:
@@ -379,10 +415,16 @@ class ControlPanel(QMainWindow):
             self.last_status[topic] = text
             self.message(text)
         if topic == '/planning/task_status':
-            self.task_text = text.split(';')[0]
+            state = text.split(';')[0]
+            labels = {'GLOBAL_PLANNING':'全局规划中', 'FOOT_PLANNING':'足式规划中', 'DEPLOY':'展腿中', 'FOLD':'收腿中', 'DONE':'到达并停车', 'FAILED':'任务失败', 'STOPPED':'任务已停止', 'WAIT_OBSTACLE':'等待障碍物', 'WAIT_EXECUTOR':'等待执行器'}
+            self.task_text = labels.get(state, '足式执行中' if 'phase=foot_execution' in text else '轮式规划与执行' if 'phase=wheel_execution' in text else state)
             self.task_active = not text.startswith(('DONE', 'FAILED', 'STOPPED'))
             if not self.task_active:
                 self.busy = False
+                if hasattr(self, 'task_started_wall'):
+                    self.message(f'任务墙钟耗时：{time.monotonic()-self.task_started_wall:.2f} s')
+                if text.startswith('DONE') and self.scene() == 'three_floor':
+                    self.start_point.setCurrentIndex(self.start_point.findData(self.goal_point.currentData()))
         if topic == '/robot/execution_status' and text.startswith('FAILED'):
             self.task_text = '执行器保护停止'
             self.plan_ready = False
@@ -403,11 +445,17 @@ class ControlPanel(QMainWindow):
             self.message('已收到机器人实际反馈。')
             if not self.task_used and (self.scene() == 'three_floor' or self.start_point.currentData() == 'A'):
                 self.start_planner()
-        if self.stop_requested and abs(msg.twist.twist.linear.x)<.001 and abs(msg.twist.twist.angular.z)<.001:
-            self.task_active = False
-            self.stop_requested = False
-            self.task_text = '已停止（实际速度为零）'
+        self.complete_stop()
         self.update_buttons()
+
+    def complete_stop(self):
+        if not self.stop_requested or not self.stop_acknowledged or self.actual_pose is None:
+            return
+        velocity = self.actual_pose.twist.twist
+        if max(abs(getattr(axis, key)) for axis in (velocity.linear, velocity.angular) for key in ('x', 'y', 'z')) < .001:
+            self.busy = self.task_active = self.stop_requested = False
+            self.task_text = '已停止（服务确认，实际速度为零）'
+            self.update_buttons()
 
     def tick(self):
         now = time.monotonic()
@@ -490,21 +538,25 @@ class ControlPanel(QMainWindow):
         self.scene_combo.setEnabled(not self.running)
         self.factor.setEnabled(not self.running)
         robot_nodes = 'robot' in self.sessions or 'planner' in self.sessions
-        self.start_point.setEnabled(not self.spawned and not self.spawning and not robot_nodes)
-        self.goal_point.setEnabled(not self.task_active and not self.busy and not self.task_used)
+        self.start_point.setEnabled(not self.spawning and not self.task_active and not self.busy and (not robot_nodes or self.scene() == 'three_floor'))
+        self.goal_point.setEnabled(not self.task_active and not self.busy)
         self.start_button.setEnabled(not self.running and not self.sessions)
         self.close_button.setEnabled(self.running and not self.stopping)
         self.spawn_button.setEnabled(self.ready and not self.stopping and not self.spawned and not self.spawning and not robot_nodes)
         self.remove_button.setEnabled(self.spawned and not self.task_active and not self.busy and not self.removing and not self.stopping)
         planner_ready = hasattr(self, 'ros') and self.ros.clients['plan'].service_is_ready()
-        self.plan_button.setEnabled(self.spawned and self.supported() and planner_ready and not self.task_used and not self.busy and self.factor_supported() and not self.stopping)
-        self.execute_button.setEnabled(self.plan_ready and self.supported() and not self.task_used and not self.busy and not self.stopping)
+        if planner_ready and getattr(self, 'task_text', '') == '地图初始化中':
+            self.task_text = '地图就绪'
+        self.execute_button.setEnabled(self.spawned and self.supported() and planner_ready and not self.task_active and not self.busy and self.factor_supported() and not self.stopping)
+        for combo in self.algorithms.values():
+            combo.setEnabled(not self.task_active and not self.busy)
         self.stop_button.setEnabled(self.spawned and not self.stopping)
         self.follow_button.setEnabled(self.spawned and not self.stopping)
         self.apply_view.setEnabled(self.ready and not self.stopping)
         scene = '关闭中' if self.stopping else ('运行中' if self.ready else ('启动中' if self.running else '未启动'))
         robot = '移除中' if self.removing else ('已生成' if self.spawned else ('生成中' if self.spawning else '未生成'))
-        self.state_label.setText(f'仿真：{scene}  ｜  机器人：{robot}  ｜  任务：{getattr(self, "task_text", "待命")}')
+        elapsed = f' · {time.monotonic()-self.task_started_wall:.1f} s' if (self.busy or self.task_active) and hasattr(self, 'task_started_wall') else ''
+        self.state_label.setText(f'仿真：{scene}  ｜  机器人：{robot}  ｜  任务：{getattr(self, "task_text", "待命")}{elapsed}')
 
     def closeEvent(self, event):
         if self.sessions:

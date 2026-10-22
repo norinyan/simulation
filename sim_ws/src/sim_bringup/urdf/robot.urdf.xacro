@@ -148,6 +148,15 @@
       <limit effort="${joint_effort}" velocity="${joint_speed}"/>
     </joint>
 
+    <link name="${side}_hip_yaw">
+      <inertial><mass value="0.001"/><inertia ixx="0.000001" ixy="0" ixz="0" iyy="0.000001" iyz="0" izz="0.000001"/></inertial>
+    </link>
+    <joint name="${side}_hip_yaw_joint" type="revolute">
+      <parent link="base_link"/><child link="${side}_hip_yaw"/>
+      <origin xyz="${shoulder_x} ${sign*shoulder_y} ${shoulder_z}"/>
+      <axis xyz="0 0 1"/>
+      <limit lower="-1.57" upper="1.57" effort="${joint_effort}" velocity="${leg_joint_speed}"/>
+    </joint>
     <link name="${side}_upper_leg">
       <xacro:box_parts sx="${leg_width}" sy="${leg_width}" sz="${upper_length}"
                        mass="${leg_mass}" xyz="0 0 ${-upper_length/2}" material="${material}"/>
@@ -155,8 +164,8 @@
     <xacro:gazebo_color link="${side}_upper_leg" rgba="${limb_rgba}"/>
 
     <joint name="${side}_shoulder_joint" type="revolute">
-      <parent link="base_link"/><child link="${side}_upper_leg"/>
-      <origin xyz="${shoulder_x} ${sign*shoulder_y} ${shoulder_z}" rpy="0 ${shoulder_mount_pitch} 0"/>
+      <parent link="${side}_hip_yaw"/><child link="${side}_upper_leg"/>
+      <origin rpy="0 ${shoulder_mount_pitch} 0"/>
       <axis xyz="0 1 0"/>
       <limit lower="${-pitch_limit}" upper="${pitch_limit}" effort="${joint_effort}" velocity="${leg_joint_speed}"/>
     </joint>

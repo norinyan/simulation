@@ -169,6 +169,46 @@ int main()
     expect(planning::isPoseCollisionFree(r.start,r),"Rejected adjacent coplanar support union");
     r.obstacles={{0,0,.5,.2,3,1,std::acos(-1.)/4}};
     expect(!planning::isPoseCollisionFree(r.start,r),"Ignored rotated obstacle");
+    // The same public interface handles full XYZ routes and rejects malformed
+    // algorithm segments independently of search success.
+    r=request();r.start={-2,0,0,0};r.goal={2,0,.32,0};r.footprint={.2,.2};r.safety_margin=.01;
+    auto map=std::make_shared<planning::SceneMap>();map->frame_id=r.frame_id;
+    map->regions={{"lower",0,{-5,0,-4,4},{{-2.5,0,-.1,5,8,.2}},{}},
+                  {"upper",.32,{.3,5,-4,4},{{2.65,0,.22,4.7,8,.2}},{}}};
+    planning::StairConnection up;up.id="up";up.from="lower";up.to="upper";
+    up.treads={{.15,0,.06,.3,2,.2},{.45,0,.22,.3,2,.2}};
+    up.platforms={{1,0,.22,1.4,2,.2}};
+    up.reference={{-.5,0,0,0},{0,0,0,0},{0,0,.16,0},{.3,0,.16,0},{.3,0,.32,0},{.8,0,.32,0}};
+    auto down=up;down.id="down";std::swap(down.from,down.to);
+    std::reverse(down.reference.begin(),down.reference.end());
+    for(auto& p:down.reference)p.yaw=std::acos(-1.);
+    map->connections={up,down};r.map=map;
+    auto spatial=planning::runPlanner(planner,r);
+    expect(spatial.success,spatial.failure_reason.c_str());
+    expect(spatial.segments.size()==3 && spatial.mode_switches==2,"Missing mode boundaries");
+    expect(spatial.spatial_length>4.31 && spatial.spatial_length<4.6,"Wrong XYZ distance objective");
+    auto broken=spatial;broken.segments.clear();
+    expect(!planning::validateGlobalPath(r,broken).empty(),"Accepted missing segment coverage");
+    broken=spatial;broken.segments[1].begin++;
+    expect(!planning::validateGlobalPath(r,broken).empty(),"Accepted unshared boundary");
+    broken=spatial;broken.path[broken.segments[1].begin+1].z+=.01;
+    expect(!planning::validateGlobalPath(r,broken).empty(),"Accepted floating stair path");
+    broken=spatial;broken.segments[1].mode=planning::TravelMode::Wheel;
+    expect(!planning::validateGlobalPath(r,broken).empty(),"Accepted wheel traversal of stairs");
+    auto narrow=up;narrow.treads[0].size_y=.1;
+    expect(!planning::validateConnection(r,narrow).empty(),"Ignored stair passage width");
+    auto too_high=r;too_high.traversal.max_step_height=.1;
+    expect(!planning::validateConnection(too_high,up).empty(),"Ignored stair capability");
+    // Continuous support validation must detect a sub-sample gap.
+    auto gap=up;gap.treads[0].size_x-=.0001;
+    expect(!planning::validateConnection(r,gap).empty(),"Missed thin stair support gap");
+    map->solids={{-.5,0,-.1,2,.01,.04,0,0,std::acos(-1.)/4}};
+    expect(!planning::validateConnection(r,up).empty(),"Ignored tilted solid crossing body height");
+    map->solids.clear();
+    map->connections[0].enabled=false;
+    expect(!planning::runPlanner(planner,r).success,"Ignored directed connection disable");
+    map->connections[0].enabled=true;std::swap(r.start,r.goal);
+    expect(planning::runPlanner(planner,r).success,"Rejected independent downward connection");
     std::cout << "PASS: bypass, oriented docking, collision, thin barrier, invalid input, height and grid-limit cases\n";
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';

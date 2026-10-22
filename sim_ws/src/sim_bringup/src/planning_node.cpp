@@ -1,6 +1,5 @@
-#include "astar.h"
-#include "teb_optimizer.h"
-#include "footstep_planner.h"
+#include "global_planner.h"
+#include "local_planner.h"
 #include "scene_geometry.h"
 #include <rclcpp/create_timer.hpp>
 #include <mutex>
@@ -86,25 +85,19 @@ struct TaskSegment
   PlanRequest geometry;
   std::string label;
   std::string state;
+  std::vector<Pose> reference;
 };
 
 struct Scene
 {
   std::string world_name;
-  PlanRequest lower;
-  PlanRequest upper;
-  double stair_x{0};
-  double rise{0};
-  double tread{0};
-  double min_y{0};
-  double max_y{0};
-  int count{0};
-  std::vector<TaskSegment> task=std::vector<TaskSegment>(3);
-  bool navigation{false};
-  simulation::FloorGeometry floor;
+  PlanRequest request;  // Immutable task start/goal and shared scene map.
+  std::vector<TaskSegment> task;
+  bool unified{false};
+  planning::PlanResult global;
 };
 
-Scene loadScene(const YAML::Node& config, double margin)
+Scene loadScene(const YAML::Node& config, double margin, const std::shared_ptr<const planning::SceneMap>& prepared_map={})
 {
   require(config["schema_version"].as<int>() == 1, "Unsupported scene schema");
   const auto scene = config["scene"], robot = config["robot"];
@@ -113,7 +106,8 @@ Scene loadScene(const YAML::Node& config, double margin)
   Scene result;
   result.world_name = scene["name"].as<std::string>();
   if(result.world_name=="three_floor") {
-    require(scene["task_type"].as<std::string>()=="wheel_navigation","Unsupported three_floor task type");
+    const auto type=scene["task_type"].as<std::string>();
+    require(type=="wheel_navigation" || type=="stair_navigation","Unsupported three_floor task type");
     const auto route=scene["task_route"];
     require(route.IsSequence() && route.size()==2,"Navigation requires start and goal");
     const auto start=pose(scene["waypoints"][route[0].as<std::string>()]);
@@ -123,17 +117,25 @@ Scene loadScene(const YAML::Node& config, double margin)
     require(supported_floor,"UNKNOWN_FLOOR_HEIGHT");
     const auto world_file=scene["world_file"].as<std::string>();
     require(std::filesystem::path(world_file).is_absolute(),"Navigation requires the absolute loaded World path");
-    result.navigation=true;
-    result.floor=simulation::loadFloorGeometry(world_file,result.world_name,start,goal,
+    result.unified=true;
+    auto map=prepared_map ? prepared_map : simulation::loadSceneMap(world_file,result.world_name,
       {scalar(robot["wheel_mode_length"]),scalar(robot["wheel_mode_width"])},
       scalar(robot["wheel_radius"])+scalar(robot["carrier_drop"])+scalar(robot["body_size"][2])/2,margin);
-    result.lower=result.upper=result.floor.geometry;
-    result.task={{TaskSegment::Mode::Wheel,result.lower,"start-goal","WHEEL_NAV"}};
+    auto& request=result.request;request.frame_id=map->frame_id;request.map=map;
+    request.start=start;request.goal=goal;request.safety_margin=margin;
+    request.footprint={scalar(robot["wheel_mode_length"]),scalar(robot["wheel_mode_width"])};
+    request.traversal.body_height=scalar(robot["body_size"][2]);
+    if(robot["traversal"]) {
+      request.traversal.max_step_height=scalar(robot["traversal"]["max_step_height"]);
+      request.traversal.min_tread=scalar(robot["traversal"]["min_tread"]);
+      request.traversal.body_ground_clearance=scalar(robot["traversal"]["body_ground_clearance"]);
+    }
+    request.bounds=map->regions.front().bounds;result.task.clear();
     return result;
   }
+
   require(!result.world_name.empty(), "Empty Gazebo world name");
-  auto& lo = result.lower;
-  auto& up = result.upper;
+  PlanRequest lo,up;
   lo.frame_id = up.frame_id = scene["frame"].as<std::string>();
   require(!lo.frame_id.empty(), "Empty scene frame");
   lo.bounds = bounds(scene["lower_bounds"]);
@@ -167,63 +169,68 @@ Scene loadScene(const YAML::Node& config, double margin)
   equal(up.start.z, upper_z, "X is not on upper surface");
   equal(up.goal.z, upper_z, "B is not on upper surface");
   const auto stair = scene["stair"];
-  result.stair_x = scalar(stair["start_x"]);
-  result.rise = scalar(stair["rise"]);
-  result.tread = scalar(stair["tread"]);
-  result.count = stair["count"].as<int>();
+  const double stair_x = scalar(stair["start_x"]);
+  const double rise = scalar(stair["rise"]);
+  const double tread = scalar(stair["tread"]);
+  const int count = stair["count"].as<int>();
   const auto passage = values(stair["passage_y"], 2);
-  result.min_y = passage[0];
-  result.max_y = passage[1];
-  require(result.rise > 0 && result.tread > 0 && result.count > 0 && result.count <= 10000,
+  const double min_y = passage[0];
+  const double max_y = passage[1];
+  require(rise > 0 && tread > 0 && count > 0 && count <= 10000,
           "Invalid staircase dimensions");
-  equal(result.max_y-result.min_y, scalar(stair["width"]), "Inconsistent stair passage width");
-  equal((result.max_y+result.min_y)/2, scalar(stair["center_y"]), "Inconsistent stair centre");
-  equal(lo.bounds.max_x, result.stair_x, "Lower platform does not meet stairs");
-  equal(up.bounds.min_x, result.stair_x+result.count*result.tread, "Upper platform does not meet stairs");
-  equal(upper_z, lower_z+result.count*result.rise, "Stair/platform height mismatch");
+  equal(max_y-min_y, scalar(stair["width"]), "Inconsistent stair passage width");
+  equal((max_y+min_y)/2, scalar(stair["center_y"]), "Inconsistent stair centre");
+  equal(lo.bounds.max_x, stair_x, "Lower platform does not meet stairs");
+  equal(up.bounds.min_x, stair_x+count*tread, "Upper platform does not meet stairs");
+  equal(upper_z, lower_z+count*rise, "Stair/platform height mismatch");
   for (const auto& b : {lo.bounds, up.bounds}) {
-    equal(b.min_y, result.min_y, "Platform/stair lower Y mismatch");
-    equal(b.max_y, result.max_y, "Platform/stair upper Y mismatch");
+    equal(b.min_y, min_y, "Platform/stair lower Y mismatch");
+    equal(b.max_y, max_y, "Platform/stair upper Y mismatch");
   }
   const auto steps = stair["steps"];
-  require(steps.IsSequence() && steps.size() == static_cast<std::size_t>(result.count),
+  require(steps.IsSequence() && steps.size() == static_cast<std::size_t>(count),
           "Stair count/geometry mismatch");
-  for (int i = 0; i < result.count; ++i) {
+  for (int i = 0; i < count; ++i) {
     const auto step = steps[i];
     require(step["shape"].as<std::string>() == "box", "Unsupported step shape");
     const auto c = values(step["center"], 3), s = values(step["size"], 3);
-    equal(c[0]-s[0]/2, result.stair_x+i*result.tread, "Step leading edge mismatch");
-    equal(s[0], result.tread, "Step tread mismatch");
-    equal(c[1]-s[1]/2, result.min_y, "Step lower Y mismatch");
-    equal(c[1]+s[1]/2, result.max_y, "Step upper Y mismatch");
+    equal(c[0]-s[0]/2, stair_x+i*tread, "Step leading edge mismatch");
+    equal(s[0], tread, "Step tread mismatch");
+    equal(c[1]-s[1]/2, min_y, "Step lower Y mismatch");
+    equal(c[1]+s[1]/2, max_y, "Step upper Y mismatch");
     equal(c[2]+s[2]/2, scalar(step["top_z"]), "Step top mismatch");
-    equal(scalar(step["top_z"]), lower_z+(i+1)*result.rise, "Step rise mismatch");
+    equal(scalar(step["top_z"]), lower_z+(i+1)*rise, "Step rise mismatch");
   }
   auto stair_geometry=lo;
   stair_geometry.start=lo.goal;stair_geometry.goal=up.start;
   stair_geometry.bounds.max_x=up.bounds.max_x;
+  result.request=lo;result.request.goal=up.goal;
   result.task={TaskSegment{TaskSegment::Mode::Wheel,lo,ids[0]+"-"+ids[1],"WHEEL_"+ids[0]+"_"+ids[1]},
                TaskSegment{TaskSegment::Mode::Foot,stair_geometry,ids[1]+"-"+ids[2],"FOOT_"+ids[1]+"_"+ids[2]},
                TaskSegment{TaskSegment::Mode::Wheel,up,ids[2]+"-"+ids[3],"WHEEL_"+ids[2]+"_"+ids[3]}};
   return result;
 }
 
-std::vector<Pose> stairReference(const Scene& scene)
+std::vector<Pose> stairReference(const YAML::Node& config,const Scene& scene)
 {
-  const auto& entry = scene.lower.goal;
-  const auto& exit = scene.upper.start;
+  const auto& entry=scene.task.front().geometry.goal;
+  const auto& exit=scene.task.back().geometry.start;
+  const auto stair=config["scene"]["stair"];
+  const double stair_x=scalar(stair["start_x"]),rise=scalar(stair["rise"]),tread=scalar(stair["tread"]);
+  const int count=stair["count"].as<int>();const auto passage=values(stair["passage_y"],2);
+  const double min_y=passage[0],max_y=passage[1];
   equal(entry.y, exit.y, "E/X must share an aligned stair lane");
   equal(entry.yaw, 0, "Stair reference expects +X entry yaw");
   equal(exit.yaw, 0, "Stair reference expects +X exit yaw");
-  const double half_width = scene.lower.footprint.width/2+scene.lower.safety_margin;
-  require(entry.y-half_width >= scene.min_y && entry.y+half_width <= scene.max_y,
+  const double half_width = scene.request.footprint.width/2+scene.request.safety_margin;
+  require(entry.y-half_width >= min_y && entry.y+half_width <= max_y,
           "Robot footprint does not fit stair passage");
-  require(entry.x <= scene.stair_x && exit.x >= scene.stair_x+scene.count*scene.tread,
+  require(entry.x <= stair_x && exit.x >= stair_x+count*tread,
           "Stair waypoints do not bracket the steps");
   // Check the complete aligned corridor against scene obstacles/walls. Terrain
   // boxes are intentionally separate: this is a geometric reference, not gait feasibility.
-  const double half_length = scene.lower.footprint.length/2+scene.lower.safety_margin;
-  for (const auto& box : scene.lower.obstacles) {
+  const double half_length = scene.request.footprint.length/2+scene.request.safety_margin;
+  for (const auto& box : scene.request.obstacles) {
     if (box.center_z+box.size_z/2 <= entry.z+kTolerance) continue;
     const bool overlap = box.center_x+box.size_x/2 >= entry.x-half_length &&
       box.center_x-box.size_x/2 <= exit.x+half_length &&
@@ -231,11 +238,11 @@ std::vector<Pose> stairReference(const Scene& scene)
       box.center_y-box.size_y/2 <= entry.y+half_width;
     require(!overlap, "Stair reference corridor blocked by a scene obstacle/wall");
   }
-  std::vector<Pose> path{entry, {scene.stair_x, entry.y, entry.z, 0}};
-  for (int i = 0; i < scene.count; ++i) {
-    const double x = scene.stair_x+i*scene.tread;
-    if (i > 0) path.push_back({x, entry.y, entry.z+i*scene.rise, 0});
-    path.push_back({x, entry.y, entry.z+(i+1)*scene.rise, 0});
+  std::vector<Pose> path{entry, {stair_x, entry.y, entry.z, 0}};
+  for (int i = 0; i < count; ++i) {
+    const double x = stair_x+i*tread;
+    if (i > 0) path.push_back({x, entry.y, entry.z+i*rise, 0});
+    path.push_back({x, entry.y, entry.z+(i+1)*rise, 0});
   }
   path.push_back(exit);
   return path;
@@ -245,10 +252,8 @@ planning::FootLocalPlanRequest footRequest(const YAML::Node& config, const Scene
                                          const std::vector<Pose>& reference)
 {
   planning::FootLocalPlanRequest request;
-  request.geometry = scene.lower;
-  request.geometry.start = scene.lower.goal;
-  request.geometry.goal = scene.upper.start;
-  request.geometry.bounds.max_x = scene.upper.bounds.max_x;
+  request.geometry = scene.request;
+  if(!scene.unified){request.geometry=scene.task[1].geometry;}
   request.geometry.safety_margin = 0;  // Foot support margin is configured separately.
   request.reference_path = reference;
   const auto terrain = config["scene"], robot = config["robot"];
@@ -257,8 +262,10 @@ planning::FootLocalPlanRequest footRequest(const YAML::Node& config, const Scene
     const auto c = values(node["center"], 3), s = values(node["size"], 3);
     return BoxObstacle{c[0], c[1], c[2], s[0], s[1], s[2]};
   };
-  for (const auto& surface : terrain["surfaces"]) request.terrain.push_back(box(surface.second));
-  for (const auto& step : terrain["stair"]["steps"]) request.terrain.push_back(box(step));
+  if(!scene.unified) {
+    for (const auto& surface : terrain["surfaces"]) request.terrain.push_back(box(surface.second));
+    for (const auto& step : terrain["stair"]["steps"]) request.terrain.push_back(box(step));
+  }
   auto xyz = [](const YAML::Node& node) {
     const auto v = values(node, 3);
     return std::array<double, 3>{v[0], v[1], v[2]};
@@ -275,12 +282,57 @@ planning::FootLocalPlanRequest footRequest(const YAML::Node& config, const Scene
   r.foot_center_offset_x = scalar(robot["foot_center_offset_x"]);
   const auto joint_limits = values(robot["leg_pitch_limits"], 2), lift_limits = values(robot["lift_limits"], 2);
   r.joint_min = joint_limits[0]; r.joint_max = joint_limits[1];
+  if(robot["hip_yaw_limits"]){const auto yaw=values(robot["hip_yaw_limits"],2);r.hip_yaw_min=yaw[0];r.hip_yaw_max=yaw[1];}
   r.lift_min = lift_limits[0]; r.lift_max = lift_limits[1];
   r.wheel_radius = scalar(robot["wheel_radius"]);
   r.wheel_width = scalar(robot["wheel_width"]);
   r.wheel_track = scalar(robot["wheel_track"]);
   r.carrier_drop = scalar(robot["carrier_drop"]);
   return request;
+}
+
+planning::FootLocalPlanRequest segmentFootRequest(const YAML::Node& config,const Scene& scene,std::size_t index) {
+  const auto& segment=scene.task.at(index);
+  auto request=footRequest(config,scene,{});request.geometry=segment.geometry;request.geometry.safety_margin=0;
+  if(!scene.unified){request.reference_path=stairReference(config,scene);return request;}
+  request.spatial=true;
+  const auto& map=*scene.request.map;
+  const auto found=std::find_if(map.connections.begin(),map.connections.end(),[&](const auto& c){return c.id==segment.label;});
+  require(found!=map.connections.end(),"UNKNOWN_FOOT_CONNECTION: "+segment.label);
+  request.geometry.obstacles=map.solids;request.terrain.clear();
+  for(const auto& b:map.solids)if(std::abs(b.roll)+std::abs(b.pitch)<1e-7)request.terrain.push_back(b);
+  const auto& ref=found->reference;
+  auto append=[&](const Pose& p){if(request.reference_path.empty() ||
+    std::hypot(p.x-request.reference_path.back().x,p.y-request.reference_path.back().y)>1e-8 ||
+    std::abs(std::atan2(std::sin(p.yaw-request.reference_path.back().yaw),std::cos(p.yaw-request.reference_path.back().yaw)))>1e-8)request.reference_path.push_back(p);};
+  append(ref.front());
+  for(std::size_t i=1;i<ref.size();++i)if(std::abs(std::atan2(std::sin(ref[i].yaw-ref[i-1].yaw),std::cos(ref[i].yaw-ref[i-1].yaw)))>1e-7){append(ref[i-1]);append(ref[i]);}
+  append(ref.back());
+  return request;
+}
+
+trajectory_msgs::msg::MultiDOFJointTrajectory makeFootCommand(const planning::FootLocalPlanResult& result,const std_msgs::msg::Header& header,bool spatial){
+    trajectory_msgs::msg::MultiDOFJointTrajectory trajectory;
+    trajectory.header = header;
+    trajectory.joint_names = {"body", "left_foot_center", "right_foot_center"};
+    for (const auto& sample : result.trajectory) {
+      trajectory_msgs::msg::MultiDOFJointTrajectoryPoint point;
+      point.time_from_start = rclcpp::Duration(std::chrono::nanoseconds(static_cast<int64_t>(std::llround(sample.time_from_start*1e9))));
+      const std::array<Pose, 3> poses{sample.body, sample.feet[0], sample.feet[1]};
+      for (std::size_t i = 0; i < poses.size(); ++i) {
+        geometry_msgs::msg::Transform transform;
+        transform.translation.x = poses[i].x; transform.translation.y = poses[i].y; transform.translation.z = poses[i].z;
+        transform.rotation.z=std::sin(poses[i].yaw/2);transform.rotation.w=std::cos(poses[i].yaw/2);
+        point.transforms.push_back(transform);
+        geometry_msgs::msg::Twist v, a;
+        const auto& sv=sample.spatial_velocity[i];const auto& sa=sample.spatial_acceleration[i];
+        v.linear.x=sv.x;v.linear.y=sv.y;v.linear.z=sv.z;v.angular.z=sv.yaw;
+        a.linear.x=sa.x;a.linear.y=sa.y;a.linear.z=sa.z;a.angular.z=sa.yaw;
+        point.velocities.push_back(v); point.accelerations.push_back(a);
+      }
+      trajectory.points.push_back(point);
+    }
+    return trajectory;
 }
 
 double length(const std::vector<Pose>& path, bool spatial)
@@ -320,30 +372,43 @@ public:
   PlanningNode() : Node("planning_node")
   {
     scene_file_ = declare_parameter<std::string>("scene_file", "");
-    const auto initial_scene=YAML::LoadFile(scene_file_)["scene"];
-    navigation_mode_=initial_scene["name"].as<std::string>()=="three_floor";
-    resolution_ = declare_parameter<double>("resolution", 0.05);
+    scene_config_=YAML::Load(sceneText());
+    const auto initial_scene=scene_config_["scene"];
+    const auto robot=scene_config_["robot"];
+    wheel_height_=scalar(robot["wheel_radius"])+scalar(robot["carrier_drop"]);
     margin_ = declare_parameter<double>("safety_margin", 0.05);
+    if(initial_scene["name"].as<std::string>()=="three_floor") {
+      const auto start=std::chrono::steady_clock::now();
+      prepared_geometry_=simulation::loadSceneGeometry(initial_scene["world_file"].as<std::string>(),"three_floor",
+        {scalar(robot["wheel_mode_length"]),scalar(robot["wheel_mode_width"])},
+        wheel_height_+scalar(robot["body_size"][2])/2, margin_);
+      initialization_ms_=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+    }
+    RCLCPP_INFO(get_logger(),"Scene initialized: world_parse_count=%zu; fixed_config_reads=1",simulation::worldParseCount());
+    cross_floor_=initial_scene["name"].as<std::string>()=="three_floor" && initial_scene["task_type"].as<std::string>()=="stair_navigation";
+    navigation_mode_=initial_scene["name"].as<std::string>()=="three_floor" && !cross_floor_;
+    resolution_ = declare_parameter<double>("resolution", 0.05);
     max_cells_ = declare_parameter<int64_t>("max_grid_cells", 2000000);
     require(max_cells_>0,"Invalid max_grid_cells");
     local_enabled_ = declare_parameter<bool>("local_enabled", false);
-    planning::TebOptions teb_options;
-    planning::FootstepOptions foot_options;
+    planning::WheelMotionLimits teb_options;
+    planning::PlannerParameters wheel_parameters,foot_parameters;
+    planning::FootMotionLimits foot_options;
     teb_options.max_v = declare_parameter<double>("teb.max_v", .30);
     teb_options.max_w = declare_parameter<double>("teb.max_w", .80);
     teb_options.max_a = declare_parameter<double>("teb.max_a", .30);
     teb_options.max_alpha = declare_parameter<double>("teb.max_alpha", 1.0);
     teb_options.time_horizon = declare_parameter<double>("teb.time_horizon", 2.2);
-    teb_options.spacing = declare_parameter<double>("teb.spacing", .15);
-    teb_options.iterations = declare_parameter<int>("teb.iterations", 30);
-    teb_options.solver_time_limit = declare_parameter<double>("teb.solver_time_limit", .10);
+    wheel_parameters["spacing"] = declare_parameter<double>("teb.spacing", .15);
+    wheel_parameters["iterations"] = declare_parameter<int>("teb.iterations", 30);
+    wheel_parameters["solver_time_limit"] = declare_parameter<double>("teb.solver_time_limit", .10);
     teb_options.max_lateral_velocity = declare_parameter<double>("teb.max_lateral_velocity", .01);
     teb_options.collision_translation_step = declare_parameter<double>("teb.collision_translation_step", .01);
     teb_options.collision_rotation_step = declare_parameter<double>("teb.collision_rotation_step", .02);
     local_margin_ = declare_parameter<double>("teb.safety_margin", .05);
     foot_enabled_ = declare_parameter<bool>("foot_enabled", false);
-    require(!navigation_mode_ || !foot_enabled_,"Stage2 navigation is wheel-only");
-    foot_options.resolution = declare_parameter<double>("foot.resolution", .05);
+
+    foot_parameters["resolution"] = declare_parameter<double>("foot.resolution", .05);
     foot_options.max_step = declare_parameter<double>("foot.max_step", .50);
     foot_options.edge_margin = declare_parameter<double>("foot.edge_margin", .025);
     foot_options.swing_clearance = declare_parameter<double>("foot.swing_clearance", .08);
@@ -357,11 +422,14 @@ public:
     foot_options.max_joint_a = declare_parameter<double>("foot.max_joint_a", 20.0);
     foot_options.body_height = declare_parameter<double>("foot.body_height", .43);
     foot_options.wheel_lift = declare_parameter<double>("foot.wheel_lift", .13);
-    foot_options.max_expansions = declare_parameter<int>("foot.max_expansions", 10000);
+    foot_parameters["max_expansions"] = declare_parameter<int>("foot.max_expansions", 10000);
     global_name_=declare_parameter<std::string>("planners.global","astar");
     wheel_name_=declare_parameter<std::string>("planners.wheel","teb");
     foot_name_=declare_parameter<std::string>("planners.foot","footstep");
     plan_timeout_=declare_parameter<double>("planners.timeout",25.0);
+    const double stair_timeout=declare_parameter<double>("planners.stair_timeout",60.0);
+    if(cross_floor_)plan_timeout_=stair_timeout;
+    foot_plan_timeout_=declare_parameter<double>("planners.foot_timeout",60.0);
     local_timeout_=declare_parameter<double>("planners.local_timeout",.6);
     require(plan_timeout_>0 && std::isfinite(plan_timeout_) && local_timeout_>0 && std::isfinite(local_timeout_),"Invalid planner budget");
     // Keep legacy teb.* ROS parameters as aliases; explicit aliases retain priority.
@@ -380,13 +448,15 @@ public:
     teb_options.collision_rotation_step=motion("collision_rotation_step",teb_options.collision_rotation_step);
     local_margin_=motion("safety_margin",local_margin_);
     wheel_limits_=teb_options;foot_limits_=foot_options;
-    global_planner_=planning::makeGlobalPlanner(global_name_,{resolution_,static_cast<std::size_t>(max_cells_)});
-    wheel_planner_=planning::makeWheelPlanner(wheel_name_,teb_options);
-    foot_planner_=planning::makeFootPlanner(foot_name_,foot_options);
+    wheel_parameters_=wheel_parameters;foot_parameters_=foot_parameters;
+    global_planner_=planning::makeGlobalPlanner(global_name_,planning::PlannerParameters{{"resolution",resolution_},{"max_grid_cells",double(max_cells_)}});
+    wheel_planner_=planning::makeWheelPlanner(wheel_name_,wheel_parameters);
+    foot_planner_=planning::makeFootPlanner(foot_name_,foot_parameters);
     const auto root = declare_parameter<std::string>("output_dir", defaultOutputRoot());
     require(!root.empty(), "Empty planning output_dir");
     const auto stamp = std::chrono::system_clock::now().time_since_epoch().count();
-    output_dir_ = std::filesystem::path(root)/("run_"+std::to_string(stamp));
+    output_root_=root;
+    output_dir_ = output_root_/("run_"+std::to_string(stamp));
     const auto qos = rclcpp::QoS(1).reliable().transient_local();
     path_publisher_ = create_publisher<nav_msgs::msg::Path>("/planning/global_path", qos);
     status_publisher_ = create_publisher<std_msgs::msg::String>("/planning/status", qos);
@@ -403,9 +473,9 @@ public:
     interactive_ = declare_parameter<bool>("interactive", false);
     frame_=initial_scene["frame"].as<std::string>();
     setupTask();
-    if(navigation_mode_) {
+    if(navigation_mode_||cross_floor_) {
       const auto nav=initial_scene["navigation"];
-      position_tolerance_=scalar(nav["position_tolerance"]);yaw_tolerance_=scalar(nav["yaw_tolerance"]);
+      // One stopping contract, independent of HMI task_type or future route modes.
       approach_gain_=scalar(nav["approach_gain"]);navigation_wait_timeout_=scalar(nav["wait_timeout"]);
       obstacle_timeout_=scalar(nav["obstacle_timeout"]);
       if(get_parameter("use_sim_time").as_bool()) {
@@ -417,22 +487,23 @@ public:
     if (interactive_) {
       plan_service_ = create_service<std_srvs::srv::Trigger>("/planning/plan",
         [this](std::shared_ptr<rmw_request_id_t> header, std_srvs::srv::Trigger::Request::SharedPtr) {
-          if(task_ready_ || terminal_ || plan_future_.valid()) {
+          discardFinishedJobs();
+          if((task_ready_ && !terminal_) || plan_future_.valid() || wheel_future_.valid() || foot_future_.valid() || replan_future_.valid()) {
             std_srvs::srv::Trigger::Response response;
-            response.success=false;response.message="Planning busy or task already used; reset robot before another task";
+            response.success=false;response.message="Planning or execution is busy";
             plan_service_->send_response(*header,response);return;
           }
           pending_response_=header;
           run();
         });
       execute_service_ = create_service<std_srvs::srv::Trigger>("/planning/execute", [this](const std_srvs::srv::Trigger::Request::SharedPtr, std_srvs::srv::Trigger::Response::SharedPtr response) {
-        if (!plan_ready_ || task_ready_ || terminal_) {response->success=false;response->message="Plan first; executed/stopped tasks require resetting the robot";return;}
-        if (!have_odom_ || !have_status_ || !have_feet_ || !at(task_scene_.lower.start,wheelHeight(),.01) || !stopped() || executor_.find("READY_WHEEL")!=0) {
+        if (!plan_ready_ || task_ready_ || terminal_) {response->success=false;response->message="A current plan is required; task is already running or finished";return;}
+        if (!have_odom_ || !have_status_ || !have_feet_ || !at(task_scene_.request.start,wheelHeight(),.01) || !stopped() || !wheelReady()) {
           std::ostringstream info;
           info<<"Robot must be ready and stopped at the selected start; feedback="<<have_odom_<<have_status_<<have_feet_
               <<"; actual="<<actual_pose_.x<<','<<actual_pose_.y<<','<<actual_pose_.z<<','<<actual_pose_.yaw
-              <<"; expected="<<task_scene_.lower.start.x<<','<<task_scene_.lower.start.y<<','<<task_scene_.lower.start.z
-              <<','<<task_scene_.lower.start.yaw<<"; executor="<<executor_;
+              <<"; expected="<<task_scene_.request.start.x<<','<<task_scene_.request.start.y<<','<<task_scene_.request.start.z
+              <<','<<task_scene_.request.start.yaw<<"; executor="<<executor_;
           response->success=false;response->message=info.str();return;
         }
         try {
@@ -450,9 +521,9 @@ public:
       });
       stop_service_ = create_service<std_srvs::srv::Trigger>("/planning/stop", [this](const std_srvs::srv::Trigger::Request::SharedPtr, std_srvs::srv::Trigger::Response::SharedPtr response) {
         cancelPlanning();
-        if(task_ready_ && !terminal_)finishTask("STOPPED","Stopped by operator; reset robot before another task");
+        if(task_ready_ && !terminal_)finishTask("STOPPED","Stopped by operator; preserved actual pose and mode");
         else {velocity(0,0);modeCommand("STOP");}
-        plan_ready_=false;terminal_=true;response->success=true;response->message="Stop sent; reset robot before another task";
+        plan_ready_=false;terminal_=true;response->success=true;response->message="Stop sent; next task requires a stopped wheel-mode robot at its selected start";
       });
     }
     auto poll=[this]() {
@@ -469,12 +540,22 @@ public:
         try {drive(false);} catch(const std::exception& e) {finishTask("FAILED",e.what());}
       }
     };
-    timer_=navigation_mode_ ? rclcpp::create_timer(this,get_clock(),std::chrono::milliseconds(20),poll)
-                            : create_wall_timer(std::chrono::milliseconds(20),poll);
-    parameter_guard_=add_on_set_parameters_callback([](const std::vector<rclcpp::Parameter>&) {
-      rcl_interfaces::msg::SetParametersResult result;
-      result.successful=false;
-      result.reason="Planning configuration is fixed per process; restart to change algorithms or constraints";
+    timer_=(navigation_mode_||cross_floor_) ? rclcpp::create_timer(this,get_clock(),std::chrono::milliseconds(20),std::move(poll))
+                            : create_wall_timer(std::chrono::milliseconds(20),std::move(poll));
+    parameter_guard_=add_on_set_parameters_callback([this](const std::vector<rclcpp::Parameter>& parameters) {
+      rcl_interfaces::msg::SetParametersResult result;result.successful=false;
+      try {
+        discardFinishedJobs();
+        require(!(task_ready_&&!terminal_)&&!plan_future_.valid()&&!wheel_future_.valid()&&!foot_future_.valid()&&!replan_future_.valid(),"Task configuration is frozen while busy");
+        for(const auto& p:parameters) {
+          require(p.get_type()==rclcpp::ParameterType::PARAMETER_STRING,"Algorithm name must be a string");
+          if(p.get_name()=="planners.global")planning::makeGlobalPlanner(p.as_string(),planning::PlannerParameters{{"resolution",resolution_},{"max_grid_cells",double(max_cells_)}});
+          else if(p.get_name()=="planners.wheel")planning::makeWheelPlanner(p.as_string(),wheel_parameters_);
+          else if(p.get_name()=="planners.foot")planning::makeFootPlanner(p.as_string(),foot_parameters_);
+          else throw std::runtime_error("Only idle algorithm selection may change; restart for scene or motion constraints");
+        }
+        result.successful=true;
+      }catch(const std::exception& e){result.reason=e.what();}
       return result;
     });
   }
@@ -485,13 +566,12 @@ public:
     if(plan_future_.valid()) plan_future_.wait();
     if(wheel_future_.valid()) wheel_future_.wait();
     if(replan_future_.valid()) replan_future_.wait();
+    if(foot_future_.valid())foot_future_.wait();
     pedestrian_sub_.reset();
     if (visual_timer_) visual_timer_->cancel();
     clearLocalVisuals();
-    clearVisualGroup(foot_visuals_);
+    setFootVisuals({});
     clearPathVisuals();
-    visual_publisher_.reset();
-    delete_publisher_.reset();
     overlay_publisher_.reset();
     if (visual_node_) visual_node_->Fini();
     visual_node_.reset();
@@ -499,15 +579,22 @@ public:
   }
 
 private:
-  using Sections = std::array<std::vector<Pose>, 3>;
+#ifdef SIMULATION_ACCEPTANCE
+  friend int checkStage2Schedule();
+  friend int checkLocalSnapshot(const std::string&);
+  friend int checkMapReuse();
+  friend int checkLegacy();
+  friend int checkWheelRollout(const std::string&,bool);
+  friend int checkAlgorithmSelection();
+#endif
+  using Sections = std::vector<std::vector<Pose>>;
   struct PlanningBatch {
     Scene scene;
     Sections sections;
     std::array<planning::LocalPlanResult,2> local;
-    planning::FootLocalPlanResult foot;
     bool success{false};
     std::string reason;
-    double global_ms{0};
+    double global_ms{0}, map_ms{0};
   };
   struct WheelJob {
     planning::LocalPlanRequest request;
@@ -516,6 +603,15 @@ private:
     double odom_stamp{0};
   };
 
+  YAML::Node scene_config_;
+  simulation::SceneGeometry prepared_geometry_;
+  simulation::FloorGeometry active_floor_;
+  double wheel_height_{0},initialization_ms_{0};
+  static std::string staticConfiguration(const YAML::Node& input) {
+    auto config=YAML::Clone(input);auto scene=config["scene"];
+    scene.remove("waypoints");scene.remove("task_route");scene.remove("task_type");
+    return YAML::Dump(config);
+  }
   std::string sceneText() const {
     std::ifstream input(scene_file_);
     require(input.good(),"Cannot read scene_file: "+scene_file_);
@@ -547,13 +643,27 @@ private:
     const auto begin=std::chrono::steady_clock::now();
     try {
       const auto config=YAML::Load(text);
-      batch.scene=loadScene(config,margin_);
-      if(batch.scene.navigation) {
-        auto request=batch.scene.lower;request.control=control;
-        const auto result=planning::runPlanner(*global_planner_,request);
+      require(staticConfiguration(config)==staticConfiguration(scene_config_),"STATIC_SCENE_OR_ROBOT_CHANGED_RESTART_REQUIRED");
+      batch.scene=loadScene(config,margin_,prepared_geometry_.map);
+      batch.map_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
+      if(batch.scene.unified) {
+        auto request=batch.scene.request;request.control=control;
+        auto result=planning::runPlanner(*global_planner_,request);
         require(result.success,result.failure_reason);
-        batch.sections[0]=result.path;batch.success=true;batch.reason="OK";
-        batch.global_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
+        batch.sections.clear();batch.scene.task.clear();
+        for(std::size_t i=0;i<result.segments.size();++i) {
+          const auto& segment=result.segments[i];
+          batch.sections.emplace_back(result.path.begin()+segment.begin,result.path.begin()+segment.end+1);
+          auto geometry=request;geometry.map.reset();
+          if(segment.mode==planning::TravelMode::Wheel)for(const auto& region:request.map->regions)
+            if(region.id==segment.region_id)geometry=planning::regionRequest(request,region);
+          geometry.start=batch.sections.back().front();geometry.goal=batch.sections.back().back();
+          batch.scene.task.push_back({segment.mode==planning::TravelMode::Wheel?TaskSegment::Mode::Wheel:TaskSegment::Mode::Foot,
+            geometry,segment.connection_id.empty()?segment.region_id:segment.connection_id,"SEGMENT_"+std::to_string(i)});
+        }
+        batch.scene.global=std::move(result);
+        batch.success=true;batch.reason="GLOBAL_VALIDATED; foot motion generated at actual entry; independent_foot_validation=not_run";
+        batch.global_ms=batch.scene.global.algorithm_ms;
         return batch;
       }
       for(auto& segment:batch.scene.task) segment.geometry.control=control;
@@ -561,7 +671,7 @@ private:
       require(lower.success,batch.scene.task[0].label+": "+lower.failure_reason);
       const auto upper=planning::runPlanner(*global_planner_,batch.scene.task[2].geometry);
       require(upper.success,batch.scene.task[2].label+": "+upper.failure_reason);
-      batch.sections={lower.path,stairReference(batch.scene),upper.path};
+      batch.sections={lower.path,stairReference(config,batch.scene),upper.path};
       batch.success=true;batch.reason="OK";
       batch.global_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
       if(local_enabled_) for(std::size_t i=0;i<2;++i) {
@@ -572,24 +682,39 @@ private:
         request.limits=wheel_limits_;
         batch.local[i]=planning::runPlanner(*wheel_planner_,request);
       }
-      if(foot_enabled_) {
-        auto request=footRequest(config,batch.scene,batch.sections[1]);
-        request.geometry.control=control;request.limits=foot_limits_;
-        batch.foot=planning::runPlanner(*foot_planner_,request);
-      }
       if(const auto reason=control.failure();!reason.empty()) throw std::runtime_error(reason);
     } catch(const std::exception& e) {
       batch.success=false;batch.reason=e.what();batch.sections={};
       for(auto& result:batch.local) {result={};result.failure_reason=e.what();}
-      batch.foot={};batch.foot.failure_reason=e.what();
+
     }
     return batch;
   }
+  bool wheelReady() const {
+    return executor_.find("READY_WHEEL")==0 || executor_.find("WHEEL_READY")==0 ||
+      (executor_.find("STOPPED")==0 && executor_.find("mode=wheel")!=std::string::npos);
+  }
+  void discardFinishedJobs() {
+    if(task_ready_&&!terminal_)return;
+    auto discard=[](auto& f){if(f.valid()&&f.wait_for(std::chrono::seconds(0))==std::future_status::ready){try{f.get();}catch(const std::exception&) {}}};
+    discard(wheel_future_);discard(foot_future_);discard(replan_future_);
+  }
   void run() {
-    if(plan_future_.valid() || task_ready_ || terminal_) {respondPlan(false,"TASK_BUSY");return;}
+    if(plan_future_.valid() || (task_ready_&&!terminal_) || wheel_future_.valid() || foot_future_.valid() || replan_future_.valid()) {respondPlan(false,"TASK_BUSY");return;}
+    if(terminal_){
+      if(!have_odom_ || !stopped() || !wheelReady()){respondPlan(false,"RESET_REQUIRED: robot must be stopped and READY_WHEEL");return;}
+      for(auto* stream:{&actual_,&events_,&bands_,&pedestrians_log_}){if(stream->is_open())stream->close();stream->clear();}
+      terminal_=task_ready_=false;active_segment_=0;navigation_segment_=static_cast<std::size_t>(-1);plan_id_=0;
+    }
+    output_dir_=output_root_/("run_"+std::to_string(std::chrono::system_clock::now().time_since_epoch().count()));
     plan_ready_=false;local_ok_=false;foot_command_.points.clear();
     try {
+      global_name_=get_parameter("planners.global").as_string();wheel_name_=get_parameter("planners.wheel").as_string();foot_name_=get_parameter("planners.foot").as_string();
+      global_planner_=planning::makeGlobalPlanner(global_name_,planning::PlannerParameters{{"resolution",resolution_},{"max_grid_cells",double(max_cells_)}});
+      wheel_planner_=planning::makeWheelPlanner(wheel_name_,wheel_parameters_);foot_planner_=planning::makeFootPlanner(foot_name_,foot_parameters_);
+      std_msgs::msg::String state;state.data="GLOBAL_PLANNING; algorithms="+global_name_+"/"+wheel_name_+"/"+foot_name_;task_pub_->publish(state);
       scene_snapshot_=sceneText();
+      setFootVisuals({});
       plan_cancel_=std::make_shared<std::atomic_bool>(false);
       const auto control=budget(plan_timeout_,plan_cancel_);
       plan_future_=std::async(std::launch::async,[this,text=scene_snapshot_,control]() {return computePlan(text,control);});
@@ -602,18 +727,16 @@ private:
       if(terminal_ || plan_cancel_->load()) {respondPlan(false,"PLANNING_CANCELLED");return;}
       require(sceneText()==scene_snapshot_,"SCENE_CHANGED_REPLAN_REQUIRED");
       commitPlan(std::move(batch));
-      respondPlan(plan_ready_,plan_ready_?"PLAN_READY":"Planning failed; inspect planning status");
+      respondPlan(last_plan_success_,last_plan_success_?(plan_ready_?"PLAN_READY":"GLOBAL_VALIDATED; execution unavailable"):"Planning failed; inspect planning status");
     } catch(const std::exception& e) {plan_ready_=false;respondPlan(false,e.what());RCLCPP_ERROR(get_logger(),"%s",e.what());}
   }
 
 
   void ensureTransport(const std::string& world) {
     visual_world_=world;
-    if(visual_publisher_)return;
+    if(overlay_publisher_)return;
     require(gazebo::client::setup(),"Could not start Gazebo transport");gazebo_started_=true;
     visual_node_.reset(new gazebo::transport::Node());visual_node_->Init(world);
-    visual_publisher_=visual_node_->Advertise<gazebo::msgs::Visual>("~/visual",1000);
-    delete_publisher_=visual_node_->Advertise<gazebo::msgs::Request>("~/request",1000);
     overlay_publisher_=visual_node_->Advertise<gazebo::msgs::GzString>("~/planning/path_overlay",10);
     visual_timer_=create_wall_timer(std::chrono::seconds(1),[this](){publishPathVisuals();});
   }
@@ -635,7 +758,7 @@ private:
     {std::lock_guard<std::mutex> lock(pedestrians_mutex_);samples=pedestrians_;}
     const auto& target=navigation_path_[navigation_index_];
     const double dx=target.x-actual_pose_.x,dy=target.y-actual_pose_.y,distance=std::hypot(dx,dy);
-    for(const auto& model:task_scene_.floor.pedestrians) {
+    for(const auto& model:active_floor_.pedestrians) {
       const auto found=samples.find(model.name);
       if(found==samples.end()){pedestrian_feedback_error_="No live sample: "+model.name;return false;}
       const auto& sample=found->second;
@@ -694,7 +817,7 @@ private:
         probe.y+=dy/distance*std::min(distance,3*wheel_limits_.max_v);
       }else probe.yaw=target.yaw;
       if(planning::isPoseCollisionFree(robot,corridor) && !planning::isMotionCollisionFree(robot,probe,corridor)) {
-        auto index=navigation_index_;
+        auto cursor=navigation_stop_cursor_;auto index=navigation_index_;
         double v=std::max(0.,odom_.twist.twist.linear.x),w=odom_.twist.twist.angular.z;
         bool entered=!planning::isPoseCollisionFree(robot,corridor);
         for(double dt=0;dt<=60 && index<navigation_path_.size();dt+=.1) {
@@ -720,7 +843,7 @@ private:
             const double turn=std::abs(error)<yaw_tolerance_?0:std::clamp(2*error,-wheel_limits_.max_w,wheel_limits_.max_w);
             w+=std::clamp(turn-w,-wheel_limits_.max_alpha*.1,wheel_limits_.max_alpha*.1);
             robot.yaw=angle(robot.yaw+w*.1);
-            if(v<.001 && std::abs(w)<.001 && std::abs(error)<yaw_tolerance_)++index;
+            if(v<.001 && std::abs(w)<.001 && std::abs(error)<yaw_tolerance_){++cursor;index=cursor<navigation_stops_.size()?navigation_stops_[cursor]:navigation_path_.size();}
           }
         }
       }
@@ -730,7 +853,7 @@ private:
   void navigationTick() {
     require(navigation_index_<navigation_path_.size(),"NAVIGATION_PATH_EXHAUSTED");
     const double t=now().seconds();
-    auto geometry=task_scene_.floor.geometry;
+    auto geometry=active_floor_.geometry;
     geometry.goal=navigation_path_[navigation_index_];
     bool threat=false,staying_safe=true;
     const bool fresh=updateNavigationObstacles(geometry,threat,staying_safe);
@@ -755,25 +878,25 @@ private:
         auto result=replan_future_.get();
         if(result.success && stopped()) {
           navigation_need_route_=false;
-          navigation_path_=std::move(result.path);navigation_index_=1;
+          setNavigationPath(std::move(result.path));
           geometry.goal=navigation_path_[navigation_index_];
-          task_scene_.task[0].geometry=geometry;
-          task_sections_[0]=navigation_path_;setPathVisuals(task_sections_,task_scene_.world_name);
+          task_scene_.task[active_segment_].geometry=geometry;
+          task_scene_.task[active_segment_].reference=navigation_path_;if(get_parameter("use_sim_time").as_bool())setPathVisuals(taskReferences(),task_scene_.world_name);
           std::ofstream paths(output_dir_/"navigation_replans.csv",std::ios::app);
           for(std::size_t i=0;i<navigation_path_.size();++i) {
             const auto& p=navigation_path_[i];
             paths<<std::setprecision(17)<<t<<','<<i<<','<<p.x<<','<<p.y<<','<<p.yaw<<'\n';
           }
-          enterTask("WHEEL_NAV","Replanned from actual stopped pose");navigation_hold_=-1;
+          enterTask(task_scene_.task[active_segment_].state,"Replanned from actual stopped pose");navigation_hold_=-1;
           return;
         }
         RCLCPP_INFO(get_logger(),"Navigation replan unavailable: %s",result.failure_reason.c_str());
       }
       if(!threat && !navigation_need_route_ && stopped() && t-navigation_hold_>.3 && !replan_future_.valid()) {
-        enterTask("WHEEL_NAV","Passage clear; current obstacles rechecked");navigation_hold_=-1;
+        enterTask(task_scene_.task[active_segment_].state,"Passage clear; current obstacles rechecked");navigation_hold_=-1;
       } else if(!threat && navigation_need_route_ && stopped() && t-last_replan_>1. && !replan_future_.valid()) {
         auto request=geometry;request.start={actual_pose_.x,actual_pose_.y,geometry.start.z,actual_pose_.yaw};
-        request.goal=task_scene_.upper.goal;
+        request.goal=cross_floor_?task_scene_.task[active_segment_].reference.back():task_scene_.request.goal;
         replan_cancel_=std::make_shared<std::atomic_bool>(false);request.control=budget(3.,replan_cancel_);
         last_replan_=t;
         replan_future_=std::async(std::launch::async,[this,request]() {
@@ -782,22 +905,8 @@ private:
       }
       return;
     }
-    task_scene_.task[0].geometry=std::move(geometry);
+    task_scene_.task[active_segment_].geometry=std::move(geometry);
     drive();
-  }
-
-  void clearVisualGroup(std::vector<gazebo::msgs::Visual>& visuals)
-  {
-    if (delete_publisher_ && delete_publisher_->HasConnections()) {
-      for (const auto& visual : visuals) {
-        gazebo::msgs::Request removal;
-        removal.set_id(0);
-        removal.set_request("entity_delete");
-        removal.set_data(visual.name());
-        delete_publisher_->Publish(removal);
-      }
-    }
-    visuals.clear();
   }
 
   // Internal GUI overlays carry only points. No physical or rendering meshes
@@ -819,13 +928,9 @@ private:
   }
 
   void clearPathVisuals() {
-    for(int i=0;i<3;++i)setOverlay("global_"+std::to_string(i),{},0);
-  }
-
-  void publishVisualGroup(const std::vector<gazebo::msgs::Visual>& visuals)
-  {
-    if (!visual_publisher_ || !visual_publisher_->HasConnections()) return;
-    for (const auto& visual : visuals) visual_publisher_->Publish(visual);
+    std::vector<std::string> groups;
+    for(const auto& entry:overlay_messages_)if(entry.first.rfind("global_",0)==0)groups.push_back(entry.first);
+    for(const auto& group:groups)setOverlay(group,{},0);
   }
 
   void setLocalVisuals(const nav_msgs::msg::Path& path,std::size_t group,bool force=false) {
@@ -839,43 +944,27 @@ private:
     setOverlay("local_"+std::to_string(group),points,.065);
   }
 
-  void setFootVisuals(const planning::FootLocalPlanResult& result)
-  {
-    if (!visual_publisher_) return;
-    clearVisualGroup(foot_visuals_);
-    if (!result.success) return;
-    const auto size = values(YAML::LoadFile(scene_file_)["robot"]["foot_size"], 3);
-    for (std::size_t i = 0; i < result.footsteps.size(); ++i) {
-      const auto& step = result.footsteps[i];
-      gazebo::msgs::Visual visual;
-      visual.set_name("planned_footstep_"+output_dir_.filename().string()+"_"+std::to_string(i));
-      visual.set_parent_name(visual_world_);
-      visual.set_is_static(true);
-      visual.set_cast_shadows(false);
-      // Planner poses are collision centres; draw the sole just above its support surface.
-      gazebo::msgs::Set(visual.mutable_pose(), ignition::math::Pose3d(
-        step.to.x, step.to.y, step.to.z-size[2]/2+.012, 0, 0, step.to.yaw));
-      visual.mutable_geometry()->set_type(gazebo::msgs::Geometry::BOX);
-      gazebo::msgs::Set(visual.mutable_geometry()->mutable_box()->mutable_size(),
-                        ignition::math::Vector3d(size[0], size[1], .008));
-      const auto color = step.side == 0 ? ignition::math::Color(.05, .8, 1, 1)
-                                        : ignition::math::Color(1, .45, .05, 1);
-      gazebo::msgs::Set(visual.mutable_material()->mutable_ambient(), color);
-      gazebo::msgs::Set(visual.mutable_material()->mutable_diffuse(), color);
-      // Visual transport creates no physical model or collision geometry.
-      foot_visuals_.push_back(std::move(visual));
-    }
-    publishVisualGroup(foot_visuals_);
+  // Publish planning data only; scene_visualization owns footprint rendering.
+  void setFootVisuals(const planning::FootLocalPlanResult& result) {
+    if(!overlay_publisher_)return;
+    YAML::Emitter data;data<<YAML::BeginMap<<YAML::Key<<"group"<<YAML::Value<<"footsteps";
+    data<<YAML::Key<<"version"<<YAML::Value<<++foot_visual_version_;
+    data<<YAML::Key<<"size"<<YAML::Value<<scene_config_["robot"]["foot_size"];
+    data<<YAML::Key<<"steps"<<YAML::Value<<YAML::BeginSeq;
+    if(result.success)for(const auto& step:result.footsteps)data<<YAML::Flow<<YAML::BeginSeq<<step.side<<step.to.x<<step.to.y<<step.to.z<<step.to.yaw<<YAML::EndSeq;
+    data<<YAML::EndSeq<<YAML::EndMap;
+    auto& message=overlay_messages_["footsteps"];message.set_data(data.c_str());overlay_publisher_->Publish(message);
   }
 
   void publishPathVisuals() {
     if(overlay_publisher_ && overlay_publisher_->HasConnections())
       for(const auto& entry:overlay_messages_)overlay_publisher_->Publish(entry.second);
-    publishVisualGroup(foot_visuals_);
+
   }
 
   void setPathVisuals(const Sections& sections,const std::string& world) {
     ensureTransport(world);
+    clearPathVisuals();
     for(std::size_t i=0;i<sections.size();++i)setOverlay("global_"+std::to_string(i),sections[i],.04);
     publishPathVisuals();
   }
@@ -894,7 +983,7 @@ private:
       spatial += length(sections[s], true);
       for (std::size_t i = 0; i < sections[s].size(); ++i) {
         const auto& p = sections[s][i];
-        path << s << ',' << (s == 1 ? "stair_reference" : "wheel") << ',' << i << ','
+        path << s << ',' << (s<task_scene_.task.size() && task_scene_.task[s].mode==TaskSegment::Mode::Foot ? "foot" : "wheel") << ',' << i << ','
              << p.x << ',' << p.y << ',' << p.z << ',' << p.yaw << '\n';
         ++count;
       }
@@ -908,7 +997,7 @@ private:
               "resolution_m,safety_margin_m,lower_length_m,upper_length_m,stair_reference_only\n"
            << success << ',' << csvString(reason) << ',' << count << ',' << horizontal << ','
            << spatial << ',' << ms << ',' << resolution_ << ',' << margin_ << ','
-           << length(sections[0], false) << ',' << length(sections[2], false) << ',' << !navigation_mode_ << '\n';
+           << (sections.empty()?0:length(sections.front(), false)) << ',' << (sections.size()<3?0:length(sections.back(), false)) << ',' << !navigation_mode_ << '\n';
     result.close();
   }
 
@@ -919,11 +1008,28 @@ private:
     bool success=batch.success;
     std::string reason=batch.reason;
     const auto world=scene.world_name;
-    frame_=scene.lower.frame_id;
+    frame_=scene.request.frame_id;
     task_scene_=scene;
+    cross_floor_=std::any_of(scene.task.begin(),scene.task.end(),[](const auto& segment){return segment.mode==TaskSegment::Mode::Foot;})&&scene.unified;
+    navigation_mode_=scene.unified&&!cross_floor_;
     const double ms=batch.global_ms;
     std::filesystem::create_directories(output_dir_);
     YAML::Node metadata;
+    metadata["map_preparation_ms"]=batch.map_ms;
+    metadata["cold_initialization_ms"]=initialization_ms_;
+    metadata["world_parse_count"]=simulation::worldParseCount();
+    metadata["fixed_config_reads"]=1;
+    metadata["nominal_foot_solves"]=0;
+    metadata["independent_foot_validation"]="not_run";
+    metadata["global_validation_ms"]=scene.global.validation_ms;
+    metadata["spatial_length_m"]=scene.global.spatial_length;
+    metadata["mode_switches"]=scene.global.mode_switches;
+    for(const auto& segment:scene.global.segments) {
+      YAML::Node item;item["begin"]=segment.begin;item["end"]=segment.end;
+      item["mode"]=segment.mode==planning::TravelMode::Wheel?"wheel":"foot";
+      item["region"]=segment.region_id;item["connection"]=segment.connection_id;
+      metadata["segments"].push_back(item);
+    }
     metadata["global"]=global_name_;metadata["wheel"]=wheel_name_;metadata["foot"]=foot_name_;
     metadata["scene_snapshot"]=scene_snapshot_;
     for(const auto& parameter:get_parameters(list_parameters({},10).names))
@@ -943,7 +1049,9 @@ private:
       if (!path.poses.empty()) {
         const auto& last = path.poses.back().pose.position;
         if (std::abs(last.x-p.x) < kTolerance && std::abs(last.y-p.y) < kTolerance &&
-            std::abs(last.z-p.z) < kTolerance) continue;
+            std::abs(last.z-p.z) < kTolerance &&
+            std::abs(std::atan2(std::sin(p.yaw-2*std::atan2(path.poses.back().pose.orientation.z,path.poses.back().pose.orientation.w)),
+                               std::cos(p.yaw-2*std::atan2(path.poses.back().pose.orientation.z,path.poses.back().pose.orientation.w))))<kTolerance) continue;
       }
       geometry_msgs::msg::PoseStamped point;
       point.header = path.header;
@@ -957,12 +1065,12 @@ private:
     path_publisher_->publish(path);
     std_msgs::msg::String status;
     status.data = std::string(success ? "SUCCESS: " : "FAILED: ")+reason+
-      (navigation_mode_?"; task=same_floor_wheel; output=":"; stair=geometric_reference_only; output=")+output_dir_.string();
+      (navigation_mode_?"; task=same_floor_wheel; output=":cross_floor_?"; task=unified_navigation; output=":"; stair=geometric_reference_only; output=")+output_dir_.string();
     status_publisher_->publish(status);
     if (success) {
+      double total_length=0;for(const auto& section:sections)total_length+=length(section,false);
       RCLCPP_INFO(get_logger(), "%s; points=%zu; horizontal_length=%.3f m; planning=%.3f ms",
-                  status.data.c_str(), path.poses.size(), length(sections[0], false)+
-                  length(sections[1], false)+length(sections[2], false), ms);
+                  status.data.c_str(), path.poses.size(), total_length, ms);
     } else {
       RCLCPP_ERROR(get_logger(), "%s", status.data.c_str());
     }
@@ -974,11 +1082,15 @@ private:
     } catch (const std::exception& error) {
       RCLCPP_WARN(get_logger(), "Path visualization unavailable: %s", error.what());
     }
-    if (local_enabled_ && !navigation_mode_) publishLocal(std::move(batch.local));
-    if (foot_enabled_) publishFoot(std::move(batch.foot));
-    task_scene_ = scene; task_sections_ = sections;
-    plan_ready_ = success && local_enabled_ && (navigation_mode_ || (foot_enabled_ && local_ok_ && !foot_command_.points.empty()));
-    if(navigation_mode_) {navigation_path_=task_sections_[0];navigation_index_=1;}
+    task_scene_ = scene;
+    if (local_enabled_ && !scene.unified && !navigation_mode_) publishLocal(std::move(batch.local));
+    foot_commands_.clear();foot_commands_.resize(scene.task.size());
+    task_scene_ = scene;
+    for(std::size_t i=0;i<sections.size();++i)task_scene_.task[i].reference=std::move(sections[i]);
+    task_scene_.global.path.clear();
+    last_plan_success_=success;
+    plan_ready_ = success && local_enabled_ && (navigation_mode_ || (foot_enabled_ && (scene.unified || local_ok_)));
+
     if (autonomous_) beginTask();
   }
 
@@ -990,12 +1102,21 @@ private:
     bands_.exceptions(std::ios::failbit | std::ios::badbit);
     actual_.open(output_dir_/"actual_trajectory.csv"); events_.open(output_dir_/"task_events.csv");
     bands_.open(output_dir_/"teb_execution.csv");
-    actual_ << "sim_time_s,state,x_m,y_m,body_z_m,yaw_rad,v_mps,w_rps,left_x_m,left_y_m,left_z_m,right_x_m,right_y_m,right_z_m,executor_status\n";
+    actual_ << "sim_time_s,state,x_m,y_m,body_z_m,yaw_rad,v_mps,w_rps,left_x_m,left_y_m,left_z_m,right_x_m,right_y_m,right_z_m,foot_time_from_start_s,left_yaw_rad,right_yaw_rad,executor_status\n";
     events_ << "sim_time_s,state,reason,x_m,y_m,body_z_m,yaw_rad,v_mps,w_rps\n";
     bands_ << "plan_id,segment,odom_stamp_s,initial_x_m,initial_y_m,initial_yaw_rad,initial_v_mps,initial_w_rps,index,time_s,x_m,y_m,yaw_rad,v_mps,w_rps,planning_ms,seed_spacing_m\n";
+    segment_budgets_.clear();double total=30;
+    std::ofstream budgets(output_dir_/"segment_budgets.csv");budgets<<"segment,mode,motion_s,budget_s\n";
+    for(std::size_t i=0;i<task_scene_.task.size();++i){
+      const bool foot=task_scene_.task[i].mode==TaskSegment::Mode::Foot;
+      const double motion=foot?(foot_commands_[i].points.empty()?0:rclcpp::Duration(foot_commands_[i].points.back().time_from_start).seconds()):length(task_scene_.task[i].reference,false)/wheel_limits_.max_v;
+      const double seconds=foot?motion+2*get_parameter("task.morph_duration").as_double()+30:std::max(stage_timeout_,2*motion+30);
+      segment_budgets_.push_back(seconds);total+=seconds;budgets<<i<<','<<(foot?"foot":"wheel")<<','<<motion<<','<<seconds<<'\n';
+    }
+    task_timeout_=std::max(task_timeout_,total);
     task_begin_=phase_begin_=now().seconds(); wall_begin_=std::chrono::steady_clock::now();
     task_ready_=true;
-    if(navigation_mode_) {
+    if(navigation_mode_||cross_floor_) {
       pedestrians_log_.open(output_dir_/"pedestrians.csv");
       pedestrians_log_<<"sim_time_s,name,x_m,y_m,yaw_rad,speed_mps\n";
     }
@@ -1085,14 +1206,14 @@ private:
     }
   }
 
-  void saveFoot(const planning::FootLocalPlanResult& result)
+  void saveFoot(const planning::FootLocalPlanResult& result,std::size_t index,bool independent_validation=false)
   {
     std::filesystem::create_directories(output_dir_);
     std::ofstream steps, trajectory;
     steps.exceptions(std::ios::failbit | std::ios::badbit);
     trajectory.exceptions(std::ios::failbit | std::ios::badbit);
-    steps.open(output_dir_/"footstep_path.csv");
-    trajectory.open(output_dir_/"foot_trajectory.csv");
+    steps.open(output_dir_/("footstep_path_"+std::to_string(index)+".csv"));
+    trajectory.open(output_dir_/("foot_trajectory_"+std::to_string(index)+".csv"));
     steps << std::setprecision(17)
       << "step,side,from_x_m,from_y_m,from_z_m,foot_center_x_m,foot_center_y_m,foot_center_z_m,edge_margin_m,touchdown_time_s\n";
     for (std::size_t i = 0; i < result.footsteps.size(); ++i) {
@@ -1108,20 +1229,27 @@ private:
         trajectory << ',' << axis << '_' << derivative << (std::string(derivative) == "velocity" ? "_mps" : "_mps2");
       }
     }
+    trajectory << ",body_yaw_rad,left_yaw_rad,right_yaw_rad";
+    for(const char* d:{"v","a"})for(int j=0;j<3;++j)for(const char* axis:{"x","y","z","yaw"})trajectory<<",spatial_"<<j<<'_'<<axis<<'_'<<d;
     trajectory << '\n';
     for (const auto& s : result.trajectory) {
       trajectory << s.time_from_start << ',' << s.body.x << ',' << s.body.y << ',' << s.body.z;
       for (const auto& foot : s.feet) trajectory << ',' << foot.x << ',' << foot.y << ',' << foot.z;
-      for (double v : s.velocity) trajectory << ',' << v;
-      for (double a : s.acceleration) trajectory << ',' << a;
+      for(const auto* d:{&s.spatial_velocity,&s.spatial_acceleration}) {
+        trajectory<<','<<(*d)[0].x<<','<<(*d)[0].y<<','<<(*d)[0].z<<','<<(*d)[1].x<<','<<(*d)[1].z<<','<<(*d)[2].x<<','<<(*d)[2].z;
+      }
+      trajectory<<','<<s.body.yaw<<','<<s.feet[0].yaw<<','<<s.feet[1].yaw;
+      for(const auto* derivatives:{&s.spatial_velocity,&s.spatial_acceleration})for(const auto& d:*derivatives)trajectory<<','<<d.x<<','<<d.y<<','<<d.z<<','<<d.yaw;
       trajectory << '\n';
     }
     steps.close(); trajectory.close();
+    std::ofstream summary(output_dir_/("foot_result_"+std::to_string(index)+".csv"));
+    summary<<std::setprecision(17)<<"segment,success,reason,steps,samples,duration_s,algorithm_ms,result_check_ms,independent_validation\n"<<index<<','<<result.success<<','<<csvString(result.failure_reason)<<','<<result.footsteps.size()<<','<<result.trajectory.size()<<','<<(result.trajectory.empty()?0:result.trajectory.back().time_from_start)<<','<<result.planning_ms<<','<<result.validation_ms<<','<<(independent_validation?(result.success?"passed":"failed"):"not_run")<<'\n';
   }
 
-  void publishFoot(planning::FootLocalPlanResult result)
+  void publishFoot(planning::FootLocalPlanResult result,trajectory_msgs::msg::MultiDOFJointTrajectory* prepared=nullptr)
   {
-    try { saveFoot(result); }
+    try { if(!prepared)saveFoot(result,foot_publish_segment_); }
     catch (const std::exception& error) {
       result = {}; result.failure_reason = std::string("FOOT_CSV_ERROR: ")+error.what();
     }
@@ -1137,28 +1265,7 @@ private:
       p.pose.orientation.w = 1;
       footsteps.poses.push_back(p);
     }
-    trajectory_msgs::msg::MultiDOFJointTrajectory trajectory;
-    trajectory.header = footsteps.header;
-    trajectory.joint_names = {"body", "left_foot_center", "right_foot_center"};
-    for (const auto& sample : result.trajectory) {
-      trajectory_msgs::msg::MultiDOFJointTrajectoryPoint point;
-      point.time_from_start = rclcpp::Duration::from_seconds(sample.time_from_start);
-      const std::array<Pose, 3> poses{sample.body, sample.feet[0], sample.feet[1]};
-      for (std::size_t i = 0; i < poses.size(); ++i) {
-        geometry_msgs::msg::Transform transform;
-        transform.translation.x = poses[i].x; transform.translation.y = poses[i].y; transform.translation.z = poses[i].z;
-        transform.rotation.w = 1;
-        point.transforms.push_back(transform);
-        geometry_msgs::msg::Twist v, a;
-        const auto axis = i == 0 ? 0 : 3+2*(i-1);
-        v.linear.x = sample.velocity[axis]; a.linear.x = sample.acceleration[axis];
-        v.linear.z = sample.velocity[i == 0 ? 2 : axis+1];
-        a.linear.z = sample.acceleration[i == 0 ? 2 : axis+1];
-        if (i == 0) { v.linear.y = sample.velocity[1]; a.linear.y = sample.acceleration[1]; }
-        point.velocities.push_back(v); point.accelerations.push_back(a);
-      }
-      trajectory.points.push_back(point);
-    }
+    auto trajectory=prepared?std::move(*prepared):makeFootCommand(result,footsteps.header,cross_floor_);
     footstep_publisher_->publish(footsteps);
     foot_trajectory_publisher_->publish(trajectory);
     if (result.success) foot_command_ = trajectory;
@@ -1169,7 +1276,7 @@ private:
     std_msgs::msg::String status;
     const double duration = result.trajectory.empty() ? 0 : result.trajectory.back().time_from_start;
     status.data = std::string(result.success ? "SUCCESS" : "FAILED")+
-      "; segment="+task_scene_.task[1].label+"; state=static_leg_posture; execution=none; model=geometry_kinematics_only; first_side=left"+
+      "; segment="+task_scene_.task[foot_publish_segment_].label+"; state=static_leg_posture; execution=none; model=geometry_kinematics_only; first_side=left"+
       "; steps="+std::to_string(result.footsteps.size())+"; samples="+std::to_string(result.trajectory.size())+
       "; duration_s="+std::to_string(duration)+"; expanded="+std::to_string(result.expanded)+
       "; planning_ms="+std::to_string(result.planning_ms)+"; reason="+(result.success ? "OK" : result.failure_reason)+
@@ -1201,7 +1308,7 @@ private:
     // Accelerated telemetry needs the latest sample, without reliable-history
     // retransmission delaying current odometry. The legacy task keeps its QoS.
     auto odom_qos=rclcpp::QoS(1);
-    if(navigation_mode_)odom_qos.best_effort();
+    if(navigation_mode_||cross_floor_)odom_qos.best_effort();
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>("/robot/odom",odom_qos,[this](nav_msgs::msg::Odometry::SharedPtr msg) {
       if(msg->header.frame_id!=frame_ || msg->child_frame_id!="base_link")return;
       odom_=*msg; odom_stamp_=rclcpp::Time(msg->header.stamp).seconds();
@@ -1221,6 +1328,7 @@ private:
           << t[0].translation.x << ',' << t[0].translation.y << ',' << t[0].translation.z << ','
           << 2*std::atan2(t[0].rotation.z,t[0].rotation.w) << ',' << odom_.twist.twist.linear.x << ',' << odom_.twist.twist.angular.z;
         for(int i=1;i<3;i++)actual_ << ',' << t[i].translation.x << ',' << t[i].translation.y << ',' << t[i].translation.z;
+        actual_<<','<<rclcpp::Duration(msg->points[0].time_from_start).seconds()<<','<<2*std::atan2(t[1].rotation.z,t[1].rotation.w)<<','<<2*std::atan2(t[2].rotation.z,t[2].rotation.w);
         actual_ << ',' << csvString(executor_) << '\n';
       }
     });
@@ -1228,15 +1336,15 @@ private:
       if(!task_ready_||terminal_)return;
       try {taskTick();} catch(const std::exception& e){finishTask("FAILED",e.what());}
     };
-    task_timer_=navigation_mode_ ? rclcpp::create_timer(this,get_clock(),std::chrono::milliseconds(100),tick)
-                                 : create_wall_timer(std::chrono::milliseconds(100),tick);
+    task_timer_=(navigation_mode_||cross_floor_) ? rclcpp::create_timer(this,get_clock(),std::chrono::milliseconds(100),std::move(tick))
+                                 : create_wall_timer(std::chrono::milliseconds(100),std::move(tick));
   }
   static double angle(double x) { return std::atan2(std::sin(x),std::cos(x)); }
-  bool stopped() const {return std::abs(odom_.twist.twist.linear.x)<.001 && std::abs(odom_.twist.twist.angular.z)<.001;}
+  bool stopped() const {return std::max({std::abs(odom_.twist.twist.linear.x),std::abs(odom_.twist.twist.linear.y),std::abs(odom_.twist.twist.linear.z),std::abs(odom_.twist.twist.angular.x),std::abs(odom_.twist.twist.angular.y),std::abs(odom_.twist.twist.angular.z)})<.001;}
   void modeCommand(const std::string& command) {std_msgs::msg::String msg;msg.data=command;mode_pub_->publish(msg);}
   void velocity(double v,double w) {
-    if(navigation_mode_ && task_ready_ && !terminal_ && std::abs(v)+std::abs(w)>1e-8) {
-      auto check=task_scene_.floor.geometry;
+    if((navigation_mode_||cross_floor_) && task_ready_ && !terminal_ && std::abs(v)+std::abs(w)>1e-8) {
+      auto check=active_floor_.geometry;
       Pose p{actual_pose_.x,actual_pose_.y,check.start.z,actual_pose_.yaw};
       double linear=odom_.twist.twist.linear.x,angular=odom_.twist.twist.angular.z;
       // Check the same bounded-acceleration integration as the executor, followed
@@ -1257,34 +1365,56 @@ private:
     geometry_msgs::msg::TwistStamped msg;msg.header.stamp=now();msg.header.frame_id="base_link";
     msg.twist.linear.x=v;msg.twist.angular.z=w;velocity_pub_->publish(msg);
   }
+  void setNavigationPath(std::vector<Pose> path){
+    require(path.size()>=2,"WHEEL_REFERENCE_TOO_SHORT");navigation_path_=std::move(path);navigation_stops_.clear();
+    for(std::size_t i=1;i<navigation_path_.size();++i){const auto& a=navigation_path_[i-1];const auto& b=navigation_path_[i];
+      if(std::hypot(a.x-b.x,a.y-b.y)<1e-8 && std::abs(angle(a.yaw-b.yaw))>1e-5)navigation_stops_.push_back(i);
+    }
+    if(navigation_stops_.empty() || navigation_stops_.back()+1!=navigation_path_.size())navigation_stops_.push_back(navigation_path_.size()-1);
+    navigation_stop_cursor_=navigation_begin_=0;navigation_index_=navigation_stops_.front();
+  }
+  Sections taskReferences() const {Sections paths;for(const auto& segment:task_scene_.task)paths.push_back(segment.reference);return paths;}
+  void activateSegment(){
+    require(active_segment_<task_scene_.task.size(),"SEGMENT_INDEX_OUT_OF_RANGE");segment_begin_=now().seconds();
+    if(task_scene_.task[active_segment_].mode==TaskSegment::Mode::Foot){foot_plan_accounted_until_=now().seconds();enterTask("DEPLOY");modeCommand("LEG");}
+    else enterTask(task_scene_.task[active_segment_].state);
+  }
   void enterTask(const std::string& state,const std::string& reason="") {
     const bool wheel=active_segment_<task_scene_.task.size() &&
       task_scene_.task[active_segment_].mode==TaskSegment::Mode::Wheel && state==task_scene_.task[active_segment_].state;
+    if((navigation_mode_||cross_floor_) && wheel && navigation_segment_!=active_segment_){
+      navigation_segment_=active_segment_;
+      active_floor_.geometry=task_scene_.task.at(active_segment_).geometry;
+      active_floor_.pedestrians.clear();
+      for(const auto& floor:prepared_geometry_.floors)if(std::abs(floor.geometry.start.z-active_floor_.geometry.start.z)<.003)active_floor_.pedestrians=floor.pedestrians;
+      setNavigationPath(task_scene_.task[active_segment_].reference);
+      task_scene_.task[active_segment_].geometry.goal=navigation_path_.at(navigation_index_);
+      navigation_need_route_=false;navigation_hold_=-1;
+    }
     if(!wheel) clearLocalVisuals();
     task_state_=state;phase_begin_=now().seconds();
     if(wheel) last_control_time_=-1;
     events_ << std::setprecision(17) << phase_begin_ << ',' << state << ',' << csvString(reason) << ','
       << actual_pose_.x << ',' << actual_pose_.y << ',' << actual_pose_.z << ',' << actual_pose_.yaw << ','
       << odom_.twist.twist.linear.x << ',' << odom_.twist.twist.angular.z << '\n';events_.flush();
-    std_msgs::msg::String msg;msg.data=state+"; reason="+reason+"; output="+output_dir_.string();task_pub_->publish(msg);
+    std_msgs::msg::String msg;msg.data=state+"; reason="+reason+"; phase="+(active_segment_<task_scene_.task.size() && state==task_scene_.task[active_segment_].state?(task_scene_.task[active_segment_].mode==TaskSegment::Mode::Foot?"foot_execution":"wheel_execution"):state)+"; output="+output_dir_.string();task_pub_->publish(msg);
     RCLCPP_INFO(get_logger(),"Task %s",msg.data.c_str());
   }
   void finishTask(const std::string& state,const std::string& reason) {
     cancelPlanning();velocity(0,0);modeCommand("STOP");enterTask(state,reason);terminal_=true;
     std::ofstream result(output_dir_/"task_result.csv");
-    const auto& goal=task_scene_.upper.goal;
-    result << std::setprecision(17) << "state,reason,simulation_duration_s,wall_duration_s,position_error_m,height_error_m,yaw_error_rad,final_v_mps,final_w_rps,teb_plans,final_x_m,final_y_m,final_body_z_m,executor_status\n"
+    const auto& goal=task_scene_.request.goal;
+    result << std::setprecision(17) << "state,reason,simulation_duration_s,wall_duration_s,position_error_m,height_error_m,yaw_error_rad,final_v_mps,final_w_rps,teb_plans,final_x_m,final_y_m,final_body_z_m,final_vy_mps,final_vz_mps,executor_status\n"
       << state << ',' << csvString(reason) << ',' << now().seconds()-task_begin_ << ','
       << std::chrono::duration<double>(std::chrono::steady_clock::now()-wall_begin_).count() << ','
       << std::hypot(actual_pose_.x-goal.x,actual_pose_.y-goal.y) << ','
       << actual_pose_.z-goal.z-wheelHeight() << ',' << std::abs(angle(actual_pose_.yaw-goal.yaw)) << ','
       << odom_.twist.twist.linear.x << ',' << odom_.twist.twist.angular.z << ',' << plan_id_ << ','
-      << actual_pose_.x << ',' << actual_pose_.y << ',' << actual_pose_.z << ',' << csvString(executor_) << '\n';
+      << actual_pose_.x << ',' << actual_pose_.y << ',' << actual_pose_.z << ',' << odom_.twist.twist.linear.y<<','<<odom_.twist.twist.linear.z<<',' << csvString(executor_) << '\n';
     actual_.flush();events_.flush();bands_.flush();
   }
   double wheelHeight() const {
-    const auto robot=YAML::LoadFile(scene_file_)["robot"];
-    return scalar(robot["wheel_radius"])+scalar(robot["carrier_drop"]);
+    return wheel_height_;
   }
   bool at(const Pose& goal,double height,double tolerance) const {
     return std::hypot(actual_pose_.x-goal.x,actual_pose_.y-goal.y)<=tolerance &&
@@ -1299,7 +1429,7 @@ private:
     if(distance<=reach_tolerance) {
       if(wheel_cancel_) wheel_cancel_->store(true);
       const double error=angle(goal.yaw-actual_pose_.yaw);
-      if(navigation_mode_) {
+      if(navigation_mode_||cross_floor_) {
         Pose current{actual_pose_.x,actual_pose_.y,geometry.start.z,actual_pose_.yaw};
         auto turned=current;turned.yaw=goal.yaw;
         if(!planning::isMotionCollisionFree(current,turned,geometry)) {
@@ -1309,20 +1439,21 @@ private:
         }
       }
       velocity(0,std::abs(error)<yaw_tolerance_?0:std::clamp(2*error,-wheel_limits_.max_w,wheel_limits_.max_w));
-      if(stopped()&&at(goal,wheelHeight(),reach_tolerance)) {
-        if(navigation_mode_) {
-          ++navigation_index_;
-          if(navigation_index_>=navigation_path_.size())finishTask("DONE","Reached navigation goal and stopped in wheel mode");
-          else task_scene_.task[0].geometry.goal=navigation_path_[navigation_index_];
+      if(stopped()&&at(goal,wheelHeight(),reach_tolerance) && std::abs(error)<yaw_tolerance_) {
+        if((navigation_mode_||cross_floor_) && navigation_stop_cursor_+1<navigation_stops_.size()){
+          navigation_begin_=navigation_index_;navigation_index_=navigation_stops_[++navigation_stop_cursor_];
+          task_scene_.task[active_segment_].geometry.goal=navigation_path_[navigation_index_];
+          enterTask(task_scene_.task[active_segment_].state,"Reference turn completed; continuous next subpath");return;
         }
-        else if(active_segment_+1==task_scene_.task.size()) finishTask("DONE","Reached B and stopped in wheel mode");
-        else {++active_segment_;enterTask("DEPLOY");modeCommand("LEG");}
+        if(active_segment_+1==task_scene_.task.size())finishTask("DONE","Reached final goal and stopped in wheel mode");
+        else {++active_segment_;activateSegment();}
+
       }
       return;
     }
     if(wheel_future_.valid()) {
       if(wheel_future_.wait_for(std::chrono::seconds(0))!=std::future_status::ready) {
-        if(navigation_mode_ && control_time-wheel_requested_at_>=command_timeout_) {
+        if((navigation_mode_||cross_floor_) && control_time-wheel_requested_at_>=command_timeout_) {
           wheel_cancel_->store(true);velocity(0,0);
           if(navigation_hold_<0)navigation_hold_=control_time;
           enterTask("WAIT_OBSTACLE","Local prediction timed out; cancelled and braking");return;
@@ -1331,14 +1462,14 @@ private:
       }
       auto job=wheel_future_.get();
       if(!job.request.geometry.control.cancelled->load()) {
-        if(navigation_mode_ && (!job.request.geometry.control.failure().empty() || control_time-job.stamp>=command_timeout_)) {
+        if((navigation_mode_||cross_floor_) && (!job.request.geometry.control.failure().empty() || control_time-job.stamp>=command_timeout_)) {
           velocity(0,0);if(navigation_hold_<0)navigation_hold_=control_time;
           enterTask("WAIT_OBSTACLE","Discarded expired local prediction; recheck before retry");return;
         }
         require(job.request.geometry.control.failure().empty(),"LOCAL_RESULT_EXPIRED");
         require(control_time-job.stamp<command_timeout_,"LOCAL_RESULT_STALE");
         const auto& result=job.result;
-        if(navigation_mode_ && !result.success) {
+        if((navigation_mode_||cross_floor_) && !result.success) {
           velocity(0,0);if(navigation_hold_<0)navigation_hold_=control_time;
           navigation_need_route_=true;
           enterTask("WAIT_OBSTACLE","Local prediction unavailable: "+result.failure_reason);return;
@@ -1355,7 +1486,7 @@ private:
           std::sqrt(2*wheel_limits_.max_a*std::max(0.,distance-reach_tolerance/2))});
         const double scale=planned_v>1e-8?std::clamp(target/planned_v,0.,1.):1.;
         double steering=planned_w*scale;
-        if(navigation_mode_) {
+        if(navigation_mode_ || cross_floor_) {
           Pose look=result.trajectory.back().pose;double length=0;
           for(std::size_t i=1;i<result.trajectory.size();++i) {
             const auto& a=result.trajectory[i-1].pose;const auto& b=result.trajectory[i].pose;
@@ -1394,8 +1525,19 @@ private:
     request.geometry.start={actual_pose_.x,actual_pose_.y,actual_pose_.z-wheelHeight(),actual_pose_.yaw};
     require(std::abs(request.geometry.start.z-geometry.start.z)<.006,"WHEEL_GROUND_HEIGHT_MISMATCH");
     request.geometry.start.z=geometry.start.z;request.geometry.safety_margin=local_margin_;
-    request.reference_path=navigation_mode_ ? std::vector<Pose>{navigation_path_[navigation_index_-1],navigation_path_[navigation_index_]}
-                                            : task_sections_[active_segment_];
+    request.reference_path=task_scene_.task[active_segment_].reference;
+    if(navigation_mode_||cross_floor_)request.reference_path.assign(navigation_path_.begin()+navigation_begin_,navigation_path_.begin()+navigation_index_+1);
+    if(navigation_mode_||cross_floor_){
+      std::size_t closest=0;double best=1e100;
+      for(std::size_t i=0;i<request.reference_path.size();++i){const auto& p=request.reference_path[i];double d=std::hypot(p.x-actual_pose_.x,p.y-actual_pose_.y);if(d<best){best=d;closest=i;}}
+      if(closest>0)request.reference_path.erase(request.reference_path.begin(),request.reference_path.begin()+closest);
+      request.reference_path.front()=request.geometry.start;
+      if(request.reference_path.size()<2)request.reference_path.push_back(geometry.goal);
+    }
+    if((navigation_mode_||cross_floor_) && navigation_index_>0){
+      const auto& before=navigation_path_[navigation_index_-1];const auto& after=navigation_path_[navigation_index_];
+      if(std::hypot(before.x-after.x,before.y-after.y)<1e-8){request.geometry.goal.yaw=before.yaw;request.reference_path.back().yaw=before.yaw;}
+    }
     request.initial_linear_velocity=std::clamp(odom_.twist.twist.linear.x,0.,wheel_limits_.max_v);
     request.initial_angular_velocity=std::clamp(odom_.twist.twist.angular.z,-wheel_limits_.max_w,wheel_limits_.max_w);
     request.limits=wheel_limits_;
@@ -1414,10 +1556,14 @@ private:
       if(!have_odom_||!have_status_||!have_feet_||velocity_pub_->get_subscription_count()==0||execution_pub_->get_subscription_count()==0||mode_pub_->get_subscription_count()==0) {
         require(t-phase_begin_<30 && age(wall_begin_)<60,"EXECUTOR_STARTUP_TIMEOUT");return;
       }
-      require(at(task_scene_.lower.start,wheelHeight(),.01)&&stopped()&&executor_.find("READY_WHEEL")==0,"INITIAL_POSE_OR_MODE_MISMATCH");
-      active_segment_=0;enterTask(task_scene_.task[active_segment_].state);
+      require(at(task_scene_.request.start,wheelHeight(),.01)&&stopped()&&wheelReady(),"INITIAL_POSE_OR_MODE_MISMATCH");
+      active_segment_=0;activateSegment();
     }
-    require(t-task_begin_<task_timeout_ && t-phase_begin_<stage_timeout_ && age(wall_begin_)<2*task_timeout_,"TASK_OR_STAGE_TIMEOUT");
+    if(task_state_=="DEPLOY"){
+      const double planning_wait=std::max(0.,t-foot_plan_accounted_until_);
+      segment_budgets_.at(active_segment_)+=planning_wait;task_timeout_+=planning_wait;foot_plan_accounted_until_=t;
+    }
+    require(t-task_begin_<task_timeout_ && t-segment_begin_<segment_budgets_.at(active_segment_) && age(wall_begin_)<2*task_timeout_,"TASK_OR_STAGE_TIMEOUT");
     if(!(t-odom_stamp_>=-.1 && t-odom_stamp_<feedback_timeout_ && t-feet_stamp_>=-.1 && t-feet_stamp_<feedback_timeout_ &&
       age(wall_odom_)<feedback_timeout_&&age(wall_feet_)<feedback_timeout_&&age(wall_status_)<feedback_timeout_)) {
       std::ostringstream info;info<<"EXECUTION_FEEDBACK_TIMEOUT: sim ages odom="<<t-odom_stamp_<<", feet="<<t-feet_stamp_
@@ -1426,14 +1572,47 @@ private:
     }
     require(executor_.find("FAILED")!=0,"EXECUTOR: "+executor_);
     modeCommand("HEARTBEAT");
-    if(navigation_mode_) {navigationTick();return;}
+    if(navigation_mode_ || (cross_floor_ && task_scene_.task[active_segment_].mode==TaskSegment::Mode::Wheel)){navigationTick();return;}
     if(task_state_==task_scene_.task[active_segment_].state && task_scene_.task[active_segment_].mode==TaskSegment::Mode::Wheel) drive();
-    else if(task_state_=="DEPLOY"&&executor_.find("LEG_READY")==0) {
-      require(at(task_scene_.lower.goal,foot_limits_.body_height,.004),"LEG_ENTRY_POSE_MISMATCH");
+    else if(task_state_=="DEPLOY"&&(executor_.find("LEG_READY")==0||executor_.find("FOOT_DONE")==0)) {
+      require(at(task_scene_.task[active_segment_].geometry.start,foot_limits_.body_height,.004)&&stopped(),"LEG_ENTRY_POSE_OR_STOP_MISMATCH");
+      {
+        if(!foot_future_.valid()){
+          auto request=segmentFootRequest(scene_config_,task_scene_,active_segment_);request.limits=foot_limits_;
+          request.geometry.control=budget(foot_plan_timeout_,plan_cancel_);
+          const auto& measured=feet_.points[0].transforms;
+          auto pose=[](const auto& p){return Pose{p.translation.x,p.translation.y,p.translation.z,2*std::atan2(p.rotation.z,p.rotation.w)};};
+          if(task_scene_.unified) {
+            request.current_body=pose(measured[0]);request.current_feet={pose(measured[1]),pose(measured[2])};
+            request.geometry.start=*request.current_body;request.geometry.start.z-=foot_limits_.body_height;
+          }
+          // The two-step adapter preserves its original +X planar command and
+          // executor entry tolerance; it does not claim spatial stance alignment.
+          foot_plan_accounted_until_=foot_plan_started_sim_=t;foot_plan_started_wall_=std::chrono::steady_clock::now();
+          std_msgs::msg::String planning_state;planning_state.data="FOOT_PLANNING; segment="+std::to_string(active_segment_);task_pub_->publish(planning_state);
+          foot_future_=std::async(std::launch::async,[this,request,index=active_segment_](){
+            RCLCPP_INFO(get_logger(),"ACTUAL_FOOT_SOLVE segment=%zu count=1 independent_validation=not_run",index);
+            auto result=planning::runPlanner(*foot_planner_,request);std_msgs::msg::Header header;header.frame_id=frame_;
+            auto command=makeFootCommand(result,header,request.spatial);saveFoot(result,index);return FootJob{std::move(result),std::move(command),request.geometry.control};
+          });
+          return;
+        }
+        require(std::chrono::duration<double>(std::chrono::steady_clock::now()-foot_plan_started_wall_).count()<foot_plan_timeout_,"FOOT_SEGMENT_PLANNING_TIMEOUT");
+        if(foot_future_.wait_for(std::chrono::seconds(0))!=std::future_status::ready)return;
+        auto job=foot_future_.get();require(job.control.failure().empty(),"FOOT_RESULT_EXPIRED: "+job.control.failure());require(job.result.success,"ACTUAL_FOOT_SEGMENT_"+std::to_string(active_segment_)+": "+job.result.failure_reason);
+        const double motion=rclcpp::Duration(job.command.points.back().time_from_start).seconds();
+        const double previous_motion=0;
+        segment_budgets_[active_segment_]+=motion-previous_motion;task_timeout_+=motion-previous_motion;
+        std::ofstream timing(output_dir_/"foot_planning_wait.csv",std::ios::app);
+        if(timing.tellp()==0)timing<<"segment,simulation_wait_s,wall_wait_s,runtime_motion_s,motion_delta_s,segment_budget_s,task_budget_s\n";
+        timing<<std::setprecision(17)<<active_segment_<<','<<t-foot_plan_started_sim_<<','<<std::chrono::duration<double>(std::chrono::steady_clock::now()-foot_plan_started_wall_).count()<<','<<motion<<','<<motion-previous_motion<<','<<segment_budgets_[active_segment_]<<','<<task_timeout_<<'\n';
+        foot_publish_segment_=active_segment_;publishFoot(std::move(job.result),&job.command);foot_commands_[active_segment_]=foot_command_;
+      }
       foot_command_.header.stamp=now();execution_pub_->publish(foot_command_);enterTask(task_scene_.task[active_segment_].state);
     } else if(task_state_==task_scene_.task[active_segment_].state &&
               task_scene_.task[active_segment_].mode==TaskSegment::Mode::Foot && executor_.find("FOOT_DONE")==0) {
-      require(at(task_scene_.upper.start,foot_limits_.body_height,.004),"FOOT_EXIT_POSE_MISMATCH");
+      require(at(task_scene_.task[active_segment_].geometry.goal,foot_limits_.body_height,.004),"FOOT_EXIT_POSE_MISMATCH");
+      if(!stopped())return;
       const auto& end=foot_command_.points.back();const auto& measured=feet_.points[0];
       // Independent DDS topics may deliver completion status before the final feet sample.
       if(rclcpp::Duration(measured.time_from_start).seconds()<rclcpp::Duration(end.time_from_start).seconds()-.001)return;
@@ -1442,13 +1621,16 @@ private:
         require(std::hypot(a.x-b.x,a.y-b.y)<.003&&std::abs(a.z-b.z)<.003,"FOOT_ENDPOINT_FEEDBACK_MISMATCH");
       }
       require(rclcpp::Duration(measured.time_from_start).seconds()>=rclcpp::Duration(end.time_from_start).seconds()-.001,"FOOT_COMPLETION_FEEDBACK_MISSING");
-      enterTask("FOLD");modeCommand("WHEEL");
+      if(active_segment_+1<task_scene_.task.size() && task_scene_.task[active_segment_+1].mode==TaskSegment::Mode::Foot){++active_segment_;activateSegment();}
+      else {enterTask("FOLD");modeCommand("WHEEL");}
     } else if(task_state_=="FOLD"&&executor_.find("WHEEL_READY")==0) {
-      require(at(task_scene_.upper.start,wheelHeight(),.004)&&stopped(),"WHEEL_EXIT_POSE_MISMATCH");++active_segment_;enterTask(task_scene_.task[active_segment_].state);
+      require(at(task_scene_.task[active_segment_].geometry.goal,wheelHeight(),.004)&&stopped(),"WHEEL_EXIT_POSE_MISMATCH");++active_segment_;if(active_segment_==task_scene_.task.size())finishTask("DONE","Reached final goal and stopped in wheel mode");else activateSegment();
     }
   }
+  bool last_plan_success_{false};
   bool interactive_{false},plan_ready_{false},local_ok_{false},initial_requested_{false};
   bool navigation_mode_{false};
+  bool cross_floor_{false};
   struct PedestrianSample {
     ignition::math::Pose3d pose;
     double stamp{0},speed{0};
@@ -1461,6 +1643,9 @@ private:
   double last_pedestrian_log_{-1};
   std::vector<Pose> navigation_path_;
   std::size_t navigation_index_{1};
+  std::vector<std::size_t> navigation_stops_;
+  std::size_t navigation_stop_cursor_{0},navigation_begin_{0};
+  std::size_t navigation_segment_{static_cast<std::size_t>(-1)};
   double navigation_hold_{-1},last_replan_{-100},navigation_wait_timeout_{90},obstacle_timeout_{.5};
   std::shared_ptr<std::atomic_bool> replan_cancel_;
   std::future<planning::PlanResult> replan_future_;
@@ -1468,19 +1653,25 @@ private:
   std::string pedestrian_feedback_error_;
   std::chrono::steady_clock::time_point last_pedestrian_connect_{std::chrono::steady_clock::now()};
   std::string global_name_,wheel_name_,foot_name_,scene_snapshot_;
-  double plan_timeout_{25},local_timeout_{.6};
+  double plan_timeout_{25},local_timeout_{.6},foot_plan_timeout_{60};
   std::shared_ptr<std::atomic_bool> plan_cancel_,wheel_cancel_;
   std::shared_ptr<rmw_request_id_t> pending_response_;
   std::future<PlanningBatch> plan_future_;
   std::future<WheelJob> wheel_future_;
+  struct FootJob{planning::FootLocalPlanResult result;trajectory_msgs::msg::MultiDOFJointTrajectory command;planning::PlanControl control;};
+  std::future<FootJob> foot_future_;
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_guard_;
-  std::size_t active_segment_{0};
+  std::size_t active_segment_{0},foot_publish_segment_{1};
+  double segment_begin_{0},foot_plan_accounted_until_{0},foot_plan_started_sim_{0};
+  std::chrono::steady_clock::time_point foot_plan_started_wall_;
+  std::vector<double> segment_budgets_;
+  std::vector<trajectory_msgs::msg::MultiDOFJointTrajectory> foot_commands_;
   double wheel_requested_at_{0};
 
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr plan_service_,execute_service_,stop_service_;
   bool autonomous_{false},task_ready_{false},terminal_{false},have_odom_{false},have_status_{false},have_feet_{false};
   std::string task_state_,executor_;
-  Scene task_scene_;Sections task_sections_;
+  Scene task_scene_;
   Pose actual_pose_;
   double feedback_timeout_,command_timeout_,stage_timeout_,task_timeout_,position_tolerance_,yaw_tolerance_,approach_gain_;
   double task_begin_{0},phase_begin_{0},odom_stamp_{-100},feet_stamp_{-100},last_control_time_{-1};
@@ -1500,17 +1691,16 @@ private:
   std::string scene_file_, frame_;
   double resolution_, margin_;
   int64_t max_cells_;
-  std::filesystem::path output_dir_;
+  std::filesystem::path output_dir_,output_root_;
+  planning::PlannerParameters wheel_parameters_,foot_parameters_;
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_publisher_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_publisher_;
   bool gazebo_started_{false};
   gazebo::transport::NodePtr visual_node_;
-  gazebo::transport::PublisherPtr visual_publisher_;
-  gazebo::transport::PublisherPtr delete_publisher_;
   gazebo::transport::PublisherPtr overlay_publisher_;
   std::map<std::string,gazebo::msgs::GzString> overlay_messages_;
-  std::vector<gazebo::msgs::Visual> foot_visuals_;
+  uint64_t foot_visual_version_{static_cast<uint64_t>(std::chrono::system_clock::now().time_since_epoch().count())};
   std::string visual_world_;
   std::chrono::steady_clock::time_point last_local_draw_;
   rclcpp::TimerBase::SharedPtr visual_timer_;
@@ -1530,18 +1720,14 @@ private:
   rclcpp::Publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr foot_trajectory_publisher_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr foot_status_publisher_;
 };
+
 }  // namespace
 
-int main(int argc, char** argv)
-{
-  rclcpp::init(argc, argv);
-  try {
-    rclcpp::spin(std::make_shared<PlanningNode>());
-  } catch (const std::exception& error) {
-    RCLCPP_ERROR(rclcpp::get_logger("planning_node"), "%s", error.what());
-    rclcpp::shutdown();
-    return 1;
-  }
-  rclcpp::shutdown();
-  return 0;
+#ifndef SIMULATION_ACCEPTANCE
+int main(int argc,char** argv) {
+  rclcpp::init(argc,argv);
+  try {rclcpp::spin(std::make_shared<PlanningNode>());}
+  catch(const std::exception& e){RCLCPP_ERROR(rclcpp::get_logger("planning_node"),"%s",e.what());rclcpp::shutdown();return 1;}
+  rclcpp::shutdown();return 0;
 }
+#endif

@@ -20,8 +20,8 @@ def load_presets(path):
 
 
 def task_supported(scene, start, goal):
-    if scene.get('same_floor_navigation'):
-        return start != goal and abs(scene['points'][start]['pose'][2]-scene['points'][goal]['pose'][2]) < .003
+    if scene.get('all_point_navigation'):
+        return start in scene['points'] and goal in scene['points'] and start != goal
     return [start, goal] in scene['executable_routes']
 
 

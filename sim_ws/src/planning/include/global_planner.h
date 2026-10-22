@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <map>
 
 namespace planning
 {
@@ -45,7 +46,8 @@ struct MapBounds
   double max_y{0.0};
 };
 
-// Horizontal oriented solid box, expressed by centre, full XYZ dimensions and yaw.
+// Solid box by centre, full XYZ dimensions and orientation. Wheel maps supply
+// horizontal boxes/projections; spatial foot checks also use roll and pitch.
 // Boundary walls can be supplied in the same obstacle collection.
 struct BoxObstacle
 {
@@ -56,6 +58,7 @@ struct BoxObstacle
   double size_y{0.0};
   double size_z{0.0};
   double yaw{0.0};
+  double roll{0.0}, pitch{0.0};  // Used by spatial foot collision checks.
 };
 
 // Full occupied rectangle, centred on the robot reference point.
@@ -65,6 +68,42 @@ struct RobotFootprint
 {
   double length{0.0};
   double width{0.0};
+};
+
+enum class TravelMode { Wheel, Foot };
+
+struct SupportRegion {
+  std::string id;
+  double height{0};
+  MapBounds bounds;
+  std::vector<BoxObstacle> supports, obstacles;
+};
+
+// Directed connections: reference follows actual tread tops and the platform.
+struct StairConnection {
+  std::string id, from, to;
+  std::vector<Pose> reference;
+  std::vector<BoxObstacle> treads, platforms;
+  bool enabled{true};
+};
+
+struct SceneMap {
+  std::string frame_id;
+  std::vector<BoxObstacle> solids;  // Static World collisions only.
+  std::vector<SupportRegion> regions;
+  std::vector<StairConnection> connections;
+};
+
+struct TraversalConstraints {
+  double wheel_height{0.41};
+  double body_ground_clearance{0.34}, body_height{0.18};
+  double max_step_height{0.17}, min_tread{0.18};
+};
+
+struct PathSegment {
+  std::size_t begin{0}, end{0};  // Inclusive, adjacent segments share a pose.
+  TravelMode mode{TravelMode::Wheel};
+  std::string region_id, connection_id;
 };
 
 struct PlanRequest
@@ -81,6 +120,8 @@ struct PlanRequest
   // adapters with require_support=false; navigation never infers support from bounds.
   std::vector<BoxObstacle> supports;
   bool require_support{false};
+  std::shared_ptr<const SceneMap> map;
+  TraversalConstraints traversal;
 };
 
 struct PlanResult
@@ -89,6 +130,10 @@ struct PlanResult
   // Ordered ground poses in the request frame; includes both endpoints on success.
   std::vector<Pose> path;
   std::string failure_reason;  // Empty on success; explains invalid input/no path, etc.
+  std::vector<PathSegment> segments;
+  double spatial_length{0};
+  std::size_t mode_switches{0};
+  double algorithm_ms{0}, validation_ms{0};
 };
 
 class GlobalPlanner
@@ -101,9 +146,15 @@ public:
 // Common caller boundary: catches exceptions, rejects late/malformed paths,
 // and validates swept geometry independently of the selected algorithm.
 PlanResult runPlanner(GlobalPlanner& planner, const PlanRequest& request);
+PlanRequest regionRequest(const PlanRequest& request, const SupportRegion& region);
+std::string validateGlobalPath(const PlanRequest& request, PlanResult& result);
+std::string validateConnection(const PlanRequest& request, const StairConnection& connection);
 bool isPoseCollisionFree(const Pose& pose, const PlanRequest& request, double padding = 0);
 bool isMotionCollisionFree(const Pose& start, const Pose& end, const PlanRequest& request,
                            double translation_step = .01, double rotation_step = .02);
+
+using PlannerParameters = std::map<std::string,double>;
+std::unique_ptr<GlobalPlanner> makeGlobalPlanner(const std::string&,const PlannerParameters&);
 
 }  // namespace planning
 

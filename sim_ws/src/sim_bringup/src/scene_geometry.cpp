@@ -3,10 +3,14 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
+#include <atomic>
+#include <iostream>
 #include <stdexcept>
 
 namespace simulation {
 namespace {
+std::atomic_size_t parse_count{0};
 using Pose = ignition::math::Pose3d;
 using Vector = ignition::math::Vector3d;
 
@@ -62,15 +66,10 @@ Pose patrolPose(const MovingBox& model,double time) {
   throw std::runtime_error("Invalid pedestrian phase time");
 }
 
-FloorGeometry loadFloorGeometry(const std::string& filename,const std::string& world_name,
+static FloorGeometry extractFloorGeometry(const sdf::ElementPtr& world,
                                 const planning::Pose& start,const planning::Pose& goal,
                                 planning::RobotFootprint footprint,double height,double margin) {
   if(std::abs(start.z-goal.z)>.003)throw std::runtime_error("CROSS_FLOOR_NOT_SUPPORTED_IN_STAGE2");
-  sdf::SDFPtr document(new sdf::SDF());sdf::init(document);
-  if(!sdf::readFile(filename,document) || !document->Root()->HasElement("world"))
-    throw std::runtime_error("Cannot read loaded World: "+filename);
-  auto world=document->Root()->GetElement("world");
-  if(world->Get<std::string>("name")!=world_name)throw std::runtime_error("WORLD_NAME_MISMATCH");
   FloorGeometry result;auto& r=result.geometry;
   r.frame_id="world";r.start=start;r.goal=goal;r.footprint=footprint;r.safety_margin=margin;r.require_support=true;
   double xmin=INFINITY,xmax=-INFINITY,ymin=INFINITY,ymax=-INFINITY;
@@ -143,8 +142,88 @@ FloorGeometry loadFloorGeometry(const std::string& filename,const std::string& w
   }
   if(r.supports.empty())throw std::runtime_error("FLOOR_HAS_NO_SUPPORT_SURFACES");
   r.bounds={xmin,xmax,ymin,ymax};
-  if(!planning::isPoseCollisionFree(start,r))throw std::runtime_error("NAV_START_COLLISION_OR_UNSUPPORTED");
-  if(!planning::isPoseCollisionFree(goal,r))throw std::runtime_error("NAV_GOAL_COLLISION_OR_UNSUPPORTED");
   return result;
+}
+
+std::size_t worldParseCount() {return parse_count.load();}
+SceneGeometry loadSceneGeometry(const std::string& filename,
+ const std::string& world_name,planning::RobotFootprint footprint,double height,double margin) {
+ SceneGeometry prepared;
+ ++parse_count;std::clog<<"SCENE_WORLD_PARSE count="<<parse_count<<" file="<<filename<<std::endl;
+ sdf::SDFPtr document(new sdf::SDF());sdf::init(document);
+ if(!sdf::readFile(filename,document))throw std::runtime_error("Cannot read loaded World");
+ auto world=document->Root()->GetElement("world");
+ if(world->Get<std::string>("name")!=world_name)throw std::runtime_error("WORLD_NAME_MISMATCH");
+ auto result=std::make_shared<planning::SceneMap>();result->frame_id="world";
+ std::map<std::string,planning::BoxObstacle> named;
+ for(auto model=world->GetElement("model");model;model=model->GetNextElement("model")) {
+  const auto name=model->Get<std::string>("name");
+  bool dynamic=false;
+  if(model->HasElement("plugin"))for(auto p=model->GetElement("plugin");p;p=p->GetNextElement("plugin"))
+   if(p->Get<std::string>("filename")=="libscene_controller.so")dynamic=true;
+  if(dynamic || !model->HasElement("link"))continue;
+  if(model->HasElement("model"))throw std::runtime_error("Nested model unsupported");
+  for(auto link=model->GetElement("link");link;link=link->GetNextElement("link")) {
+   if(!link->HasElement("collision"))continue;
+   for(auto c=link->GetElement("collision");c;c=c->GetNextElement("collision")) {
+    auto g=c->GetElement("geometry");
+    if(g->HasElement("plane") && name=="ground_plane")continue;
+    if(!g->HasElement("box"))throw std::runtime_error("Unsupported World collision: "+name);
+    auto size=g->GetElement("box")->Get<Vector>("size");auto p=pose(model)*pose(link)*pose(c);
+    planning::BoxObstacle b{p.Pos().X(),p.Pos().Y(),p.Pos().Z(),size.X(),size.Y(),size.Z(),p.Rot().Yaw(),p.Rot().Roll(),p.Rot().Pitch()};
+    result->solids.push_back(b);named[name]=b;
+   }
+  }
+ }
+ // Semantic slab/tread names identify topology; all dimensions and heights come
+ // from the loaded World, never from preset task names or copied scene geometry.
+ for(int floor=1;floor<=3;++floor) {
+  auto slab=named.at("f"+std::to_string(floor)+"_slab_01");
+  double z=slab.center_z+slab.size_z/2;
+  auto floor_geometry=extractFloorGeometry(world,{0,0,z,0},{0,0,z,0},footprint,height,margin);
+  const auto& geometry=floor_geometry.geometry;
+  result->regions.push_back({"F"+std::to_string(floor),z,geometry.bounds,geometry.supports,geometry.obstacles});
+  prepared.floors.push_back(std::move(floor_geometry));
+ }
+ for(int floor=1;floor<=2;++floor) {
+  const auto prefix="f"+std::to_string(floor)+"_stair_";
+  auto landing=named.at(prefix+"mid_landing");
+  auto first=named.at(prefix+"south_tread_01"),last=named.at(prefix+"north_tread_10");
+  const double lower=result->regions[floor-1].height,upper=result->regions[floor].height;
+  planning::StairConnection up;
+  up.id=prefix+"up";up.from=result->regions[floor-1].id;up.to=result->regions[floor].id;
+  up.platforms={landing};
+  up.reference.push_back({first.center_x-first.size_x/2-.45,first.center_y,lower,0});
+  double z=lower;
+  for(const auto& flight: {std::string("south"),std::string("north")}) {
+   const double direction=flight=="south"?1:-1,yaw=direction>0?0:std::acos(-1.);
+   if(flight=="north") {
+    const double top=landing.center_z+landing.size_z/2;
+    const double y=named.at(prefix+"north_tread_01").center_y;
+    up.reference.push_back({landing.center_x,first.center_y,top,0});
+    up.reference.push_back({landing.center_x,first.center_y,top,std::acos(-1.)/2});
+    up.reference.push_back({landing.center_x,y,top,std::acos(-1.)/2});
+    up.reference.push_back({landing.center_x,y,top,yaw});z=top;
+   }
+   for(int i=1;i<=10;++i) {
+    auto b=named.at(prefix+flight+"_tread_"+(i<10?"0":"")+std::to_string(i));up.treads.push_back(b);
+    const double x=b.center_x-direction*b.size_x/2,top=b.center_z+b.size_z/2;
+    up.reference.push_back({x,b.center_y,z,yaw});
+    up.reference.push_back({x,b.center_y,top,yaw});
+    up.reference.push_back({b.center_x+direction*b.size_x/2,b.center_y,top,yaw});z=top;
+   }
+  }
+  up.reference.push_back({last.center_x-last.size_x/2-.45,last.center_y,upper,std::acos(-1.)});
+  result->connections.push_back(up);
+  auto down=up;down.id=prefix+"down";std::swap(down.from,down.to);
+  std::reverse(down.reference.begin(),down.reference.end());
+  for(auto& p:down.reference)p.yaw=std::atan2(std::sin(p.yaw+std::acos(-1.)),std::cos(p.yaw+std::acos(-1.)));
+  result->connections.push_back(down);
+ }
+ prepared.map=std::move(result);return prepared;
+}
+std::shared_ptr<const planning::SceneMap> loadSceneMap(const std::string& filename,
+ const std::string& world_name,planning::RobotFootprint footprint,double height,double margin) {
+ return loadSceneGeometry(filename,world_name,footprint,height,margin).map;
 }
 }  // namespace simulation

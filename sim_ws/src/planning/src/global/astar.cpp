@@ -7,6 +7,7 @@
 #include <queue>
 #include <stdexcept>
 #include <utility>
+#include <unordered_map>
 
 namespace planning
 {
@@ -277,6 +278,252 @@ PlanResult orientedPlan(const PlanRequest& r,const AStarOptions& options) {
 }
 }  // namespace
 
+PlanRequest regionRequest(const PlanRequest& r,const SupportRegion& region) {
+  auto local=r;local.map.reset();local.bounds=region.bounds;local.supports=region.supports;
+  local.obstacles=region.obstacles;local.require_support=true;
+  local.start.z=local.goal.z=region.height;return local;
+}
+
+namespace {
+double spatialDistance(const Pose& a,const Pose& b) {
+ return std::hypot(std::hypot(a.x-b.x,a.y-b.y),a.z-b.z);
+}
+bool samePose(const Pose& a,const Pose& b) {
+ return poseFinite(a)&&poseFinite(b)&&spatialDistance(a,b)<1e-7 &&
+  std::abs(std::atan2(std::sin(a.yaw-b.yaw),std::cos(a.yaw-b.yaw)))<1e-7;
+}
+const SupportRegion* findRegion(const SceneMap& map,const std::string& id) {
+ for(const auto& region:map.regions)if(region.id==id)return &region;
+ return nullptr;
+}
+}
+
+std::string validateConnection(const PlanRequest& r,const StairConnection& c) {
+ if(!r.map || !c.enabled || c.reference.size()<2 || c.treads.empty() || c.platforms.empty())return "INVALID_CONNECTION";
+ const auto* from=findRegion(*r.map,c.from);const auto* to=findRegion(*r.map,c.to);
+ if(!from || !to)return "UNKNOWN_CONNECTION_REGION";
+ if(!isPoseCollisionFree(c.reference.front(),regionRequest(r,*from)) ||
+    !isPoseCollisionFree(c.reference.back(),regionRequest(r,*to)))return "UNSAFE_MODE_SWITCH";
+ auto terrain=c.treads;terrain.insert(terrain.end(),c.platforms.begin(),c.platforms.end());
+ terrain.insert(terrain.end(),from->supports.begin(),from->supports.end());
+ terrain.insert(terrain.end(),to->supports.begin(),to->supports.end());
+ for(const auto& tread:c.treads)
+  if(tread.size_x+1e-8<r.traversal.min_tread || tread.size_y<r.footprint.width+2*r.safety_margin)
+   return "STAIR_CAPABILITY_OR_WIDTH";
+ // Check the complete reference interpolation. Vertical risers are supported by
+ // adjacent tread edges; they are ground references, not executable foot motion.
+ for(std::size_t i=0;i<c.reference.size();++i) {
+  const auto& a=c.reference[i?i-1:i];const auto& b=c.reference[i];
+  if(!poseFinite(b))return "INVALID_CONNECTION_POSE";
+  const double dz=std::abs(b.z-a.z),d=distance(a,b);
+  if(dz>1e-7 && (d>1e-7 || dz>r.traversal.max_step_height+1e-7))return "INVALID_STAIR_RISE";
+  const double turn=std::atan2(std::sin(b.yaw-a.yaw),std::cos(b.yaw-a.yaw));
+  if(dz<1e-7) {
+   // Exact union of support intervals along this horizontal reference edge.
+   // This detects arbitrarily thin unsupported gaps, including between samples.
+   std::vector<std::pair<double,double>> intervals;
+   for(const auto& box:terrain) {
+    if(std::abs(box.center_z+box.size_z/2-a.z)>.003)continue;
+    double lo=0,hi=1,cs=std::cos(box.yaw),sn=std::sin(box.yaw);
+    const double x=cs*(a.x-box.center_x)+sn*(a.y-box.center_y);
+    const double y=-sn*(a.x-box.center_x)+cs*(a.y-box.center_y);
+    const double vx=cs*(b.x-a.x)+sn*(b.y-a.y),vy=-sn*(b.x-a.x)+cs*(b.y-a.y);
+    for(auto axis:std::array<std::array<double,3>,2>{{{x,vx,box.size_x/2},{y,vy,box.size_y/2}}}) {
+     if(std::abs(axis[1])<1e-12) {if(std::abs(axis[0])>axis[2]+1e-9){lo=1;hi=0;}}
+     else {
+      double t0=(-axis[2]-axis[0])/axis[1],t1=(axis[2]-axis[0])/axis[1];
+      lo=std::max(lo,std::min(t0,t1));hi=std::min(hi,std::max(t0,t1));
+     }
+    }
+    if(lo<=hi+1e-9)intervals.push_back({lo,hi});
+   }
+   std::sort(intervals.begin(),intervals.end());double covered=0;
+   for(auto interval:intervals){if(interval.first>covered+1e-8)break;covered=std::max(covered,interval.second);}
+   if(covered<1-1e-8)return "UNSUPPORTED_STAIR_REFERENCE";
+  } else {
+   // A vertical riser must join the two actual horizontal surfaces at its edge.
+   for(const auto& p:{a,b}) {
+    bool support=false;
+    for(const auto& box:terrain) {
+     const double cs=std::cos(box.yaw),sn=std::sin(box.yaw),x=p.x-box.center_x,y=p.y-box.center_y;
+     if(std::abs(cs*x+sn*y)<=box.size_x/2+1e-8 && std::abs(-sn*x+cs*y)<=box.size_y/2+1e-8 &&
+        std::abs(p.z-box.center_z-box.size_z/2)<.003)support=true;
+    }
+    if(!support)return "UNSUPPORTED_RISER_EDGE";
+   }
+  }
+  // The swept body envelope covers the entire interpolation, including vertical
+  // travel. This is a macro passage check, not a claim about a feasible gait.
+  auto body=r;body.map.reset();body.require_support=false;body.supports.clear();body.obstacles.clear();
+  body.bounds={-1e4,1e4,-1e4,1e4};
+  const double low=std::min(a.z,b.z)+r.traversal.body_ground_clearance;
+  const double high=std::max(a.z,b.z)+r.traversal.body_ground_clearance+r.traversal.body_height;
+  for(const auto& box:r.map->solids) {
+   const double cp=std::cos(box.pitch),sp=std::sin(box.pitch),cr=std::cos(box.roll),sr=std::sin(box.roll);
+   const double extent=(std::abs(sp)*box.size_x+std::abs(cp*sr)*box.size_y+std::abs(cp*cr)*box.size_z)/2;
+   if(box.center_z+extent>low+1e-6 && box.center_z-extent<high-1e-6) {
+    auto projection=box;
+    projection.size_x=std::abs(cp)*box.size_x+std::abs(sp*sr)*box.size_y+std::abs(sp*cr)*box.size_z;
+    projection.size_y=std::abs(cr)*box.size_y+std::abs(sr)*box.size_z;
+    projection.center_z=(low+high)/2;projection.size_z=high-low;
+    body.obstacles.push_back(projection);
+   }
+  }
+  Pose flat_b=b;flat_b.z=a.z;
+  if(!isMotionCollisionFree(a,flat_b,body))return "STAIR_BODY_COLLISION";
+  if(std::abs(turn)>1e-7) {
+   auto flat=body;flat.obstacles.clear();flat.supports=c.platforms;flat.require_support=true;
+   if(dz>1e-7 || !isMotionCollisionFree(a,b,flat))return "INSUFFICIENT_PLATFORM_TURN_SPACE";
+  }
+
+ }
+ return {};
+}
+
+std::string validateGlobalPath(const PlanRequest& r,PlanResult& result) {
+ if(!r.map || result.path.empty() || !samePose(result.path.front(),r.start) || !samePose(result.path.back(),r.goal))return "INVALID_GLOBAL_ENDPOINTS";
+ if(result.segments.empty())return "MISSING_GLOBAL_SEGMENTS";
+ std::size_t end=0;result.spatial_length=0;result.mode_switches=0;
+ for(std::size_t i=0;i<result.segments.size();++i) {
+  const auto& s=result.segments[i];
+  if(s.begin!=end || s.end<s.begin || s.end>=result.path.size())return "INVALID_SEGMENT_COVERAGE";
+  end=s.end;
+  if(i && s.mode!=result.segments[i-1].mode)++result.mode_switches;
+  if(s.mode==TravelMode::Wheel) {
+   auto region=findRegion(*r.map,s.region_id);if(!region || !s.connection_id.empty())return "INVALID_WHEEL_REGION";
+   auto local=regionRequest(r,*region);
+   for(std::size_t j=s.begin;j<=s.end;++j)
+    if(std::abs(result.path[j].z-region->height)>1e-7 || !isPoseCollisionFree(result.path[j],local) ||
+       (j>s.begin && !isMotionCollisionFree(result.path[j-1],result.path[j],local)))return "INVALID_GLOBAL_GEOMETRY";
+  } else {
+   const StairConnection* c=nullptr;
+   for(const auto& candidate:r.map->connections)if(candidate.id==s.connection_id)c=&candidate;
+   if(!c || s.end-s.begin+1!=c->reference.size())return "INVALID_FOOT_CONNECTION";
+   if(auto failure=validateConnection(r,*c);!failure.empty())return failure;
+   for(std::size_t j=0;j<c->reference.size();++j)
+    if(!samePose(result.path[s.begin+j],c->reference[j]))return "INVALID_CONNECTION_PATH";
+   if(i==0 || i+1==result.segments.size() || result.segments[i-1].region_id!=c->from ||
+      result.segments[i+1].region_id!=c->to)return "INVALID_CONNECTION_CONTINUITY";
+  }
+ }
+ if(end+1!=result.path.size())return "INCOMPLETE_GLOBAL_PATH";
+ for(std::size_t i=1;i<result.path.size();++i)result.spatial_length+=spatialDistance(result.path[i-1],result.path[i]);
+ return {};
+}
+
+namespace {
+PlanResult spatialPlan(const PlanRequest& r,const AStarOptions& options) {
+ auto fail=[](const std::string& reason){return PlanResult{false,{},reason};};
+ const auto& map=*r.map;const double step=options.resolution,pi=std::acos(-1.);
+ const auto& ability=r.traversal;
+ if(!finite(ability.wheel_height) || ability.wheel_height<=0 ||
+    !finite(ability.body_ground_clearance) || ability.body_ground_clearance<=0 ||
+    !finite(ability.body_height) || ability.body_height<=0 ||
+    !finite(ability.max_step_height) || ability.max_step_height<=0 ||
+    !finite(ability.min_tread) || ability.min_tread<=0)return fail("INVALID_TRAVERSAL_CONSTRAINTS");
+ if(map.regions.empty() || map.frame_id!=r.frame_id)return fail("INVALID_SCENE_MAP");
+ std::vector<PlanRequest> layers;
+ for(const auto& region:map.regions)layers.push_back(regionRequest(r,region));
+ auto layerOf=[&](const Pose& p){for(std::size_t f=0;f<layers.size();++f)
+  if(std::abs(p.z-map.regions[f].height)<1e-7 && isPoseCollisionFree(p,layers[f]))return int(f);return -1;};
+ int sf=layerOf(r.start),gf=layerOf(r.goal);if(sf<0 || gf<0)return fail("INVALID_GLOBAL_ENDPOINT_SUPPORT");
+ // One position/yaw lattice per support height, plus exact endpoint/portal
+ // vertices. A single A* frontier can choose any number/direction of stairs.
+ const double minx=r.bounds.min_x,miny=r.bounds.min_y;
+ const int nx=std::floor((r.bounds.max_x-minx)/step)+1,ny=std::floor((r.bounds.max_y-miny)/step)+1;
+ if(nx<=0 || ny<=0)return fail("INVALID_MAP_BOUNDS");
+ const std::size_t per=std::size_t(nx)*ny*8,total=per*layers.size();
+ auto id=[&](int f,int x,int y,int h){return f*per+(std::size_t(y)*nx+x)*8+h;};
+ auto point=[&](std::size_t i){int f=i/per;i%=per;int h=i%8;i/=8;return Pose{minx+(i%nx)*step,miny+(i/nx)*step,map.regions[f].height,h*pi/4};};
+ auto connect=[&](const Pose& a,const Pose& b,int f){
+  std::vector<Pose> path{a};if(distance(a,b)>1e-8) {
+   double yaw=std::atan2(b.y-a.y,b.x-a.x);path.push_back({a.x,a.y,a.z,yaw});path.push_back({b.x,b.y,b.z,yaw});
+  }path.push_back(b);
+  for(std::size_t i=1;i<path.size();++i)if(!isMotionCollisionFree(path[i-1],path[i],layers[f]))return std::vector<Pose>{};
+  return path;
+ };
+ struct Edge {std::size_t to;std::vector<Pose> path;int connection{-1};};
+ std::unordered_map<std::size_t,std::vector<Edge>> extra;
+ std::vector<Pose> terminals{r.start,r.goal};std::vector<int> terminal_layers{sf,gf};
+ for(std::size_t c=0;c<map.connections.size();++c) {
+  const auto& connection=map.connections[c];
+  if(!connection.enabled || !validateConnection(r,connection).empty())continue;
+  auto a=connection.reference.front(),b=connection.reference.back();int af=layerOf(a),bf=layerOf(b);
+  if(af<0 || bf<0)continue;
+  std::size_t ai=total+terminals.size();terminals.push_back(a);terminal_layers.push_back(af);
+  std::size_t bi=total+terminals.size();terminals.push_back(b);terminal_layers.push_back(bf);
+  extra[ai].push_back({bi,connection.reference,int(c)});
+ }
+ for(std::size_t t=0;t<terminals.size();++t) {
+  const auto& p=terminals[t];int f=terminal_layers[t];
+  int x=std::llround((p.x-minx)/step),y=std::llround((p.y-miny)/step);
+  int h=(int(std::llround(p.yaw/(pi/4)))%8+8)%8;
+  for(int xx=x-1;xx<=x+1;++xx)for(int yy=y-1;yy<=y+1;++yy) {
+   if(xx<0||yy<0||xx>=nx||yy>=ny)continue;
+   auto v=id(f,xx,yy,h);auto path=connect(p,point(v),f);
+   if(!path.empty())extra[total+t].push_back({v,std::move(path)});
+   path=connect(point(v),p,f);if(!path.empty())extra[v].push_back({total+t,std::move(path)});
+  }
+  for(std::size_t u=0;u<t;++u)if(terminal_layers[u]==f && distance(p,terminals[u])<1e-8) {
+   auto path=connect(p,terminals[u],f);if(!path.empty())extra[total+t].push_back({total+u,std::move(path)});
+   path=connect(terminals[u],p,f);if(!path.empty())extra[total+u].push_back({total+t,std::move(path)});
+  }
+ }
+ struct State {double cost{INFINITY};std::size_t switches{0},parent{0};Edge edge;bool closed{false};};
+ std::unordered_map<std::size_t,State> states;
+ std::unordered_map<std::size_t,bool> free;
+ auto pos=[&](std::size_t i){return i<total?point(i):terminals[i-total];};
+ struct Item {double estimate,cost;std::size_t switches,id;bool operator<(const Item& b)const {
+  if(estimate!=b.estimate)return estimate>b.estimate;if(switches!=b.switches)return switches>b.switches;return id>b.id;
+ }};
+ std::priority_queue<Item> open;states[total].cost=0;open.push({spatialDistance(r.start,r.goal),0,0,total});
+ const int dx[8]={1,1,0,-1,-1,-1,0,1},dy[8]={0,1,1,1,0,-1,-1,-1};
+ while(!open.empty()) {
+  if(auto reason=r.control.failure();!reason.empty())return fail(reason);
+  auto item=open.top();open.pop();auto current=item.id;
+  if(states[current].closed || item.cost!=states[current].cost)continue;
+  states[current].closed=true;if(current==total+1)break;
+  if(states.size()>options.max_grid_cells)return fail("GRID_LIMIT_EXCEEDED");
+  auto relax=[&](const Edge& e) {
+   double length=0;for(std::size_t j=1;j<e.path.size();++j)length+=spatialDistance(e.path[j-1],e.path[j]);
+   double cost=item.cost+length;std::size_t switches=item.switches+(e.connection>=0?2:0);
+   auto& next=states[e.to];if(next.closed || cost>next.cost+1e-10 ||
+     (std::abs(cost-next.cost)<=1e-10 && switches>=next.switches))return;
+   next.cost=cost;next.switches=switches;next.parent=current;next.edge=e;
+   open.push({cost+spatialDistance(pos(e.to),r.goal),cost,switches,e.to});
+  };
+  if(auto found=extra.find(current);found!=extra.end())for(const auto& e:found->second)relax(e);
+  if(current>=total)continue;
+  int f=current/per,h=current%8,x=(current%per/8)%nx,y=(current%per/8)/nx;
+  for(int action:{0,-1,1}) {
+   int xx=x,yy=y,hh=h;if(action==0){xx+=dx[h];yy+=dy[h];}else hh=(h+action+8)%8;
+   if(xx<0||yy<0||xx>=nx||yy>=ny)continue;
+   auto v=id(f,xx,yy,hh);if(states.count(v) && states[v].closed)continue;
+   auto cached=free.find(v);bool valid;
+   if(cached==free.end()){valid=isPoseCollisionFree(point(v),layers[f]);free[v]=valid;}else valid=cached->second;
+   if(!valid || !isMotionCollisionFree(point(current),point(v),layers[f]))continue;
+   relax({v,{point(current),point(v)}});
+  }
+ }
+ if(!states[total+1].closed)return fail("NO_PATH");
+ std::vector<Edge> edges;for(std::size_t i=total+1;i!=total;i=states[i].parent)edges.push_back(states[i].edge);
+ std::reverse(edges.begin(),edges.end());PlanResult result;result.success=true;result.path={r.start};
+ auto wheel=[&](int f){if(result.segments.empty() || result.segments.back().mode!=TravelMode::Wheel ||
+   result.segments.back().region_id!=map.regions[f].id)
+   result.segments.push_back({result.path.size()-1,result.path.size()-1,TravelMode::Wheel,map.regions[f].id,{}});};
+ wheel(sf);
+ for(const auto& edge:edges) {
+  if(edge.connection>=0) {
+   const auto& c=map.connections[edge.connection];
+   result.segments.push_back({result.path.size()-1,result.path.size()-1,TravelMode::Foot,{},c.id});
+  } else wheel(layerOf(edge.path.front()));
+  result.path.insert(result.path.end(),edge.path.begin()+1,edge.path.end());
+  result.segments.back().end=result.path.size()-1;
+ }
+ wheel(gf);return result;
+}
+}
+
 AStar::AStar(AStarOptions options) : options_(options)
 {
   if (!finite(options_.resolution) || options_.resolution <= 0 || options_.max_grid_cells == 0) {
@@ -289,6 +536,7 @@ PlanResult AStar::plan(const PlanRequest& request)
   auto failure = [](const std::string& reason) { return PlanResult{false, {}, reason}; };
   if (const auto reason = request.control.failure(); !reason.empty()) return failure(reason);
   if (!validate(request)) return failure("INVALID_REQUEST");
+  if(request.map)return spatialPlan(request,options_);
   if (std::abs(request.start.z-request.goal.z) > 1e-6) return failure("NON_PLANAR_REQUEST");
   if(request.require_support || std::any_of(request.obstacles.begin(),request.obstacles.end(),
       [](const auto& box){return std::abs(box.yaw)>1e-8;})) return orientedPlan(request,options_);
@@ -527,9 +775,19 @@ PlanResult runPlanner(GlobalPlanner& planner, const PlanRequest& request)
 {
   try {
     if (const auto reason=request.control.failure(); !reason.empty()) return {false,{},reason};
+    auto begin=std::chrono::steady_clock::now();
     auto result=planner.plan(request);
+    result.algorithm_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
+    begin=std::chrono::steady_clock::now();
     if (const auto reason=request.control.failure(); !reason.empty()) return {false,{},reason};
     if(!result.success) return {false,{},result.failure_reason.empty()?"PLANNER_FAILED":result.failure_reason};
+    if(request.map) {
+      auto reason=validateGlobalPath(request,result);
+      if(!reason.empty())return {false,{},reason};
+      if(auto reason=request.control.failure();!reason.empty())return {false,{},reason};
+      result.validation_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
+      return result;
+    }
     auto matches=[](const Pose& a,const Pose& b) {
       return poseFinite(a) && distance(a,b)<1e-6 && std::abs(a.z-b.z)<1e-6 &&
         std::abs(std::atan2(std::sin(a.yaw-b.yaw),std::cos(a.yaw-b.yaw)))<1e-6;
@@ -545,4 +803,15 @@ PlanResult runPlanner(GlobalPlanner& planner, const PlanRequest& request)
   } catch(const std::exception& e) { return {false,{},e.what()}; }
 }
 
+
+std::unique_ptr<GlobalPlanner> makeGlobalPlanner(const std::string& name,const PlannerParameters& parameters) {
+  AStarOptions options;
+  for(const auto& p:parameters) {
+    if(!std::isfinite(p.second))throw std::invalid_argument("NONFINITE_ALGORITHM_PARAMETER: "+p.first);
+    if(p.first=="resolution")options.resolution=static_cast<double>(p.second);
+    else if(p.first=="max_grid_cells") {if(p.second<1 || p.second>double(std::numeric_limits<std::size_t>::max()/2) || std::floor(p.second)!=p.second)throw std::invalid_argument("INVALID_MAX_GRID_CELLS");options.max_grid_cells=static_cast<std::size_t>(p.second);}
+    else throw std::invalid_argument("UNKNOWN_ALGORITHM_PARAMETER: "+p.first);
+  }
+  return makeGlobalPlanner(name,options);
+}
 }  // namespace planning

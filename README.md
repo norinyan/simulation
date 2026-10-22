@@ -15,9 +15,9 @@
 | 场景 | 已实现能力 | 运行入口 |
 |---|---|---|
 | 两级台阶 `two_steps` | A→E 轮式绕障、E→X 足式上台阶、X→B 轮式到达停车 | HMI 选择 A→B，或命令行自动任务 |
-| 三层楼 `three_floor` | 每层三个预设点之间的同层轮式导航；三名行人往返；障碍冲突等待、恢复与必要时重规划 | HMI 选择同层不同点位 |
+| 三层楼 `three_floor` | 统一三维路线、轮式动态避障、楼梯及平台全程足式 | HMI 选择9个预设点中的任意不同起终点 |
 
-当前采用 **运动学执行**，验证轨迹、碰撞和地面支撑，不包含动力学平衡、接触力或电机力矩控制。导航使用已知场景与仿真实际状态，不包含 SLAM 或传感器定位。三层楼跨层导航、自动轮足切换与电梯控制尚未实现；两级台阶已有固定任务的轮足切换，足式仅支持沿 +X 的平面上台阶运动。
+当前采用 **运动学执行**，验证轨迹、碰撞和地面支撑，不包含动力学平衡、接触力或电机力矩控制。导航使用已知场景与仿真实际状态，不包含 SLAM 或传感器定位。 **当前第四阶段验收未通过：约定真实路线8/9到达，F2-ROOM→F2-EAST因动态等待超时；静态检查停在35/72，待确认修复方案。**三层楼通过统一接口组织同层、上下楼与连续跨两层任务；电梯未开发。机器人已增加左右髋部偏航关节，用于平台足式迈步转向。
 
 ![三层楼场景总览](doc/f2/gazebo_final_overview.png)
 
@@ -63,15 +63,15 @@ ros2 launch simulation_hmi hmi.launch.py
 
 ### 3. HMI 界面与操作
 
-![HMI 实际界面：三层楼同层任务已完成规划，等待开始执行](doc/f2/hmi_panel.png)
+![HMI 实际界面：三类算法选择与足式执行状态](doc/f2/hmi_navigation.png)
 
-上图为实际启动后的面板，选择三层楼 **F1-ENTRY→F1-ROOM**、5 倍目标倍率，已生成机器人并完成“仅规划”，尚未执行；Gazebo 场景在独立窗口显示。
+上图采自5倍实际任务：分别选择全局、轮式局部、足式局部算法，一个“开始任务”串接规划与执行；Gazebo 在独立窗口显示。
 
 | 界面区域 | 用途与操作 |
 |---|---|
 | **1 · 仿真场景** | 选择两级台阶／三层楼及倍率；“启动仿真”创建会话，“关闭仿真”结束整套会话。更换场景或倍率需先关闭仿真 |
 | **2 · 机器人与预设点位** | 选择出生点、目标点，核对下方地面坐标与朝向，再“生成机器人”；重选出生点使用“移除机器人 / 重选出生点” |
-| **3 · 规划与执行** | “仅规划”生成路径；成功后“开始执行”可用；“停止运动”取消本次任务并停车 |
+| **3 · 规划与执行** | 独立选择三类算法；“开始任务”自动规划并执行；“停止任务”取消计算或运动并停车 |
 | **4 · 观察视角** | 总览看整体，俯视／内部透视配合楼层选择，三层同屏同时观察各层；“跟随机器人”启用第三人称宽视野，“恢复所选视角”退出跟随 |
 | **底部状态与消息框** | 查看实际仿真时间、机器人位置、任务状态与失败原因；按钮不可用时，先检查是否就绪、点位组合及倍率是否受支持 |
 
@@ -79,11 +79,11 @@ ros2 launch simulation_hmi hmi.launch.py
 
 1. 选择“三层楼”和“正常速度 · 1 倍”，点击“启动仿真”，等待场景就绪。
 2. 出生点选 `F1-ENTRY`、目标点选 `F1-ROOM`，点击“生成机器人”，等待实际位置和执行器就绪。
-3. 点击“仅规划”。成功后可在 Gazebo 查看路径，此时机器人保持静止。
-4. 点击“开始执行”，在消息框观察阶段变化。`WAIT_OBSTACLE` 表示正在安全等待行人，条件允许后自动恢复；`DONE` 表示完成并停车，`FAILED` 需查看原因。
-5. 观察时可选“俯视 + F1”或“跟随机器人”。需要中止时点“停止运动”；停止或完成后，移除并重新生成机器人才能开始新任务。结束使用时点“关闭仿真”。
+3. 选择全局 `A*`、轮式 `TEB`、足式 `Footstep`，点击“开始任务”。全局就绪后显示路线，局部按实际状态分段求解并执行。
+4. 在消息框观察阶段及墙钟耗时。`WAIT_OBSTACLE` 表示正在安全等待行人，条件允许后自动恢复；`DONE` 表示完成并停车，`FAILED` 需查看原因。
+5. 观察时可选“俯视 + F1”或“跟随机器人”。需要中止时点“停止任务”。完成后可从实际终点选择下一个目标；重新开始仍检查实际停稳、轮式状态及选定起点，不自动恢复足式中途停止。结束使用时点“关闭仿真”。
 
-两级台阶选择 **A→B**，三层楼选择**同一层的不同预设点**；三层跨层组合不能规划。出生点生成后锁定，执行期间不能更改任务。当前算法通过配置文件选择，面板没有算法切换菜单。
+两级台阶保留 **A→B**；三层楼可选择9个预设点中的任意不同起终点。楼梯和平台全程足式，平地轮式，由全局结果决定。同层／跨层变化不要求重生；实际不在选定起点时须重选真实起点或移除重生。任务计算与执行期间冻结点位、算法与参数；新选择只用于下一任务。
 
 首次建议运行 **两级台阶 A→B，正常速度**，或 **三层楼 F1-ENTRY→F1-ROOM，正常速度**。三层同层闭环支持正常／5 倍目标倍率，10 倍仅用于场景观察；两级台阶闭环使用正常速度。目标倍率不代表实际达到的倍率。
 
@@ -108,7 +108,7 @@ ros2 launch sim_bringup simulation.launch.py scene:=two_steps robot:=true \
   planning:=true local_planning:=true foot_planning:=true autonomous:=true
 ```
 
-总入口默认 `scene:=three_floor robot:=false`，目前 `robot:=true` 只允许搭配 `two_steps`。三层导航由 HMI 生成任务快照，再启动机器人与规划节点。查看入口参数可执行 `ros2 launch sim_bringup simulation.launch.py --show-args`；无界面运行可加 `gui:=false`。
+总入口默认 `scene:=three_floor robot:=false`，三层使用 `robot:=true` 时须通过 `scene_file:=...` 提供与当前 World 对应的任务快照。三层导航由 HMI 生成任务快照，再启动机器人与规划节点。查看入口参数可执行 `ros2 launch sim_bringup simulation.launch.py --show-args`；无界面运行可加 `gui:=false`。
 
 ## 技术栈
 
@@ -176,12 +176,12 @@ HMI 启动后，用户选择场景，`scene.launch.py` 生成 `runtime.world` �
 
 三层任务从当前会话的 `runtime.world` 提取几何，`scene.yaml` 保存公共机器人与任务配置，不重复录入三层家具坐标。两级台阶沿用配置中的已知几何与 A/E/X/B 路段。
 
-### 三层同层导航闭环
+### 三层统一导航闭环
 
 ```mermaid
 flowchart TD
-    Input["实际场景几何 + 机器人约束 + HMI 起终点"] --> Global["全局规划：生成同层参考路径"]
-    Global -->|成功，开始执行| Local["局部规划：结合实际位姿、速度与当前障碍"]
+    Input["实际场景几何 + 机器人约束 + HMI 起终点"] --> Global["全局规划：完整三维路线及轮足路段"]
+    Global -->|按有序路段调度| Local["轮式／足式局部规划：实际状态与对应约束"]
     Global -->|失败| Fail["停止并报告原因"]
     Ped["行人实际状态 + World 往返脚本预测"] --> Local
     Local --> Check{"轨迹与指令通过<br/>碰撞、支撑、运动及时间校验？"}
@@ -197,7 +197,7 @@ flowchart TD
 
 行人不主动让行。机器人在冲突前检查通行时序，不能安全执行时先停车；反馈失效或预测过期时不沿用旧轨迹。用户停止终止本次任务，晚到的规划结果不会恢复运动。动态障碍信息来自仿真反馈与已知往返脚本，不是传感器感知。
 
-两级台阶的任务流程为 **A→E 轮式 → 展腿 → E→X 足式 → 收腿 → X→B 轮式停车**。此流程已经验证，尚未推广到三层楼上下楼任务。
+两级台阶的任务流程为 **A→E 轮式 → 展腿 → E→X 足式 → 收腿 → X→B 轮式停车**。三层楼按全局输出遍历任意数量路段，每个足式段独立生成，平台转向不切回轮式。
 
 ### 关键接口
 
@@ -223,7 +223,7 @@ simulation/
 ├── doc/
 │   ├── f1/                         # 两级台阶演示素材与历史离线手册
 │   ├── f2/                         # 三层楼正式场景图片
-│   └── prd_navigation.md           # 导航范围、阶段状态与验收记录
+│   └── prd_navigation.md           # 后续四包重构范围与分阶段要求
 └── sim_ws/src/
     ├── planning/                   # 独立 C++ 算法库
     │   ├── include/                # 全局、轮式局部、足式局部接口与实现声明
@@ -257,7 +257,7 @@ simulation/
 | [two_steps.world](sim_ws/src/sim_bringup/worlds/two_steps.world) | 原台阶、平台与障碍，修改时同步原任务几何配置 |
 | [robot.urdf.xacro](sim_ws/src/sim_bringup/urdf/robot.urdf.xacro) | 机器人连杆、关节、碰撞及执行插件；修改时同步规划几何与运动约束 |
 
-算法契约见 [global_planner.h](sim_ws/src/planning/include/global_planner.h)、[local_planner.h](sim_ws/src/planning/include/local_planner.h)。当前实现为 `astar`、`teb`、`footstep`。新增算法需实现相应接口、加入工厂创建与构建项，再通过 `planning.yaml` 选择；当前没有运行时算法插件系统或 HMI 算法菜单。公共 `runPlanner` 校验算法结果，控制流程通过抽象接口调用。
+算法契约见 [global_planner.h](sim_ws/src/planning/include/global_planner.h)、[local_planner.h](sim_ws/src/planning/include/local_planner.h)。当前实现为 `astar`、`teb`、`footstep`。新增算法需实现相应接口、加入工厂创建与构建项，再通过 `planning.yaml` 选择；HMI分别选择三类现有算法，不提供运行时插件加载。公共 `runPlanner` 对足式结果执行有限值、时间、端点等轻量检查；算法保留候选约束，执行器保留实时保护。整段足式密集独立校验仅在显式验收入口运行，控制流程通过抽象接口调用。
 
 比较算法时固定场景、起终点、机器人几何、公共约束、仿真倍率及行人初始相位，比较耗时、实际路程、到达误差和失败原因；算法内部优化代价不作为通用评分。
 
@@ -271,7 +271,7 @@ colcon build --packages-up-to simulation_hmi \
 source install/setup.bash
 ```
 
-运行读取安装目录中的资源，编辑源文件不会自动刷新现有进程；算法和约束在规划节点启动时固定，运行中修改参数会被拒绝。
+运行读取安装目录中的资源，编辑源文件不会自动刷新现有进程；场景与运动约束在规划节点启动时固定；三类算法名称只允许空闲时原子更新，任务中冻结，未知名称明确拒绝。
 
 ### 验证与结果
 
@@ -287,7 +287,23 @@ colcon test --packages-select planning simulation_hmi
 colcon test-result --verbose
 ```
 
-实际任务验收看最终 `DONE`、实际到达误差及停车速度，不以规划成功或按钮响应代替完成。当前已验收：原两级台阶完整任务、三层同层 18 个有向点对离线规划、每层一条有行人等待与恢复的实际导航任务，以及 HMI 取消与停止。阶段三跨层任务未开始，详见 [导航 PRD 与验收记录](doc/prd_navigation.md)。
+当前代码是四包重构前的版本：已接通统一全局导航、三类算法选择、单按钮任务、自适应足式步时及落脚点显示，仍有 F2-ROOM→F2-EAST 动态等待超时问题。历史 build、install、log、results 已按要求清理，原始验收证据不再可复查，运行前需要重新构建。[重构 PRD](doc/prd_navigation.md) 描述后续目标；其中 control、hmi 包和新启动入口尚未实施，本 README 命令仍对应当前代码。
+
+仅复现第一阶段离线检查，在容器中执行（不会初始化 ROS 或移动机器人）：
+
+```bash
+source /workspace/sim_ws/install/setup.bash
+/workspace/sim_ws/install/sim_bringup/lib/sim_bringup/planning_acceptance \
+  --check-global-pairs \
+  /workspace/sim_ws/src/sim_bringup/worlds/three_floor.world \
+  /workspace/sim_ws/src/simulation_hmi/config/presets.yaml \
+  /workspace/sim_ws/src/sim_bringup/config/scene.yaml \
+  /workspace/sim_ws/src/sim_bringup/config/planning.yaml \
+  /workspace/sim_ws/results/stage1_$(TZ=Asia/Shanghai date +%Y%m%d_%H%M%S)
+```
+
+证据输出目录必须不存在，避免覆盖历史记录；打开其中的 `index.html` 查看全部路线，`pairs.csv` 查看逐组合结果。
+
 
 | 结果位置 / 文件 | 用途 |
 |---|---|
@@ -314,7 +330,7 @@ ros2 topic echo /robot/odom nav_msgs/msg/Odometry --once
 | 查询不到反馈 | 是否加载正确 overlay、是否与会话使用同一 ROS 域；HMI 默认 91，普通 CLI 默认 73 |
 | 修改不生效 | `ros2 pkg prefix --share sim_bringup` 是否指向当前安装；重新构建、source 并重启 |
 | 规划或执行失败 | 消息框、`task_result.csv` 的原因、`task_events.csv`；核对碰撞、地面支撑、反馈时效与计算预算 |
-| 跨层组合不能规划 | 当前只开放三层同层任务；不是按钮故障 |
+| 跨层组合不能规划 | 三层任意不同预设点均可请求；检查实际起点、停止／轮式状态及消息框中的后端失败原因 |
 
 HMI 退出时清理自己创建的会话进程；CLI 用 `Ctrl+C` 退出整套 Launch，关闭 Gazebo 窗口不等于任务停止。重跑使用新会话，不用 Gazebo Reset 代替任务复位。
 

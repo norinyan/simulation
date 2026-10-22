@@ -16,7 +16,7 @@ def test_all_presets_have_static_clearance_and_support():
             check_static_placement(BRINGUP/'worlds'/f'{name}.world', point['pose'])
     assert task_supported(scenes['two_steps'], 'A', 'B')
     assert not task_supported(scenes['two_steps'], 'B', 'A')
-    assert not task_supported(scenes['three_floor'], 'F1-ENTRY', 'F3-EAST')
+    assert task_supported(scenes['three_floor'], 'F1-ENTRY', 'F3-EAST')
 
 
 def test_reject_wall_and_unsupported_placement():
@@ -38,7 +38,14 @@ def test_storey_placement_enables_actual_geometry(tmp_path):
     assert scene['floors'] == [0.0, 3.2, 6.4]
     scenes = load_presets(ROOT/'config/presets.yaml')
     assert task_supported(scenes['three_floor'], 'F1-ENTRY', 'F1-ROOM')
-    assert not task_supported(scenes['three_floor'], 'F1-ENTRY', 'F2-ROOM')
+    assert task_supported(scenes['three_floor'], 'F1-ENTRY', 'F2-ROOM')
+    assert task_supported(scenes['three_floor'], 'F1-STAIR', 'F2-STAIR')
+    assert task_supported(scenes['three_floor'], 'F2-STAIR', 'F1-STAIR')
+    points = scenes['three_floor']['points']
+    placement_scene(BRINGUP/'config/scene.yaml', 'three_floor', points['F1-STAIR']['pose'], output,
+                    goal=points['F2-STAIR']['pose'])
+    assert yaml.safe_load(output.read_text())['scene']['task_type'] == 'wheel_navigation'
+    assert sum(task_supported(scenes['three_floor'], a, b) for a in points for b in points) == 72
 
 
 def test_parked_presets_do_not_intersect_configured_pedestrian_sweeps():

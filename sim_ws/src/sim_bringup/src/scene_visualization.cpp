@@ -34,6 +34,9 @@ class SceneVisualization final : public GUIPlugin {
  std::map<std::string,Overlay> overlays_;
  std::map<std::string,rendering::DynamicLines*> overlay_lines_;
  bool refresh_overlays_=true;
+ std::string foot_data_,drawn_foot_data_;
+ uint64_t foot_version_{0};bool refresh_feet_=false;
+ std::vector<rendering::VisualPtr> foot_markers_;
  std::string config_text_;bool follow_=false,capture_pending_=false;std::vector<rendering::DynamicLines*> lines_;
  std::chrono::steady_clock::time_point config_check_{};
  ignition::math::Vector3d marker_start_,marker_goal_;bool markers_=false;
@@ -95,13 +98,41 @@ class SceneVisualization final : public GUIPlugin {
  void PathOverlay(ConstGzStringPtr& message){
   try{
    const auto data=YAML::Load(message->data());const auto name=data["group"].as<std::string>();
-   if(name!="global_0" && name!="global_1" && name!="global_2" && name!="local_0" && name!="local_1")return;
+   if(name=="footsteps"){std::lock_guard<std::mutex> lock(mutex_);
+    const auto version=data["version"].as<uint64_t>(0);
+    if(version>foot_version_){foot_version_=version;foot_data_=message->data();}return;}
+   if(name.rfind("global_",0)!=0 && name!="local_0" && name!="local_1")return;
    std::lock_guard<std::mutex> lock(mutex_);auto& overlay=overlays_[name];
    if(overlay.text==message->data())return;
    overlay.text=message->data();overlay.points.clear();
    for(const auto& p:data["points"])overlay.points.emplace_back(p[0].as<double>(),p[1].as<double>(),p[2].as<double>());
    overlay.dirty=true;
   }catch(const std::exception& e){gzerr<<"Path overlay: "<<e.what()<<"\n";}
+ }
+ void DrawFootsteps(const rendering::ScenePtr& scene) {
+  std::string text;{std::lock_guard<std::mutex> lock(mutex_);text=foot_data_;}
+  if(text.empty() || (text==drawn_foot_data_ && !refresh_feet_))return;
+  try {
+   const auto data=YAML::Load(text),size=data["size"];
+   const bool replace=text!=drawn_foot_data_;
+   std::vector<rendering::VisualPtr> next;
+   for(const auto& step:data["steps"]) {
+    const auto id=next.size();const auto z=step[3].as<double>();
+    int floor=world_=="three_floor"?int(std::round((z-size[2].as<double>()/2)/3.2))+1:0;
+    rendering::VisualPtr marker;
+    if(!replace)marker=foot_markers_.at(id);
+    else {marker.reset(new rendering::Visual("planned_sole_"+data["version"].as<std::string>()+"_"+std::to_string(id),scene->WorldVisual()));marker->Load();}
+    msgs::Visual visual;visual.set_name(marker->Name());visual.mutable_geometry()->set_type(msgs::Geometry::BOX);
+    msgs::Set(visual.mutable_geometry()->mutable_box()->mutable_size(),ignition::math::Vector3d(size[0].as<double>(),size[1].as<double>(),.008));
+    auto color=step[0].as<int>()==0?ignition::math::Color(.05,.8,1,1):ignition::math::Color(1,.45,.05,1);
+    msgs::Set(visual.mutable_material()->mutable_ambient(),color);msgs::Set(visual.mutable_material()->mutable_diffuse(),color);
+    marker->UpdateFromMsg(boost::make_shared<msgs::Visual>(visual));
+    marker->SetPose(DisplayPose(ignition::math::Pose3d(step[1].as<double>(),step[2].as<double>(),z-size[2].as<double>()/2+.012,0,0,step[4].as<double>()),floor));
+    marker->SetVisible(Visible("path",floor));next.push_back(marker);
+   }
+   if(replace)for(auto& old:foot_markers_)scene->RemoveVisual(old);
+   foot_markers_=std::move(next);drawn_foot_data_=text;refresh_feet_=false;
+  }catch(const std::exception& e){gzerr<<"Footstep display: "<<e.what()<<"\n";}
  }
  void DrawOverlays(const rendering::ScenePtr& scene){
   std::map<std::string,std::vector<ignition::math::Vector3d>> changes;
@@ -133,6 +164,10 @@ class SceneVisualization final : public GUIPlugin {
    const int floor=config["floor"].as<int>();
    if((view!="exterior"&&view!="top"&&view!="interior"&&view!="split")||floor<0||floor>3)return;
    const bool layout=view!=view_||floor!=floor_||config["robot_generation"].as<int>(0)!=generation_;
+   if(generation_!=config["robot_generation"].as<int>(0)){
+    for(auto& marker:foot_markers_)scene->RemoveVisual(marker);foot_markers_.clear();
+    std::lock_guard<std::mutex> lock(mutex_);foot_data_.clear();drawn_foot_data_.clear();
+   }
    generation_=config["robot_generation"].as<int>(0);
    view_=view;floor_=floor;follow_=config["follow"].as<bool>(false);
    markers_=config["start"] && config["goal"];
@@ -144,7 +179,7 @@ class SceneVisualization final : public GUIPlugin {
     // Retain model/link visuals across view switches. Reusing their names after
     // removal races Gazebo's render cache and can produce an empty viewport.
     ready_=false;saved_=false;start_=-1;
-    refresh_overlays_=true;
+    refresh_overlays_=true;refresh_feet_=true;
     const bool next_split=view_=="split";
     if(next_split && !labels_[0]){
      auto layout=new QHBoxLayout(this);
@@ -262,6 +297,15 @@ class SceneVisualization final : public GUIPlugin {
   // collision checks or planning feedback, and never extrapolates stale poses.
   const double display_time=Wall()-.1;
   {std::lock_guard<std::mutex> lock(mutex_);for(const auto& entry:robot_poses_)robot[entry.first]=Sample(entry.second,display_time);}
+  auto tracked=robot.find("wheel_leg_robot");
+  if(world_=="three_floor" && tracked!=robot.end()){
+   const int level=std::clamp(int(std::floor((tracked->second.Pos().Z()-.32+.005)/3.2))+1,1,3);
+   if(robot_floor_!=level){robot_floor_=level;
+    if(follow_ && floor_!=level){floor_=level;ready_=false;}
+   }
+   auto model=models_.find("wheel_leg_robot");
+   if(model!=models_.end())model->second->SetVisible(Visible("wheel_leg_robot",robot_floor_));
+  }
   for(const auto &pose:robot){
    auto visual=robot_links_.find(pose.first);if(visual==robot_links_.end())continue;
    // Gazebo pose/info model poses are world-relative; link poses are relative
@@ -276,7 +320,7 @@ class SceneVisualization final : public GUIPlugin {
    auto delta=target-position;camera->SetWorldPose(ignition::math::Pose3d(position,ignition::math::Quaterniond(0,std::atan2(-delta.Z(),std::hypot(delta.X(),delta.Y())),std::atan2(delta.Y(),delta.X()))));
   }
   std::map<std::string,State> states;{std::lock_guard<std::mutex> lock(mutex_);states=states_;}
-  DrawOverlays(scene);
+  DrawOverlays(scene);DrawFootsteps(scene);
   if(split_)setFixedWidth(camera->ImageWidth());
   if(split_)for(int f=1;f<=3;++f){auto it=states.find("f"+std::to_string(f)+"_pedestrian");if(it!=states.end()){auto &s=it->second;labels_[f-1]->setText(QString("F%1 | %2 | sim %3 s<br/>actual speed %4 m/s | pause %5 s").arg(f).arg(QString::fromStdString(s.mode)).arg(s.t,0,'f',1).arg(s.speed,0,'f',2).arg(s.wait,0,'f',1));}}
   {std::lock_guard<std::mutex> lock(mutex_);for(const auto& entry:pedestrian_poses_){

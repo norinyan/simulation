@@ -9,6 +9,7 @@
 #include <std_msgs/msg/string.hpp>
 #include <trajectory_msgs/msg/multi_dof_joint_trajectory.hpp>
 #include <yaml-cpp/yaml.h>
+#include "local_planner.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -48,6 +49,9 @@ class RobotExecutor final : public ModelPlugin {
   std::array<double,2> fx_, fz_, from_fx_, from_fz_, wheels_{};
   std::array<double,3> mount_;
   Trajectory planned_;
+  planning::FootRobotGeometry foot_robot_;
+  bool spatial_task_{false},spatial_foot_{false};
+  std::array<planning::Pose,2> spatial_feet_{};
   std::chrono::steady_clock::time_point wall_tick_{std::chrono::steady_clock::now()};
   static double q(double u) {u=std::clamp(u,0.,1.);return u*u*u*(10+u*(-15+6*u));}
   static double mix(double a,double b,double u) {return a+(b-a)*q(u);}
@@ -77,21 +81,32 @@ class RobotExecutor final : public ModelPlugin {
   }
   bool apply(double now) {
     std::array<double,2> a,b;
-    for(int i=0;i<2;++i)if(!ik(i,a[i],b[i]))return false;
+    if(!spatial_foot_)for(int i=0;i<2;++i)if(!ik(i,a[i],b[i]))return false;
     model_->SetWorldPose(P(x_,y_,z_,0,0,yaw_),false,false);
     setLink("wheel_carrier",0,0,z_-drop_+lift_);
     sensor_msgs::msg::JointState msg;msg.header.stamp=rclcpp::Time(int64_t(now*1e9));
-    msg.name={"wheel_lift_joint","left_wheel_joint","right_wheel_joint"};
-    msg.position={lift_,wheels_[0],wheels_[1]};
-    for(int i=0;i<2;++i) {
-      std::string s=i==0?"left":"right";double sign=i==0?1:-1;
+    msg.name={"wheel_lift_joint","left_wheel_joint","right_wheel_joint"};msg.position={lift_,wheels_[0],wheels_[1]};
+    try {for(int i=0;i<2;++i){
+      const std::string s=i==0?"left":"right";const double sign=i==0?1:-1;
       setLink(s+"_wheel",0,sign*track_/2,z_-drop_+lift_,wheels_[i]);
-      setLink(s+"_upper_leg",hx_,sign*hy_,z_+hz_,a[i]);
-      setLink(s+"_lower_leg",hx_-l1_*std::sin(a[i]),sign*hy_,z_+hz_-l1_*std::cos(a[i]),b[i]);
-      setLink(s+"_foot",fx_[i]-forward()-toe_,sign*hy_,fz_[i]);
-      msg.name.insert(msg.name.end(),{s+"_shoulder_joint",s+"_knee_joint",s+"_ankle_joint"});
-      msg.position.insert(msg.position.end(),{a[i]-mount_[0],b[i]-a[i]-mount_[1],-b[i]-mount_[2]});
-    }
+      if(spatial_foot_){
+        const auto k=planning::footInverseKinematics({x_,y_,z_,yaw_},spatial_feet_[i],i,foot_robot_);
+        auto place=[&](const std::string& name,const planning::Pose& p,double pitch){
+          model_->GetLink(name)->SetWorldPose(P(p.x,p.y,p.z,0,pitch,p.yaw),false,false);
+        };
+        place(s+"_hip_yaw",k.hip,0);place(s+"_upper_leg",k.hip,k.upper_pitch);
+        place(s+"_lower_leg",k.knee,k.lower_pitch);place(s+"_foot",k.ankle,0);
+        msg.name.insert(msg.name.end(),{s+"_hip_yaw_joint",s+"_shoulder_joint",s+"_knee_joint",s+"_ankle_joint"});
+        msg.position.insert(msg.position.end(),k.joints.begin(),k.joints.end());
+      }else{
+        setLink(s+"_hip_yaw",hx_,sign*hy_,z_+hz_);
+        setLink(s+"_upper_leg",hx_,sign*hy_,z_+hz_,a[i]);
+        setLink(s+"_lower_leg",hx_-l1_*std::sin(a[i]),sign*hy_,z_+hz_-l1_*std::cos(a[i]),b[i]);
+        setLink(s+"_foot",fx_[i]-forward()-toe_,sign*hy_,fz_[i]);
+        msg.name.insert(msg.name.end(),{s+"_hip_yaw_joint",s+"_shoulder_joint",s+"_knee_joint",s+"_ankle_joint"});
+        msg.position.insert(msg.position.end(),{0,a[i]-mount_[0],b[i]-a[i]-mount_[1],-b[i]-mount_[2]});
+      }
+    }}catch(const std::exception& e){collision_reason_=e.what();return false;}
     model_->GetWorld()->PublishModelPose(model_);joints_->publish(msg);return true;
   }
   // SAT for oriented robot boxes against the live Gazebo scene boxes.
@@ -169,7 +184,7 @@ class RobotExecutor final : public ModelPlugin {
     if(command=="WHEEL"&&std::abs(fz_[0]-fz_[1])>.005){fail("UNEVEN_FOLD_SUPPORT");return;}
     from_z_=z_;from_lift_=lift_;from_fx_=fx_;from_fz_=fz_;begin_=model_->GetWorld()->SimTime().Double();
     action_=command=="LEG"?Action::Deploy:Action::Fold;driving_=false;
-    if(action_==Action::Fold)ground_=fz_[0]-half_;
+    if(action_==Action::Fold){ground_=fz_[0]-half_;spatial_foot_=false;}
     state_=command=="LEG"?"MORPH_TO_LEG":"MORPH_TO_WHEEL";
   }
   void accept(const Trajectory& msg) {
@@ -180,13 +195,19 @@ class RobotExecutor final : public ModelPlugin {
     for(const auto& p:msg.points) {
       double t=rclcpp::Duration(p.time_from_start).seconds();
       if(p.transforms.size()!=3||p.velocities.size()!=3||p.accelerations.size()!=3||t<=prev||(prev>=0&&t-prev>.051)){fail("INVALID_FOOT_SAMPLES");return;}
+      if(spatial_task_) {
+        auto pose=[](const auto& t){return planning::Pose{t.translation.x,t.translation.y,t.translation.z,
+          2*std::atan2(t.rotation.z,t.rotation.w)};};
+        try{for(int side=0;side<2;++side)planning::footInverseKinematics(pose(p.transforms[0]),pose(p.transforms[side+1]),side,foot_robot_);}
+        catch(const std::exception& e){fail(std::string("INVALID_SPATIAL_FOOT: ")+e.what());return;}
+      }
       for(size_t i=0;i<3;i++) {
         const auto& a=p.transforms[i];const auto& body=p.transforms[0];
         ignition::math::Quaterniond q(a.rotation.w,a.rotation.x,a.rotation.y,a.rotation.z);
         const auto r=q.Euler();
         const double lateral=-std::sin(yaw_)*(a.translation.x-body.translation.x)+std::cos(yaw_)*(a.translation.y-body.translation.y);
         const double angle=std::atan2(std::sin(r.Z()-yaw_),std::cos(r.Z()-yaw_));
-        if(!std::isfinite(a.translation.x)||!std::isfinite(a.translation.y)||!std::isfinite(a.translation.z)||std::abs(r.X())+std::abs(r.Y())>1e-6||std::abs(angle)>.001||std::abs(lateral-(i==0?0:(i==1?hy_:-hy_)))>.001){fail("INVALID_FOOT_COORDINATES");return;}
+        if(!std::isfinite(a.translation.x)||!std::isfinite(a.translation.y)||!std::isfinite(a.translation.z)||std::abs(r.X())+std::abs(r.Y())>1e-6||(!spatial_task_ && (std::abs(angle)>.001||std::abs(lateral-(i==0?0:(i==1?hy_:-hy_)))>.001))){fail("INVALID_FOOT_COORDINATES");return;}
       }
       prev=t;
     }
@@ -194,12 +215,8 @@ class RobotExecutor final : public ModelPlugin {
     double error=std::abs(b.x-x_)+std::abs(b.y-y_)+std::abs(b.z-z_);
     for(int i=0;i<2;i++)error+=std::abs(first.transforms[i+1].translation.x*std::cos(yaw_)+first.transforms[i+1].translation.y*std::sin(yaw_)-fx_[i])+std::abs(first.transforms[i+1].translation.z-fz_[i]);
     if(error>.012||std::abs(rclcpp::Duration(first.time_from_start).seconds())>1e-9){fail("FOOT_START_MISMATCH");return;}
+    spatial_foot_=spatial_task_;
     planned_=msg;begin_=model_->GetWorld()->SimTime().Double();action_=Action::Foot;state_="EXECUTING_FOOT";
-  }
-  // Quintic Hermite reconstruction preserves the planner's C2 sampled trajectory.
-  static double interpolate(double p,double end,double v,double ev,double a,double ea,double dt,double u) {
-    double c0=p,c1=v*dt,c2=a*dt*dt/2,d=end-c0-c1-c2,e=ev*dt-c1-2*c2,f=ea*dt*dt-2*c2;
-    return c0+u*(c1+u*(c2+u*((10*d-4*e+f/2)+u*((-15*d+7*e-f)+u*(6*d-3*e+f/2)))));
   }
   void footTick(double elapsed) {
     auto b=std::lower_bound(planned_.points.begin(),planned_.points.end(),elapsed,[](const auto& p,double t){return rclcpp::Duration(p.time_from_start).seconds()<t;});
@@ -209,9 +226,19 @@ class RobotExecutor final : public ModelPlugin {
       const auto& p=a->transforms[i].translation;const auto& e=b->transforms[i].translation;
       auto get=[axis](const auto& v){return axis==0?v.x:axis==1?v.y:v.z;};
       if(tb==ta)return get(e);
-      return interpolate(get(p),get(e),get(a->velocities[i].linear),get(b->velocities[i].linear),get(a->accelerations[i].linear),get(b->accelerations[i].linear),tb-ta,std::clamp((elapsed-ta)/(tb-ta),0.,1.));
+      return planning::footInterpolate(get(p),get(e),get(a->velocities[i].linear),get(b->velocities[i].linear),get(a->accelerations[i].linear),get(b->accelerations[i].linear),tb-ta,std::clamp((elapsed-ta)/(tb-ta),0.,1.));
     };
     x_=value(0,0);y_=value(0,1);z_=value(0,2);
+    if(spatial_foot_) {
+      auto rotation=[&](int i){
+        const auto& p=a->transforms[i].rotation;const auto& q=b->transforms[i].rotation;
+        const double from=2*std::atan2(p.z,p.w),to=from+std::atan2(std::sin(2*std::atan2(q.z,q.w)-from),std::cos(2*std::atan2(q.z,q.w)-from));
+        if(tb==ta)return to;
+        return planning::footInterpolate(from,to,a->velocities[i].angular.z,b->velocities[i].angular.z,a->accelerations[i].angular.z,b->accelerations[i].angular.z,tb-ta,std::clamp((elapsed-ta)/(tb-ta),0.,1.));
+      };
+      yaw_=rotation(0);
+      for(int i=0;i<2;++i)spatial_feet_[i]={value(i+1,0),value(i+1,1),value(i+1,2),rotation(i+1)};
+    }
     for(int i=0;i<2;i++){fx_[i]=value(i+1,0)*std::cos(yaw_)+value(i+1,1)*std::sin(yaw_);fz_[i]=value(i+1,2);}
     if(elapsed>=rclcpp::Duration(planned_.points.back().time_from_start).seconds()){action_=Action::Idle;state_="FOOT_DONE";}
   }
@@ -240,6 +267,7 @@ class RobotExecutor final : public ModelPlugin {
     double dt=last_<0?.01:now-last_;last_=now;wall_tick_=std::chrono::steady_clock::now();
     if(failed_) {if(now-report_>=.05){publish(now);report_=now;}return;}
     const auto previous=model_->WorldPose();double previous_z=z_;
+    const auto previous_spatial=spatial_feet_;
     const auto previous_fx=fx_,previous_fz=fz_,previous_wheels=wheels_;double previous_lift=lift_;
     std::vector<std::pair<physics::LinkPtr,P>> previous_links;
     for(auto link:model_->GetLinks())previous_links.emplace_back(link,link->WorldPose());
@@ -270,6 +298,7 @@ class RobotExecutor final : public ModelPlugin {
     if(failed_) {
       // Hold the last safe pose, including links (kinematic rollback).
       x_=previous.Pos().X();y_=previous.Pos().Y();z_=previous_z;yaw_=previous.Rot().Yaw();
+      spatial_feet_=previous_spatial;
       fx_=previous_fx;fz_=previous_fz;wheels_=previous_wheels;lift_=previous_lift;
       model_->SetWorldPose(previous,false,false);
       for(const auto& link:previous_links)link.first->SetWorldPose(link.second,false,false);
@@ -293,6 +322,11 @@ public:
       l1_=r("upper_leg_length");l2_=r("lower_leg_length");toe_=r("foot_center_offset_x");half_=robot_["foot_size"][2].as<double>()/2;
       hx_=robot_["shoulder_offset"][0].as<double>();hy_=robot_["shoulder_offset"][1].as<double>();hz_=robot_["shoulder_offset"][2].as<double>();
       mount_={r("folded_shoulder_pitch"),r("folded_knee_pitch"),r("folded_ankle_pitch")};
+      spatial_task_=scene_["name"].as<std::string>()=="three_floor";
+      auto& g=foot_robot_;g.shoulder_offset={hx_,hy_,hz_};g.folded_pitch=mount_;
+      g.upper_leg_length=l1_;g.lower_leg_length=l2_;g.foot_center_offset_x=toe_;
+      g.joint_min=robot_["leg_pitch_limits"][0].as<double>();g.joint_max=robot_["leg_pitch_limits"][1].as<double>();
+      g.hip_yaw_min=robot_["hip_yaw_limits"][0].as<double>();g.hip_yaw_max=robot_["hip_yaw_limits"][1].as<double>();
       body_height_=config_["foot"]["body_height"].as<double>();lift_target_=config_["foot"]["wheel_lift"].as<double>();
       morph_time_=t["morph_duration"].as<double>();command_timeout_=t["command_timeout"].as<double>();feedback_timeout_=t["feedback_timeout"].as<double>();
       max_v_=config_["motion"]["max_v"].as<double>();max_w_=config_["motion"]["max_w"].as<double>();max_a_=config_["motion"]["max_a"].as<double>();max_alpha_=config_["motion"]["max_alpha"].as<double>();

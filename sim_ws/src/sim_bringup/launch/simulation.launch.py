@@ -13,8 +13,6 @@ def setup(context):
     value = lambda name: LaunchConfiguration(name).perform(context)
     robot = value('robot') == 'true'
     flags = {name: value(name) == 'true' for name in ('planning', 'local_planning', 'foot_planning', 'autonomous')}
-    if robot and value('scene') != 'two_steps':
-        raise ValueError('scene:=three_floor robot:=true is not configured; use scene:=two_steps robot:=true')
     if any(flags.values()) and not robot:
         raise ValueError('Robot planning/control requires robot:=true')
     if (flags['local_planning'] or flags['foot_planning']) and not flags['planning']:
@@ -28,8 +26,8 @@ def setup(context):
     actions = [include('scene.launch.py', ('scene', 'gui', 'view', 'floor', 'real_time_factor',
                                           'snapshot_after', 'output_dir', 'master_uri'))]
     if robot:
-        actions.append(include('robot.launch.py', ('scene', 'master_uri', 'planning', 'local_planning',
-                                                  'foot_planning', 'autonomous', 'results_dir')))
+        actions.append(include('robot.launch.py', ('scene', 'scene_file', 'master_uri', 'planning', 'local_planning',
+                                                  'foot_planning', 'autonomous', 'results_dir', 'global_planner', 'wheel_planner', 'foot_planner')))
     return actions
 
 
@@ -38,6 +36,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('scene', default_value='three_floor', choices=['three_floor', 'two_steps']),
         DeclareLaunchArgument('robot', default_value='false', choices=['true', 'false']),
+        DeclareLaunchArgument('scene_file', default_value='', description='Robot/task snapshot; required for three_floor placement'),
         DeclareLaunchArgument('gui', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument('view', default_value='exterior', choices=['exterior', 'top', 'interior', 'split']),
         DeclareLaunchArgument('floor', default_value='0', choices=['0', '1', '2', '3']),
@@ -45,6 +44,9 @@ def generate_launch_description():
         DeclareLaunchArgument('snapshot_after', default_value='2'),
         DeclareLaunchArgument('output_dir', default_value=str(output)),
         DeclareLaunchArgument('master_uri', default_value='http://127.0.0.1:11345'),
+        DeclareLaunchArgument('global_planner', default_value='astar'),
+        DeclareLaunchArgument('wheel_planner', default_value='teb'),
+        DeclareLaunchArgument('foot_planner', default_value='footstep'),
         DeclareLaunchArgument('planning', default_value='false', choices=['true', 'false']),
         DeclareLaunchArgument('local_planning', default_value='false', choices=['true', 'false']),
         DeclareLaunchArgument('foot_planning', default_value='false', choices=['true', 'false']),

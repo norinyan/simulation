@@ -1,4 +1,4 @@
-"""Load a robot into an existing server; three_floor supports same-floor wheel tasks."""
+"""Load a robot into an existing server; three_floor uses unified wheel/foot route segments."""
 
 from pathlib import Path
 import math
@@ -66,8 +66,6 @@ def verify_wheel_geometry(robot, geometry):
 def setup(context):
     value = lambda name: LaunchConfiguration(name).perform(context)
     flags = {name: value(name) == 'true' for name in ('planning', 'local_planning', 'foot_planning', 'autonomous')}
-    if value('scene') == 'three_floor' and flags['foot_planning']:
-        raise ValueError('Stage2 three_floor navigation is wheel-only; foot planning is not enabled')
     if (flags['local_planning'] or flags['foot_planning']) and not flags['planning']:
         raise ValueError('local_planning and foot_planning require planning:=true')
     required = ('planning', 'local_planning', 'foot_planning') if value('scene') == 'two_steps' else ('planning', 'local_planning')
@@ -90,7 +88,7 @@ def setup(context):
         if len(start) != 4 or not all(math.isfinite(v) for v in start):
             raise ValueError('spawn_pose must contain finite x,y,ground_z,yaw values')
     if any(flags.values()) and start != scene['scene']['waypoints'][scene['scene']['task_route'][0]]:
-        raise ValueError('Planning is supported only from the configured preset A')
+        raise ValueError('Planning spawn must match the configured task start')
     description = xacro.process_file(
         str(share / 'urdf' / 'robot.urdf.xacro'),
         mappings={'static_display': 'true',
@@ -146,6 +144,9 @@ def setup(context):
                 'local_enabled': ParameterValue(LaunchConfiguration('local_planning'), value_type=bool),
                 'interactive': ParameterValue(LaunchConfiguration('interactive'), value_type=bool),
                 'autonomous': ParameterValue(LaunchConfiguration('autonomous'), value_type=bool),
+                'planners.global': LaunchConfiguration('global_planner'),
+                'planners.wheel': LaunchConfiguration('wheel_planner'),
+                'planners.foot': LaunchConfiguration('foot_planner'),
                 'foot_enabled': ParameterValue(LaunchConfiguration('foot_planning'), value_type=bool),
             },
         ],
@@ -161,6 +162,9 @@ def generate_launch_description():
         DeclareLaunchArgument('scene_file', default_value=''),
         DeclareLaunchArgument('spawn_pose', default_value='', description='Optional x,y,ground_z,yaw; does not change planner endpoints'),
         DeclareLaunchArgument('interactive', default_value='false', choices=['true', 'false']),
+        DeclareLaunchArgument('global_planner', default_value='astar'),
+        DeclareLaunchArgument('wheel_planner', default_value='teb'),
+        DeclareLaunchArgument('foot_planner', default_value='footstep'),
         DeclareLaunchArgument('planning', default_value='false', choices=['true', 'false']),
         DeclareLaunchArgument('local_planning', default_value='false', choices=['true', 'false']),
         DeclareLaunchArgument('foot_planning', default_value='false', choices=['true', 'false']),

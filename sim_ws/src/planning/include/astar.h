@@ -14,8 +14,9 @@ struct AStarOptions
   std::size_t max_grid_cells{2000000};
 };
 
-// Plan on one horizontal surface per request. Boxes extending above that surface
-// are conservatively projected to XY; this interface has no robot height.
+// With SceneMap, search one unified position/yaw/support lattice with directed
+// stair edges. Without it, retain the legacy single-surface request adapter.
+// Single-surface boxes are projected to XY by the scene adapter.
 // Legacy planar maps use a circumscribed circle with rectangular docking.
 // Maps with finite supports or rotated obstacles use a position/yaw lattice
 // and swept rectangular bodies, including in-place turns and floor openings.

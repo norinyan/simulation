@@ -95,6 +95,7 @@ struct FootRobotGeometry
   double foot_center_offset_x{0.0};
   double joint_min{0.0};
   double joint_max{0.0};
+  double hip_yaw_min{-1.57}, hip_yaw_max{1.57};
   double wheel_radius{0.0};
   double wheel_width{0.0};
   double wheel_track{0.0};
@@ -103,6 +104,7 @@ struct FootRobotGeometry
   double lift_max{0.0};
 };
 
+struct FootTrajectoryPoint;
 struct FootLocalPlanRequest
 {
   // Start/goal are ground projections at the foot-mode entry/exit.
@@ -111,6 +113,11 @@ struct FootLocalPlanRequest
   std::vector<BoxObstacle> terrain;  // Actual solid slabs/steps, not obstacles.
   FootRobotGeometry robot;
   std::optional<FootMotionLimits> limits;
+  // Stopped mode-boundary stance; absent only for nominal planning previews.
+  std::optional<Pose> current_body;
+  std::array<Pose,2> current_feet{};
+  std::array<bool,2> supported{true,true};
+  bool spatial{false};  // World-frame straight flights and foot-mode platform turns.
 };
 
 struct Footstep
@@ -127,9 +134,7 @@ struct FootTrajectoryPoint
   double time_from_start{0.0};
   Pose body;  // Absolute base_link pose, unlike the request's ground poses.
   std::array<Pose, 2> feet{};  // Absolute collision-centre poses; level soles.
-  // Analytic derivatives: body X/Y/Z, left X/Z, right X/Z. Planar +X motion.
-  std::array<double, 7> velocity{};
-  std::array<double, 7> acceleration{};
+  std::array<Pose,3> spatial_velocity{}, spatial_acceleration{}; // XYZ and yaw derivatives.
 };
 
 struct FootLocalPlanResult
@@ -140,7 +145,26 @@ struct FootLocalPlanResult
   std::string failure_reason;
   int expanded{0};
   double planning_ms{0.0};
+  double validation_ms{0.0};
 };
+
+// Shared quintic Hermite polynomial: planner validation and executor use identical math.
+double footInterpolate(double p,double end,double v,double ev,double a,double ea,double dt,double u);
+FootTrajectoryPoint interpolateFootTrajectory(const FootTrajectoryPoint& a,const FootTrajectoryPoint& b,double u);
+void canonicalizeFootCoordinates(std::vector<FootTrajectoryPoint>& samples);
+void setSpatialFootDerivatives(std::vector<FootTrajectoryPoint>& samples);
+
+struct FootJointPose {
+  std::array<double,4> joints{}; // Hip yaw, shoulder pitch, knee pitch, ankle pitch.
+  Pose hip, knee, ankle;
+  double upper_pitch{0}, lower_pitch{0};
+};
+// Shared kinematics for planning validation and the ideal tracking executor.
+FootJointPose footInverseKinematics(const Pose& body,const Pose& foot,int side,const FootRobotGeometry& robot);
+
+
+
+
 
 class FootLocalPlanner : public LocalPlanner
 {
@@ -149,6 +173,9 @@ public:
 };
 
 FootLocalPlanResult runPlanner(FootLocalPlanner& planner, const FootLocalPlanRequest& request);
+
+std::unique_ptr<WheelLocalPlanner> makeWheelPlanner(const std::string&,const PlannerParameters&);
+std::unique_ptr<FootLocalPlanner> makeFootPlanner(const std::string&,const PlannerParameters&);
 
 }  // namespace planning
 

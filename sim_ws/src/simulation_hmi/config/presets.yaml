@@ -20,7 +20,7 @@ scenes:
         pose: [9.0, 0.0, 0.34, 0.0]
     executable_routes: [[A, B]]
   three_floor:
-    same_floor_navigation: true
+    all_point_navigation: true
     max_navigation_factor: 5
     label: 三层楼
     default_start: F1-ENTRY
@@ -54,4 +54,4 @@ scenes:
       F3-WINDOW:
         label: F3-WINDOW · 三层中间下方窗前
         pose: [0, -6.1, 6.4, -1.5707963267948966]
-    executable_routes: []
+    executable_routes: []  # All distinct point pairs use the unified backend.
