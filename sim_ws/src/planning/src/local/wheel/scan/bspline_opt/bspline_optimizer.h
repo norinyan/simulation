@@ -57,7 +57,9 @@ namespace scan_planner
     void setEnvironment(const GridMap::Ptr &env);
     void setParam(double smooth, double collision, double feasibility,
                   double clearance, double max_vel, double max_acc, int iterations);
-    void setStationaryStart(bool stationary) { start_control_points_=stationary?4:3; }
+    void setStationaryBoundaries(bool stationary_start) {
+      start_control_points_=stationary_start?4:3;end_control_points_=4;
+    }
     double cost() const { return min_cost_; }
     Eigen::MatrixXd BsplineOptimizeTraj(const Eigen::MatrixXd &points, const double &ts,
                                         const int &cost_function, int max_num_id, int max_time_id);
@@ -90,6 +92,7 @@ namespace scan_planner
 
   private:
     int start_control_points_{3};
+    int end_control_points_{3};
     GridMap::Ptr grid_map_;
 
     enum FORCE_STOP_OPTIMIZE_TYPE

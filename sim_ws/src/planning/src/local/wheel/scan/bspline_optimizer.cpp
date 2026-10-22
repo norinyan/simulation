@@ -955,7 +955,7 @@ namespace scan_planner
   {
     iter_num_ = 0;
     int start_id = start_control_points_;
-    int end_id = this->cps_.size - order_;
+    int end_id = this->cps_.size - end_control_points_;
     variable_num_ = 3 * (end_id - start_id);
     double final_cost;
 
@@ -1065,7 +1065,7 @@ namespace scan_planner
   {
     iter_num_ = 0;
     int start_id = start_control_points_;
-    int end_id = this->cps_.points.cols() - order_;
+    int end_id = this->cps_.points.cols() - end_control_points_;
     variable_num_ = 3 * (end_id - start_id);
 
     std::vector<double> storage(variable_num_);

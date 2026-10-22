@@ -160,7 +160,7 @@ LocalPlanResult ScanLocalPlanner::plan(const LocalPlanRequest& request) {
       scan_planner::BsplineOptimizer optimizer;
       optimizer.setParam(options_.smooth_weight,options_.collision_weight,options_.feasibility_weight,
                          options_.clearance,limits.max_v,limits.max_a,options_.iterations);
-      optimizer.setStationaryStart(stationary);
+      optimizer.setStationaryBoundaries(stationary);
       optimizer.setEnvironment(map);optimizer.a_star_=std::make_shared<::AStar>();
       const int pool=std::clamp(int(std::ceil((points.back()-points.front()).norm()/options_.resolution))+40,60,300);
       optimizer.a_star_->initGridMap(map,Eigen::Vector3i(pool,pool,3));
@@ -180,6 +180,10 @@ LocalPlanResult ScanLocalPlanner::plan(const LocalPlanRequest& request) {
         // so translation starts with the requested zero angular velocity.
         if(stationary)controls.col(3)=controls.col(2)+knot_distance*Eigen::Vector3d(std::cos(yaw),std::sin(yaw),0);
         for (int i=controls.cols()-3;i<controls.cols();++i) controls.col(i)=points.back();
+        // A stopped endpoint has no velocity vector to fix its body heading.
+        // Preserve the reference arrival tangent before the explicit final turn;
+        // a free penultimate span can otherwise hit a narrow mode-switch edge.
+        controls.col(controls.cols()-4)=points.back()-knot_distance*(points.back()-points[points.size()-2]).normalized();
         optimizer.initControlPoints(controls,true);checkBudget(g.control);
         ++result.candidates_evaluated;
         const bool success=optimizer.BsplineOptimizeTrajRebound(controls,ts);

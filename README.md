@@ -296,6 +296,8 @@ ros2 topic echo /planning/task_status std_msgs/msg/String --once \
 
 同一三层场景、机器人和运动限制，全局使用 A*，跨楼足式使用 Footstep，行人保持运动，目标倍率为 5。本次为补充性能采样重新各跑一次，四项均实际到达并停稳，终态为 `DONE`。
 
+版本说明：下表为性能采样时的结果。后续排错修正了 A* 从实际朝向接入栅格的恢复逻辑，以及 SCAN 零速终点的抵达切线约束，尚未重新采样性能。原卡点到一层楼梯入口已实际恢复到达；F1-ENTRY→F3-STAIR 完整回归仍因行人通道内停车触发 `UNSAFE_WAITING_POSE_ON_PEDESTRIAN_ROUTE`，未通过，不属于下表的通过点对。
+
 | 路线 | 算法 | 仿真耗时 | 墙钟耗时 | 位置误差 |
 |---|---|---:|---:|---:|
 | F1-STAIR→F1-ROOM | TEB | 91.0 s | 30.0 s | 1.92 mm |

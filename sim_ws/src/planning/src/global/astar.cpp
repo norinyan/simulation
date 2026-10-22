@@ -225,8 +225,31 @@ PlanResult orientedPlan(const PlanRequest& r,const AStarOptions& options) {
     return path;
   };
   const int sx=std::llround((r.start.x-min_x)/step),sy=std::llround((r.start.y-min_y)/step);
-  const auto source=id(sx,sy,heading(r.start.yaw));
+  auto source=id(sx,sy,heading(r.start.yaw));
   auto start_path=connect(r.start,point(source));
+  // A measured pose can be valid while rotating to the nearest lattice yaw is
+  // blocked. First advance along its actual heading into a checked turning
+  // pocket, then use the existing turn/straight/turn lattice connector.
+  if(start_path.empty()) {
+    const int advances=std::ceil(std::max(r.footprint.length,r.footprint.width)/step);
+    for(int i=1;i<=advances&&start_path.empty();++i) {
+      auto departure=r.start;
+      departure.x+=i*step*std::cos(r.start.yaw);departure.y+=i*step*std::sin(r.start.yaw);
+      if(!isMotionCollisionFree(r.start,departure,r,.01,.02))break;
+      const int ax=std::llround((departure.x-min_x)/step),ay=std::llround((departure.y-min_y)/step);
+      for(int dy:{0,1,-1})for(int dx:{0,1,-1}) {
+        if(!start_path.empty())break;
+        const int x=ax+dx,y=ay+dy;
+        if(x<0||y<0||x>=nx||y>=ny)continue;
+        const auto candidate=id(x,y,heading(r.start.yaw));
+        auto tail=connect(departure,point(candidate));
+        if(tail.empty())continue;
+        source=candidate;start_path={r.start,departure};
+        start_path.insert(start_path.end(),tail.begin()+1,tail.end());
+      }
+      if(const auto reason=r.control.failure();!reason.empty())return failure(reason);
+    }
+  }
   if(start_path.empty())return failure("START_ORIENTATION_BLOCKED");
   const int gx=std::llround((r.goal.x-min_x)/step),gy=std::llround((r.goal.y-min_y)/step);
   std::size_t target=none;std::vector<Pose> goal_path;double gap=INFINITY;

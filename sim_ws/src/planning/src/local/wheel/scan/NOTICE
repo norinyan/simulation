@@ -64,3 +64,9 @@ developing reversals and amplifying their fixed boundary controls on retiming.
 After stationary alignment, fix the fourth initial control point on the start
 tangent as well: at zero linear velocity the first three controls alone cannot
 enforce zero initial heading rate. Moving starts retain three fixed controls.
+
+Mode-switch approach correction (2026-10-22): also fix the fourth terminal
+control point on the reference arrival tangent. Zero endpoint velocity and
+acceleration do not determine the body heading on the final span. Preserve the
+checked reference approach before the explicit terminal turn, retaining the
+common full-window swept-collision validation.
