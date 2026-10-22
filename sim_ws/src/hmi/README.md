@@ -2,6 +2,8 @@
 
 独立 Qt 面板，Gazebo 在另一个窗口显示。分别管理 sim_bringup 场景、control 机器人和 planning 导航进程，不实现规划算法。已知 F2-ROOM→F2-EAST 动态等待超时仍待修复，包迁移不代表该问题已解决。
 
+轮式算法现在可选择 `teb / scan`，首次加载仍默认 `teb`。`scan` 为 SCAN-Planner 的轮式适配版，使用相同运动限制和执行器；足式继续选择 `footstep`。TEB 和 SCAN 均已完成 F1-STAIR→F1-ROOM、F1-STAIR→F2-STAIR 的实际到达与停稳验证，详情见项目 README；这不表示所有点对或既有动态等待问题已解决。
+
 容器内构建并启动：
 
 ```bash

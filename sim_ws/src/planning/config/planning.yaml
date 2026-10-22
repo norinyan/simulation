@@ -25,6 +25,15 @@ planning_node:
       spacing: 0.15
       iterations: 30
       solver_time_limit: 0.10
+    scan:
+      resolution: 0.05
+      spacing: 0.15
+      sample_dt: 0.05
+      smooth_weight: 1.0
+      collision_weight: 1.0
+      feasibility_weight: 0.1
+      clearance: 0.10
+      iterations: 100
     foot:
       resolution: 0.05
       max_step: 0.50

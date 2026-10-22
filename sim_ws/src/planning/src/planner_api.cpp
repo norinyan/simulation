@@ -1,5 +1,6 @@
 #include "astar.h"
 #include "teb_optimizer.h"
+#include "scan_planner.h"
 #include "footstep_planner.h"
 #include <cmath>
 #include <algorithm>
@@ -28,6 +29,24 @@ std::unique_ptr<WheelLocalPlanner> buildWheel(const PlannerParameters& parameter
   }
   return std::make_unique<TebOptimizer>(options);
 }
+std::unique_ptr<WheelLocalPlanner> buildScan(const PlannerParameters& parameters){
+  ScanOptions options;
+  for(const auto& p:parameters) {
+    if(!std::isfinite(p.second))throw std::invalid_argument("NONFINITE_ALGORITHM_PARAMETER: "+p.first);
+    if(p.first=="resolution")options.resolution=p.second;
+    else if(p.first=="spacing")options.spacing=p.second;
+    else if(p.first=="sample_dt")options.sample_dt=p.second;
+    else if(p.first=="smooth_weight")options.smooth_weight=p.second;
+    else if(p.first=="collision_weight")options.collision_weight=p.second;
+    else if(p.first=="feasibility_weight")options.feasibility_weight=p.second;
+    else if(p.first=="clearance")options.clearance=p.second;
+    else if(p.first=="iterations") {
+      if(p.second<1||p.second>1000||std::floor(p.second)!=p.second)throw std::invalid_argument("INVALID_SCAN_ITERATIONS");
+      options.iterations=static_cast<int>(p.second);
+    } else throw std::invalid_argument("UNKNOWN_ALGORITHM_PARAMETER: "+p.first);
+  }
+  return std::make_unique<ScanLocalPlanner>(options);
+}
 std::unique_ptr<FootLocalPlanner> buildFoot(const PlannerParameters& parameters){
   FootstepOptions options;
   for(const auto& p:parameters) {
@@ -43,7 +62,10 @@ double distance(const Pose& a,const Pose& b){return std::hypot(a.x-b.x,a.y-b.y);
 bool finitePose(const Pose& p){return std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.z)&&std::isfinite(p.yaw);}
 template<class T> struct Entry{std::function<std::unique_ptr<T>(const PlannerParameters&)> create;std::string prefix;PlannerParameters defaults;};
 const std::map<std::string,Entry<GlobalPlanner>> globalRegistry{{"astar",{buildGlobal,"",{{"resolution",.05},{"max_grid_cells",2000000}}}}};
-const std::map<std::string,Entry<WheelLocalPlanner>> wheelRegistry{{"teb",{buildWheel,"teb.",{{"spacing",.15},{"iterations",30},{"solver_time_limit",.10}}}}};
+const std::map<std::string,Entry<WheelLocalPlanner>> wheelRegistry{
+  {"teb",{buildWheel,"teb.",{{"spacing",.15},{"iterations",30},{"solver_time_limit",.10}}}},
+  {"scan",{buildScan,"scan.",{{"resolution",.05},{"spacing",.15},{"sample_dt",.05},
+    {"smooth_weight",1.0},{"collision_weight",1.0},{"feasibility_weight",.1},{"clearance",.10},{"iterations",100}}}}};
 const std::map<std::string,Entry<FootLocalPlanner>> footRegistry{{"footstep",{buildFoot,"foot.",{{"resolution",.05},{"max_expansions",10000}}}}};
 }
 std::unique_ptr<GlobalPlanner> makeGlobalPlanner(const std::string& name,const PlannerParameters& parameters){const auto it=globalRegistry.find(name);if(it==globalRegistry.end())throw std::invalid_argument("Unknown global planner: "+name);return it->second.create(parameters);}

@@ -162,20 +162,36 @@ WheelTrackingCommand trackGlobalWheelGoal(const Pose& actual,const Pose& goal,
 WheelTrackingCommand trackWheel(const Pose& actual,const Pose& goal,const std::vector<TrajectoryPoint>& band,
  const WheelMotionLimits& limits,double control_dt,double gain,double tolerance,bool follow,double elapsed) {
  const double distance=std::hypot(actual.x-goal.x,actual.y-goal.y);
- if(distance<=tolerance){const double e=std::atan2(std::sin(goal.yaw-actual.yaw),std::cos(goal.yaw-actual.yaw));return {0,std::clamp(2*e,-limits.max_w,limits.max_w)};}
+ if(distance<=tolerance)return trackGlobalWheelGoal(actual,goal,limits,gain,tolerance);
  if(band.size()<2)return {};
  std::size_t index=1;while(index+1<band.size()&&band[index].time_from_start<=elapsed)++index;
  const auto& initial=band[index-1];const auto& first=band[index];
  const double interval=first.time_from_start-initial.time_from_start;
  if(interval<=0||elapsed>band.back().time_from_start)return {};
- const double u=std::clamp((elapsed-initial.time_from_start+std::min(control_dt,interval/2))/interval,0.,1.);
- const double pv=std::max(0.,initial.linear_velocity+(first.linear_velocity-initial.linear_velocity)*u),
-              pw=initial.angular_velocity+(first.angular_velocity-initial.angular_velocity)*u;
- const double target=std::min({pv,gain*distance,std::sqrt(2*limits.max_a*std::max(0.,distance-tolerance/2))});
+ // Samples after index zero carry interval means, located at interval midpoints.
+ // Reconstruct the velocity there and command the end of the control interval,
+ // allowing integrateWheel's acceleration ramp to cover the planned distance.
+ const double target_time=std::min(elapsed+control_dt,band.back().time_from_start);
+ auto midpoint=[&](std::size_t i){return i?(band[i-1].time_from_start+band[i].time_from_start)/2:0.;};
+ std::size_t right=1;
+ while(right+1<band.size()&&midpoint(right)<target_time)++right;
+ const auto& left=band[right-1];const auto& next=band[right];
+ const double u=(target_time-midpoint(right-1))/(midpoint(right)-midpoint(right-1));
+ const double pv=std::max(0.,left.linear_velocity+(next.linear_velocity-left.linear_velocity)*u),
+              pw=left.angular_velocity+(next.angular_velocity-left.angular_velocity)*u;
+ const double phase=std::clamp((elapsed-initial.time_from_start)/interval,0.,1.);
+ const double yaw=initial.pose.yaw+phase*std::atan2(std::sin(first.pose.yaw-initial.pose.yaw),std::cos(first.pose.yaw-initial.pose.yaw));
+ const double dx=initial.pose.x+phase*(first.pose.x-initial.pose.x)-actual.x,
+              dy=initial.pose.y+phase*(first.pose.y-initial.pose.y)-actual.y;
+ const double heading=std::atan2(std::sin(yaw-actual.yaw),std::cos(yaw-actual.yaw));
+ const double along=std::cos(actual.yaw)*dx+std::sin(actual.yaw)*dy,
+              across=-std::sin(actual.yaw)*dx+std::cos(actual.yaw)*dy;
+ const double speed=follow?std::max(0.,pv*std::cos(heading)+gain*along):pv;
+ const double target=std::min({speed,gain*distance,std::sqrt(2*limits.max_a*std::max(0.,distance-tolerance/2))});
  const double scale=pv>1e-8?std::clamp(target/pv,0.,1.):1.;double steering=pw*scale;
- // Consume the timed band from the current interval. A pure rotation keeps its
- // planned angular velocity; a zero linear speed must not erase that motion.
- if(follow&&pv>1e-6&&pv>=std::abs(pw)*.2){Pose look=band.back().pose;double length=0;Pose previous=actual;for(std::size_t i=index;i<band.size();++i){const auto& b=band[i].pose;const double d=std::hypot(b.x-previous.x,b.y-previous.y);if(length+d>=.2&&d>1e-8){const double f=(.2-length)/d;look={previous.x+f*(b.x-previous.x),previous.y+f*(b.y-previous.y),previous.z,previous.yaw};break;}length+=d;previous=b;}const double x=look.x-actual.x,y=look.y-actual.y;if(x*x+y*y>1e-8)steering=2*target*(-std::sin(actual.yaw)*x+std::cos(actual.yaw)*y)/(x*x+y*y);}
+ // Track the checked body heading at its timestamp. Looking through a future
+ // stationary turn changes the planned sweep before reaching its turning pose.
+ if(follow)steering+=2*heading+2*target*across/(.2*.2);
  return {std::clamp(target,0.,limits.max_v),std::clamp(steering,-limits.max_w,limits.max_w)};
 }
 Pose integrateWheel(Pose p,double& v,double& w,WheelTrackingCommand c,const WheelMotionLimits& limits,double dt) {

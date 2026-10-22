@@ -13,6 +13,7 @@
   <depend>builtin_interfaces</depend>
   <depend>ignition-math6</depend>
   <depend>libceres-dev</depend>
+  <build_depend>eigen</build_depend>
   <depend>rclcpp</depend>
   <depend>nav_msgs</depend>
   <depend>geometry_msgs</depend>

@@ -74,7 +74,7 @@ struct LocalPlanResult
   std::vector<TrajectoryPoint> trajectory;
   std::string failure_reason;
   double planning_ms{0.0};
-  double optimization_cost{0.0};  // Selected Ceres band cost, before retiming/windowing.
+  double optimization_cost{0.0};  // Selected solver cost, before retiming/windowing.
   double duration{0.0};
   double path_length{0.0};
   double max_linear_velocity{0.0};

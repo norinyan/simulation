@@ -354,6 +354,8 @@ class ControlPanel(QMainWindow):
                     raise ValueError('后端算法列表格式错误：'+key)
             for key, combo in self.algorithms.items():
                 selected = combo.currentData()
+                if selected is None:
+                    selected = {'global': 'astar', 'wheel': 'teb', 'foot': 'footstep'}[key]
                 combo.clear()
                 for name in catalog[key]:
                     combo.addItem(name, name)

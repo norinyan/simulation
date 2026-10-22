@@ -1,0 +1,66 @@
+SCAN-Planner ROS 2
+Copyright 2026 xiaoqi371317
+
+This repository is a ROS 2 Humble and Ubuntu 22.04 port of:
+
+  SCAN-Planner
+  https://github.com/wuyi2121/SCAN-Planner
+
+Original research authors:
+  Han Zheng, Zhe Chen, Yiwen Fu, Ming Yang, and Tong Qin
+
+Original project:
+  SCAN-Planner: Spatial Collision-Aware Local Planning for
+  Route-Guided Long-Range Quadruped Navigation
+  https://arxiv.org/abs/2606.19555
+
+The upstream project is licensed under the Apache License, Version 2.0.
+This derivative preserves that license and adds ROS 2 Humble, Ubuntu 22.04,
+ament_cmake, colcon, rclcpp, RViz2, tf2_ros and ROS 2 launch integration.
+
+The upstream authors and maintainers are not affiliated with, and do not
+necessarily endorse, this port.
+
+Local wheel-planner adaptation (2026-10-22)
+Source: https://github.com/wuyi2121/SCAN-Planner
+Branch: ros2-community
+Pinned commit: d0b921c9b05a6d291d144d60882b2e0e88d2c0e0
+
+Retained numerical modules: cubic B-splines, L-BFGS rebound/refinement
+optimization, projected A-star guidance, and the embedded L-BFGS license.
+
+Local modifications:
+- Replace ROS parameter/logging dependencies with C++ options and diagnostics;
+  suppress per-solve progress output, retaining failure diagnostics.
+- Observe the caller's cancellation/deadline in optimization and A-star search.
+- Replace variable-length stack arrays with vectors and release all A-star
+  allocation levels; initialize its empty allocation state.
+- Use a request-local, wheel-only occupancy-query backend over the existing
+  floor-projected boxes and explicit support. Use the shared yaw-aware rectangle
+  with the configured safety margin, matching TEB and the common validator;
+  this replaces the upstream twin-cylinder embodiment for this wheel robot.
+  The upstream sensor fusion, 3D sliding map, global FSM, simulator, controllers,
+  and boundary dead-end recovery are not included.
+- Adapt position splines to the existing differential-wheel trajectory contract
+  with explicit stationary boundary turns, exact initial-state constraints,
+  time stretching, and the unchanged common swept-collision/support/motion checks.
+
+This integration is a wheel adaptation, not a reproduction of the complete
+upstream quadruped navigation system. Footstep planning remains independent.
+
+Rolling-start correction (2026-10-22): time reparameterization now rebuilds
+the fixed initial velocity/acceleration control points at each new knot time
+and reoptimizes, instead of stretching output times and changing the physical
+initial velocity. The request has no measured acceleration boundary, so the
+adapter chooses bounded forward acceleration toward the allowed speed rather
+than imposing zero tangential acceleration at every rolling restart. Shared
+motion limits, collision/support checks, controller and admission are unchanged.
+
+Terminal-reference correction (2026-10-22): knot timing uses the actual mean
+reference interval after densification. Recompute the unobserved tangential
+acceleration from that interval and the new knot time on each retiming attempt.
+This prevents short references from being timed as full-spacing references,
+developing reversals and amplifying their fixed boundary controls on retiming.
+After stationary alignment, fix the fourth initial control point on the start
+tangent as well: at zero linear velocity the first three controls alone cannot
+enforce zero initial heading rate. Moving starts retain three fixed controls.

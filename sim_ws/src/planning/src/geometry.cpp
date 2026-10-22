@@ -271,7 +271,7 @@ bool isMotionCollisionFree(const Pose& a, const Pose& b, const PlanRequest& r,
   const double count = std::ceil(std::max(d/translation_step,std::abs(turn)/rotation_step));
   if (!std::isfinite(count) || count>100000) return false;
   const int n = std::max(1,static_cast<int>(count));
-  const double radius=std::hypot(r.footprint.length,r.footprint.width)/2;
+  const double radius=std::hypot(r.footprint.length/2+r.safety_margin,r.footprint.width/2+r.safety_margin);
   const double padding=d/(2*n)+2*radius*std::sin(std::abs(turn)/(4*n));
   if(!validate(r))return false;
   auto nearby=r;nearby.obstacles.clear();
@@ -282,10 +282,21 @@ bool isMotionCollisionFree(const Pose& a, const Pose& b, const PlanRequest& r,
        box.center_y+extent<std::min(a.y,b.y)-reach || box.center_y-extent>std::max(a.y,b.y)+reach)continue;
     nearby.obstacles.push_back(box);
   }
-  for(int i=0;i<=n;i++) {
-    const double t=static_cast<double>(i)/n;
-    if(!isPoseCollisionFree({a.x+t*(b.x-a.x),a.y+t*(b.y-a.y),a.z,a.yaw+t*turn},nearby,padding)) return false;
-  }
+  auto pose=[&](double t){return Pose{a.x+t*(b.x-a.x),a.y+t*(b.y-a.y),a.z,a.yaw+t*turn};};
+  if(!isPoseCollisionFree(a,nearby)||!isPoseCollisionFree(b,nearby))return false;
+  // A failed padded sample can be a conservative bound touching a nearby wall.
+  // Refine only that interval; every accepted interval still certifies its full
+  // translation and rotation, with the configured safety margin unchanged.
+  auto clear=[&](auto&& self,double lo,double hi,int depth)->bool {
+    const auto p=pose((lo+hi)/2);
+    const double span=hi-lo;
+    const double extra=d*span/2+2*radius*std::sin(std::abs(turn)*span/4);
+    if(isPoseCollisionFree(p,nearby,extra))return true;
+    if(depth==8||!isPoseCollisionFree(p,nearby))return false;
+    const double mid=(lo+hi)/2;
+    return self(self,lo,mid,depth+1)&&self(self,mid,hi,depth+1);
+  };
+  for(int i=0;i<n;i++)if(!clear(clear,double(i)/n,double(i+1)/n,0))return false;
   return true;
 }
 

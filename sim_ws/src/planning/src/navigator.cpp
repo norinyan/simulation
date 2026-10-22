@@ -32,6 +32,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <time.h>
 #include <vector>
 
 namespace
@@ -760,8 +761,9 @@ private:
     const auto look=referenceLook(robot,.2);const double error=angle(look.yaw-robot.yaw);
     std::vector<planning::TrajectoryPoint> band(2);band[0].pose=robot;band[0].linear_velocity=v;band[0].angular_velocity=w;band[1].pose=look;band[1].time_from_start=.1;
     const double desired=wheel_limits_.max_v*std::max(0.,std::cos(error));
-    band[1].linear_velocity=v+std::clamp(desired-v,-wheel_limits_.max_a*.1,wheel_limits_.max_a*.1);
-    band[1].angular_velocity=std::clamp(2*error,-wheel_limits_.max_w,wheel_limits_.max_w);
+    band[1].linear_velocity=v+.5*std::clamp(desired-v,-wheel_limits_.max_a*.1,wheel_limits_.max_a*.1);
+    const double desired_w=std::clamp(2*error,-wheel_limits_.max_w,wheel_limits_.max_w);
+    band[1].angular_velocity=w+.5*std::clamp(desired_w-w,-wheel_limits_.max_alpha*.1,wheel_limits_.max_alpha*.1);
     auto command=planning::trackWheel(robot,navigation_path_[navigation_index_],band,wheel_limits_,.1,approach_gain_,position_tolerance_,true);
     if(std::hypot(robot.x-navigation_path_[navigation_index_].x,robot.y-navigation_path_[navigation_index_].y)<=position_tolerance_ && std::abs(angle(robot.yaw-navigation_path_[navigation_index_].yaw))<yaw_tolerance_)return {};
     return command;
@@ -1083,6 +1085,8 @@ private:
     events_.exceptions(std::ios::failbit | std::ios::badbit);
     events_.open(output_dir_/"task_events.csv");
     events_ << "sim_time_s,state,reason,x_m,y_m,body_z_m,yaw_rad,v_mps,w_rps\n";
+    std::ofstream(output_dir_/"wheel_planning.csv")
+      << "request_sim_s,segment,algorithm,success,reason,wall_ms,thread_cpu_ms,cancelled_at_completion\n";
     segment_budgets_.clear();double total=30;
     std::ofstream budgets(output_dir_/"segment_budgets.csv");budgets<<"segment,mode,motion_s,budget_s\n";
     for(std::size_t i=0;i<task_scene_.task.size();++i){
@@ -1132,8 +1136,8 @@ private:
         std::to_string(wheel_limits_.time_horizon)+"; duration_s="+std::to_string(result.duration)+
         "; reason="+(result.success ? "OK" : result.failure_reason)+"; output="+output_dir_.string();
       local_status_publisher_->publish(status);
-      if (result.success) RCLCPP_INFO(get_logger(), "TEB %s; points=%zu; predicted_length=%.3f m", status.data.c_str(), path.poses.size(), result.path_length);
-      else RCLCPP_ERROR(get_logger(), "TEB %s", status.data.c_str());
+      if (result.success) RCLCPP_INFO(get_logger(), "%s %s; points=%zu; predicted_length=%.3f m", wheel_name_.c_str(), status.data.c_str(), path.poses.size(), result.path_length);
+      else RCLCPP_ERROR(get_logger(), "%s %s", wheel_name_.c_str(), status.data.c_str());
     }
   }
 
@@ -1274,7 +1278,7 @@ private:
     cancelPlanning();hold();modeCommand("STOP");enterTask(state,reason);terminal_=true;
     std::ofstream result(output_dir_/"task_result.csv");
     const auto& goal=task_scene_.request.goal;
-    result << std::setprecision(17) << "state,reason,simulation_duration_s,wall_duration_s,position_error_m,height_error_m,yaw_error_rad,final_v_mps,final_w_rps,teb_plans,final_x_m,final_y_m,final_body_z_m,final_vy_mps,final_vz_mps,executor_status\n"
+    result << std::setprecision(17) << "state,reason,simulation_duration_s,wall_duration_s,position_error_m,height_error_m,yaw_error_rad,final_v_mps,final_w_rps,wheel_plans,final_x_m,final_y_m,final_body_z_m,final_vy_mps,final_vz_mps,executor_status\n"
       << state << ',' << csvString(reason) << ',' << now().seconds()-task_begin_ << ','
       << std::chrono::duration<double>(std::chrono::steady_clock::now()-wall_begin_).count() << ','
       << std::hypot(actual_pose_.x-goal.x,actual_pose_.y-goal.y) << ','
@@ -1400,8 +1404,20 @@ private:
     wheel_cancel_=std::make_shared<std::atomic_bool>(false);
     request.geometry.control=budget(local_timeout_,wheel_cancel_);
     wheel_requested_at_=control_time;
-    wheel_future_=std::async(std::launch::async,[this,request,stamp=control_time,feedback_stamp=odom_stamp_]() {
-      return WheelJob{request,planning::runPlanner(*wheel_planner_,request),stamp,feedback_stamp};
+    const auto metrics_file=output_dir_/"wheel_planning.csv";
+    wheel_future_=std::async(std::launch::async,[this,request,stamp=control_time,feedback_stamp=odom_stamp_,
+        metrics_file,segment=active_segment_,algorithm=wheel_name_]() {
+      auto cpu=[](){timespec t{};return clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t)==0?t.tv_sec*1000.+t.tv_nsec/1e6:-1.;};
+      const double cpu_begin=cpu();const auto begin=std::chrono::steady_clock::now();
+      auto result=planning::runPlanner(*wheel_planner_,request);
+      const double wall_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
+      const double cpu_end=cpu(),cpu_ms=cpu_begin>=0&&cpu_end>=0?cpu_end-cpu_begin:-1.;
+      // Record all completed calls, including failed/cancelled results that the
+      // executor will discard. File I/O is outside the measured planning call.
+      std::ofstream metrics(metrics_file,std::ios::app);
+      metrics<<std::setprecision(17)<<stamp<<','<<segment<<','<<algorithm<<','<<result.success<<','
+        <<csvString(result.failure_reason)<<','<<wall_ms<<','<<cpu_ms<<','<<request.geometry.control.cancelled->load()<<'\n';
+      return WheelJob{request,std::move(result),stamp,feedback_stamp};
     });
   }
   void taskTick() {

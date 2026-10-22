@@ -3,6 +3,7 @@
 /sim_ws/install/
 /sim_ws/log/
 /sim_ws/results/
+/symlink_install_manifest.txt
 
 # Docker runtime data
 /.docker-data/

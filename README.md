@@ -81,7 +81,7 @@ ros2 run hmi panel
 
 1. **启动场景**：选择“三层楼”和倍率，点击“启动仿真”，等待就绪。
 2. **生成机器人**：选择出生点、目标点，核对坐标后点击“生成机器人”，等待实际位姿和执行器反馈。
-3. **开始任务**：分别选择全局、轮式局部、足式局部算法，点击“开始任务”。当前实现为 `A* / TEB / Footstep`。
+3. **开始任务**：分别选择全局、轮式局部、足式局部算法，点击“开始任务”。当前全局为 `astar`，轮式可选 `teb / scan`，足式为 `footstep`；默认仍为 `teb`。
 4. **观察运行**：选择俯视、内部透视、三层同屏，或点击“跟随机器人”。俯视与透视配合楼层选择使用；“恢复所选视角”退出跟随。
 5. **查看结果**：消息框显示阶段和原因。`DONE` 表示实际到达并停稳，`WAIT_OBSTACLE` 表示等待，`FAILED` 表示任务失败。
 6. **停止或关闭**：“停止任务”取消本次计算或运动；“关闭仿真”结束整个会话。更换出生点时先移除机器人再生成。
@@ -194,6 +194,8 @@ simulation/
     │       ├── global/astar.cpp
     │       └── local/
     │           ├── wheel/teb_optimizer.cpp
+    │           ├── wheel/scan_planner.cpp # SCAN 轮式接口适配
+    │           ├── wheel/scan/           # 固定上游核心与来源说明
     │           └── foot/footstep_planner.cpp
     ├── control/
     │   ├── launch/control.launch.py
@@ -217,6 +219,14 @@ simulation/
 | [robot.urdf.xacro](sim_ws/src/control/urdf/robot.urdf.xacro) | 机器人连杆、关节、碰撞及执行插件 |
 
 全局公共接口和数据结构位于 [global_planner.h](sim_ws/src/planning/include/global_planner.h)，轮式与足式公共接口位于 [local_planner.h](sim_ws/src/planning/include/local_planner.h)。新增算法分别放入 `src/global/`、`src/local/wheel/` 或 `src/local/foot/`，实现对应接口，在 `planner_api.cpp` 注册，并更新 CMake 和算法参数。HMI 从后端查询算法列表，执行器消费统一结果。
+
+轮式 `scan` 是 [SCAN-Planner 社区 ROS 2 分支](https://github.com/wuyi2121/SCAN-Planner/tree/ros2-community)的轮式适配版，固定上游提交 `d0b921c9b05a6d291d144d60882b2e0e88d2c0e0`。入口为 `src/local/wheel/scan_planner.cpp`，必要核心位于同目录的 `scan/`，来源和修改见其中 `NOTICE`。保留 B 样条优化和投影 A*，占据查询使用现有楼层几何及带安全余量的朝向矩形足迹，替代上游双圆柱碰撞包络；未引入上游感知、三维滑动地图或四足控制器。轮式限制和精确矩形扫掠／支撑校验继续共用，足式仍由 Footstep 负责。
+
+HMI 在轮式下拉框选择 `scan`；现有命令行 planning 启动参数可用 `wheel_planner:=scan`。`planning.yaml` 的 `scan` 管理分辨率、参考采样间距、输出采样间隔、优化权重、额外反弹净空和迭代上限；速度、加速度和时间窗仍读取公共 `motion`，计算预算仍读取 `planners.local_timeout`。机身尺寸与安全余量不在 SCAN 参数中重复定义。新增任务结果的局部规划次数列使用通用名 `wheel_plans`。
+
+SCAN 已完成构建、纯规划检查，以及 `F1-STAIR→F1-ROOM`、`F1-STAIR→F2-STAIR` 的 Gazebo 实际执行，两条路线均到达并停稳，详见下方实跑对比。这些结果不代表所有点对或动态行人场景已通过；既有 F2-ROOM→F2-EAST 动态准入问题仍待解决。
+
+用户首次实跑反馈起步缓慢后，已修正 SCAN 时间重参数化破坏初速度边界、滚动请求反复使用零切向加速度的问题。相同实际状态的离线对照、两秒短时模型诊断、原两个纯规划点对及上述两条实际路线回归通过。更新后需重启仿真会话以加载新规划库。
 
 技术栈分工：**C++17** 实现规划与 Gazebo 插件；**Python / PyQt5** 实现 HMI 与启动组织；**ROS 2** 提供通信；**Ceres** 求解 TEB；**URDF/Xacro、YAML、colcon/CMake** 管理模型、配置和构建。
 
@@ -250,6 +260,7 @@ ros2 launch sim_bringup scene.launch.py scene:=three_floor floor:=2 view:=interi
 | CLI 会话 | 默认 `~/.local/state/simulation/`；可用 `output_dir` / `results_dir` 指定 |
 | `task_result.csv` | 最终状态、原因、到达误差、耗时及停车速度 |
 | `task_events.csv` | 阶段切换和关键事件 |
+| `wheel_planning.csv` | 执行期间逐次轮式规划的墙钟／线程 CPU 耗时、成功状态和失败原因 |
 
 `~` 为容器用户目录。需要长期保存的结果应复制到宿主机或挂载目录。`sim_ws/{build,install,log,results}` 是 Git 忽略的本地产物。修改源码或安装资源后需重新构建、加载环境并重启相关进程。
 
@@ -272,7 +283,54 @@ ros2 topic echo /planning/task_status std_msgs/msg/String --once \
 | 暂停行人、直接跟随全局路径跨层 | 一层入口 → 二层房间已实际到达并停稳 |
 | 暂停行人、TEB 同层任务 | 二层楼梯口 → 走廊右端已实际到达并停稳 |
 | 暂停行人、TEB 跨层任务 | 有到达记录，也有转角停滞记录，稳定性待解决 |
+| 行人运动、TEB / SCAN 同层任务 | F1-STAIR→F1-ROOM 均已实际到达并停稳 |
+| 行人运动、TEB / SCAN 跨层任务 | F1-STAIR→F2-STAIR 均已完成上楼、收腿及最终到达停稳 |
 | 行人运动下的动态通行 | 尚未完成稳定验收 |
 | 足式速度 | 已按机身、足端和关节限制调整步时，仍有速度优化需求 |
 
 电梯控制未开发。当前结果不代表所有点对或动态场景均已通过；后续算法对比应在相同地图、机器人约束和任务条件下进行。
+
+本轮四项回归均为 Gazebo 实际执行；保留原运动、碰撞、支撑、制动和停车标准，途中仍有局部失败后的自动重规划恢复。具体结果与验证边界见下方实跑对比。
+
+### TEB / SCAN 实跑对比（2026-10-22）
+
+同一三层场景、机器人和运动限制，全局使用 A*，跨楼足式使用 Footstep，行人保持运动，目标倍率为 5。本次为补充性能采样重新各跑一次，四项均实际到达并停稳，终态为 `DONE`。
+
+| 路线 | 算法 | 仿真耗时 | 墙钟耗时 | 位置误差 |
+|---|---|---:|---:|---:|
+| F1-STAIR→F1-ROOM | TEB | 91.0 s | 30.0 s | 1.92 mm |
+| F1-STAIR→F1-ROOM | SCAN | 102.5 s | 34.0 s | 1.93 mm |
+| F1-STAIR→F2-STAIR | TEB | 333.1 s | 78.4 s | 1.89 mm |
+| F1-STAIR→F2-STAIR | SCAN | 372.3 s | 90.3 s | 1.99 mm |
+
+四次最终线速度、角速度均为 0，朝向误差均小于 0.0005 rad；原安全距离、制动保护和到达标准保持。耗时不包含场景启动与预先全局规划，跨楼耗时包含共同的足式执行。
+
+轮式规划与运动质量：
+
+| 路线 | 算法 | 单次规划均值 / P95（ms） | 最小障碍距离（m） | 线加速度 RMS（m/s²） |
+|---|---|---:|---:|---:|
+| F1-STAIR→F1-ROOM | TEB | 1.42 / 2.38 | 0.0676 | 0.0943 |
+| F1-STAIR→F1-ROOM | SCAN | 1.55 / 2.08 | 0.0713 | 0.0498 |
+| F1-STAIR→F2-STAIR | TEB | 2.76 / 21.41 | 0.0833 | 0.1128 |
+| F1-STAIR→F2-STAIR | SCAN | 1.02 / 2.00 | 0.0822 | 0.0680 |
+
+计算开销与本次运行的失败恢复：
+
+| 路线 | 算法 | 平均线程 CPU（ms/次） | 最大规划耗时（ms） | 求解失败 / 总调用 | 等待事件数 |
+|---|---|---:|---:|---:|---:|
+| F1-STAIR→F1-ROOM | TEB | 1.42 | 46.59 | 7 / 639（1.10%） | 3 |
+| F1-STAIR→F1-ROOM | SCAN | 1.55 | 5.46 | 3 / 846（0.35%） | 2 |
+| F1-STAIR→F2-STAIR | TEB | 2.76 | 48.17 | 6 / 274（2.19%） | 3 |
+| F1-STAIR→F2-STAIR | SCAN | 1.02 | 28.35 | 10 / 585（1.71%） | 5 |
+
+- **规划耗时**：对执行期间每个完成的轮式 `runPlanner` 调用计时，包含求解和公共校验，成功、失败及取消调用均保留；不包含 ROS 传输、排队、文件写入和足式规划。P95 表示95%的已测调用不超过该耗时。CPU 时间只统计规划线程，非整个 Gazebo／ROS 进程组占用；测量机器为 Intel Core i7-14700F，Release 构建，仿真同时运行。
+
+- **最小障碍距离**：仅轮式阶段，以实际反馈位姿计算物理矩形足迹边缘到本层静态障碍及运动行人碰撞盒边缘的二维最短距离；不扣除安全余量，不含支撑地板。机器人反馈间隔约0.06仿真秒，行人位置按相邻反馈时间插值。任务末尾未被相邻行人反馈包围的少量样本不参与距离统计，数量见metrics.json；不外推补值。这是采样最小值，不能当作连续时间最小距离或额外安全保证。
+
+- **速度平滑度**：使用实际前向线速度，按仿真时间差分，计算 `sqrt(Σ[(Δv/Δt)²·Δt] / ΣΔt)`。包括轮式停车／等待，排除足式、变形及跨阶段差分。RMS 较小表示本次线速度变化较缓，也可能受到较低速度或较多停车影响；不等同于 jerk 指标，不能单独判断整体平滑性。
+
+- **稳定性**：表中是本次求解失败比例和等待事件数；失败后仍可能恢复到达。每项只跑一次，两条路线均通过仅是两个样本，不代表长期成功率；要比较统计稳定性，还需预先约定重复次数和行人相位，本轮未扩大试验。
+
+运行时 `wheel_planning.csv` 保存逐次耗时和失败原因。连续反馈、地图、距离计算及汇总脚本仅保存在本地结果目录，不新增工程评测框架。
+
+完整指标与原始记录保存在 Git 忽略的本地目录 `sim_ws/results/scan_teb_metrics_20261022_172743/`，不随仓库推送；其中 `README.md` 说明指标口径，`metrics.csv` / `metrics.json` 是汇总，`comparison.json` 是实际任务结果，四个子目录保存 `actual_samples.csv`、`pedestrian_samples.csv`、`scene_map.json`、`wheel_clearance.csv` 及 `tasks/run_*/wheel_planning.csv`。
