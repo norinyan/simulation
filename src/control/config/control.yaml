@@ -1,0 +1,32 @@
+# 轮足行为参数；时间单位为仿真秒。关节位置和速度限制只读取 URDF。
+# 保留当前场景已调好的数值；与 URDF 对应的几何尺寸仍由运动学模型定义。
+wheel:
+  linear_speed: 0.8       # 本体前后速度上限，m/s
+  angular_speed: 1.0      # 偏航角速度上限，rad/s
+  body_height: 0.32       # 轮式本体离支撑面的高度，m
+
+foot:
+  linear_speed: 0.35
+  angular_speed: 0.6
+  body_height: 0.44
+  wheel_lift: 0.22        # 足式轮架关节位置，m
+  swing_duration: 0.16    # 单足摆动时长；左右足交替
+  step_budget: 0.06       # 每次摆足的位移预算，m
+  swing_lift: 0.06        # 连续行走抬足高度，m
+
+# 足步控制的上下台阶参数：对应当前场景踏深 0.30 m、阶高 0.16 m。
+stair:
+  speed: 0.15            # 单阶名义速度；动作时长 = run / speed
+  run: 0.30              # 单阶前移，m
+  rise: 0.16             # 单阶升降，m
+  swing_lift: 0.06       # 高于起终足端的额外抬高，m
+  first_body_up: 0.10    # 上阶前半段本体前移，m
+  first_body_down: 0.20  # 下阶前半段本体前移，m
+
+mode_duration: 1.5       # 轮足切换总时长，两阶段各占一半
+feedback_period: 0.02   # /robot/odom 和 /joint_states 发布周期
+
+trajectory:
+  position_tolerance: 0.02     # 起点和段终点的位置衔接容差，m
+  orientation_tolerance: 0.02  # 起点、终点及水平姿态容差，rad
+  geometry_tolerance: 0.001   # 平面侧移、阶步尺寸匹配容差，m

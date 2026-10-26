@@ -1,0 +1,19 @@
+# ROS 2 / colcon generated output
+/build/
+/install/
+/log/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+
+# Editor and operating system temporary files
+*.swp
+*.swo
+*~
+.DS_Store
