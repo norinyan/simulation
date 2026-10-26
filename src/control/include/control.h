@@ -40,20 +40,17 @@ private:
     // 足步控制：平地步态和上下台阶。
     double foot_linear_speed{}, foot_angular_speed{}, foot_height{}, wheel_lift{};
     double swing_duration{}, step_budget{}, swing_lift{};
-    double stair_speed{}, stair_run{}, stair_rise{}, stair_lift{};
-    double stair_first_up{}, stair_first_down{};
     // 轮足变换与状态反馈周期。
     double mode_duration{}, feedback_period{};
     // 轨迹起终点衔接与当前运动能力的匹配容差。
     double position_tolerance{}, orientation_tolerance{}, geometry_tolerance{};
   } cfg_;
 
-  // 内部执行段：平面段保存恒定 v/w，台阶段复用足步控制的单阶动作。
+  // 足式按 XYZ + yaw 插值；轮式保留恒定 v/w 圆弧执行。
   struct Segment
   {
     ignition::math::Pose3d from, to;  // world 下 base_link 的起终点。
     double begin{}, end{}, forward{}, yaw_rate{};  // 相对轨迹时间、前后速度和偏航速度。
-    bool stair{false};
   };
 
   void LoadConfig(sdf::ElementPtr sdf);
@@ -70,7 +67,14 @@ private:
   std::array<ignition::math::Vector3d, 2> GroundFeet(
     const ignition::math::Pose3d & body) const;
   bool SolveLegs();
-  void StartStair(bool up, double start, double duration);
+  bool LegAngles(const ignition::math::Pose3d & body,
+    const ignition::math::Vector3d & foot, size_t side, std::array<double, 11> & next) const;
+  // 射线查询只在 Gazebo 更新线程使用，排除机器人自身碰撞体。
+  bool Height(double x, double y, double ceiling, double & z) const;
+  bool Surface(ignition::math::Vector3d & foot, double yaw, double ceiling) const;
+  bool Landing(const ignition::math::Pose3d & body, size_t side,
+    ignition::math::Vector3d & foot) const;
+  ignition::math::Pose3d SampleTrajectory(double time) const;
   void Leg(double now, double dt);
   std::array<ignition::math::Vector3d, 2> FootPositions(
     const std::array<double, 11> & joints) const;
@@ -105,8 +109,13 @@ private:
   std::array<gazebo::physics::JointPtr, 11> joints_;
   std::array<double, 11> q_{}, reported_q_{}, lower_{}, upper_{}, speed_limits_{};
 
-  // 仿真模型、反馈采样和当前支撑面高度；上/下阶完成后更新 ground_。
+  // 仿真模型与反馈采样；ground_ 仅缓存轮足切换处的地形高度。
   gazebo::physics::ModelPtr model_;
+  gazebo::physics::RayShapePtr terrain_ray_;
+  // 同一更新帧内复用场景包围盒，最终高度仍由真实碰撞几何射线求交得到。
+  mutable double terrain_cache_time_{-1.0};
+  mutable std::vector<std::pair<gazebo::physics::CollisionPtr,
+    ignition::math::AxisAlignedBox>> terrain_collisions_;
   gazebo_ros::Node::SharedPtr node_;
   gazebo::event::ConnectionPtr update_;
   ignition::math::Pose3d pose_, reported_pose_;
@@ -120,14 +129,12 @@ private:
   ignition::math::Pose3d mode_pose_;
   std::array<ignition::math::Vector3d, 2> mode_feet_{};
 
-  // 足步控制状态：上下台阶及连续行走的交替摆足。
-  bool stair_active_{false}, stair_up_{true};
-  double stair_start_{0.0}, stair_duration_{0.0};
-  ignition::math::Pose3d stair_pose_;
-  std::array<ignition::math::Vector3d, 2> feet_{}, feet_start_{}, feet_goal_{};
+  // 支撑足固定在 world 中，摆足目标由未来本体轨迹和碰撞表面确定。
+  std::array<ignition::math::Vector3d, 2> feet_{};
   bool swing_{false};
   size_t swing_side_{0};
-  double swing_start_{0.0};
+  double swing_start_{0.0}, swing_duration_{0.0}, swing_clearance_{0.0};
+  double next_foot_query_{0.0};
   ignition::math::Vector3d swing_from_, swing_to_;
 
   // 异常冻结及轨迹执行输入；冻结后通过重新生成机器人恢复。

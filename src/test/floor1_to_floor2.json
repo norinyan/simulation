@@ -1,0 +1,1224 @@
+{
+  "description": "three_floor.world: floor 1 -> floor 2; one uninterrupted foot message throughout the stairwell",
+  "spawn": {
+    "entity": "wheel_leg_robot",
+    "x": -8.3,
+    "y": 3.9,
+    "z": 0.32,
+    "yaw": 0.0
+  },
+  "speeds": {
+    "wheel_m_s": 0.7,
+    "stairs_xy_m_s": 0.15,
+    "landing_m_s": 0.25,
+    "yaw_rad_s": 0.4
+  },
+  "segments": [
+    {
+      "name": "floor1_wheel_approach",
+      "message": {
+        "header": {
+          "frame_id": "world"
+        },
+        "mode": "wheel",
+        "points": [
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -8.3,
+                  "y": 3.9,
+                  "z": 0.32
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 0,
+              "nanosec": 0
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -7.6,
+                  "y": 3.9,
+                  "z": 0.32
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 1,
+              "nanosec": 0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "stairs_floor1_to_floor2_all_foot",
+      "message": {
+        "header": {
+          "frame_id": "world"
+        },
+        "mode": "foot",
+        "points": [
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -7.6,
+                  "y": 3.9,
+                  "z": 0.44
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 0,
+              "nanosec": 0
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -7.199999999999999,
+                  "y": 3.9,
+                  "z": 0.44
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 2,
+              "nanosec": 666666667
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -7.0,
+                  "y": 3.9,
+                  "z": 0.6
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 4,
+              "nanosec": 0
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -6.8999999999999995,
+                  "y": 3.9,
+                  "z": 0.6
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 4,
+              "nanosec": 666666667
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -6.7,
+                  "y": 3.9,
+                  "z": 0.76
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 6,
+              "nanosec": 0
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -6.6,
+                  "y": 3.9,
+                  "z": 0.76
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 6,
+              "nanosec": 666666667
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -6.4,
+                  "y": 3.9,
+                  "z": 0.9199999999999999
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 8,
+              "nanosec": 0
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -6.299999999999999,
+                  "y": 3.9,
+                  "z": 0.9199999999999999
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 8,
+              "nanosec": 666666667
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -6.1,
+                  "y": 3.9,
+                  "z": 1.08
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 10,
+              "nanosec": 0
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -5.999999999999999,
+                  "y": 3.9,
+                  "z": 1.08
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 10,
+              "nanosec": 666666667
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -5.8,
+                  "y": 3.9,
+                  "z": 1.24
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 12,
+              "nanosec": 0
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -5.699999999999999,
+                  "y": 3.9,
+                  "z": 1.24
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 12,
+              "nanosec": 666666667
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -5.5,
+                  "y": 3.9,
+                  "z": 1.4
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 14,
+              "nanosec": 0
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -5.3999999999999995,
+                  "y": 3.9,
+                  "z": 1.4
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 14,
+              "nanosec": 666666667
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -5.2,
+                  "y": 3.9,
+                  "z": 1.56
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 16,
+              "nanosec": 0
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -5.1,
+                  "y": 3.9,
+                  "z": 1.56
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 16,
+              "nanosec": 666666667
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -4.9,
+                  "y": 3.9,
+                  "z": 1.72
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 18,
+              "nanosec": 0
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -4.799999999999999,
+                  "y": 3.9,
+                  "z": 1.72
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 18,
+              "nanosec": 666666667
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -4.6,
+                  "y": 3.9,
+                  "z": 1.88
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 20,
+              "nanosec": 0
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -4.5,
+                  "y": 3.9,
+                  "z": 1.88
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 20,
+              "nanosec": 666666667
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -4.300000000000001,
+                  "y": 3.9,
+                  "z": 2.04
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 22,
+              "nanosec": 0
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -3.45,
+                  "y": 3.9,
+                  "z": 2.04
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "w": 1.0
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 27,
+              "nanosec": 666666667
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -3.45,
+                  "y": 3.9,
+                  "z": 2.04
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.7071067811865475,
+                  "w": 0.7071067811865476
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 31,
+              "nanosec": 593657484
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -3.45,
+                  "y": 5.65,
+                  "z": 2.04
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.7071067811865475,
+                  "w": 0.7071067811865476
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 38,
+              "nanosec": 593657484
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -3.45,
+                  "y": 5.65,
+                  "z": 2.04
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 42,
+              "nanosec": 520648301
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -3.9999999999999996,
+                  "y": 5.65,
+                  "z": 2.04
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 46,
+              "nanosec": 187314967
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -4.199999999999999,
+                  "y": 5.65,
+                  "z": 2.2
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 47,
+              "nanosec": 520648301
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -4.3,
+                  "y": 5.65,
+                  "z": 2.2
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 48,
+              "nanosec": 187314967
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -4.499999999999999,
+                  "y": 5.65,
+                  "z": 2.36
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 49,
+              "nanosec": 520648301
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -4.6,
+                  "y": 5.65,
+                  "z": 2.36
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 50,
+              "nanosec": 187314967
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -4.799999999999999,
+                  "y": 5.65,
+                  "z": 2.52
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 51,
+              "nanosec": 520648301
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -4.9,
+                  "y": 5.65,
+                  "z": 2.52
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 52,
+              "nanosec": 187314967
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -5.1,
+                  "y": 5.65,
+                  "z": 2.68
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 53,
+              "nanosec": 520648301
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -5.2,
+                  "y": 5.65,
+                  "z": 2.68
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 54,
+              "nanosec": 187314967
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -5.3999999999999995,
+                  "y": 5.65,
+                  "z": 2.84
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 55,
+              "nanosec": 520648301
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -5.5,
+                  "y": 5.65,
+                  "z": 2.84
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 56,
+              "nanosec": 187314967
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -5.699999999999999,
+                  "y": 5.65,
+                  "z": 3.0
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 57,
+              "nanosec": 520648301
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -5.8,
+                  "y": 5.65,
+                  "z": 3.0
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 58,
+              "nanosec": 187314967
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -5.999999999999999,
+                  "y": 5.65,
+                  "z": 3.16
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 59,
+              "nanosec": 520648301
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -6.1,
+                  "y": 5.65,
+                  "z": 3.16
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 60,
+              "nanosec": 187314967
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -6.299999999999999,
+                  "y": 5.65,
+                  "z": 3.3200000000000003
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 61,
+              "nanosec": 520648301
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -6.4,
+                  "y": 5.65,
+                  "z": 3.3200000000000003
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 62,
+              "nanosec": 187314967
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -6.6,
+                  "y": 5.65,
+                  "z": 3.48
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 63,
+              "nanosec": 520648301
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -6.699999999999999,
+                  "y": 5.65,
+                  "z": 3.48
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 64,
+              "nanosec": 187314967
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -6.899999999999999,
+                  "y": 5.65,
+                  "z": 3.64
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 65,
+              "nanosec": 520648301
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -7.75,
+                  "y": 5.65,
+                  "z": 3.64
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 71,
+              "nanosec": 187314967
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -7.75,
+                  "y": 5.65,
+                  "z": 3.64
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 72,
+              "nanosec": 687314967
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "floor2_wheel_exit",
+      "message": {
+        "header": {
+          "frame_id": "world"
+        },
+        "mode": "wheel",
+        "points": [
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -7.75,
+                  "y": 5.65,
+                  "z": 3.52
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 0,
+              "nanosec": 0
+            }
+          },
+          {
+            "transforms": [
+              {
+                "translation": {
+                  "x": -8.3,
+                  "y": 5.65,
+                  "z": 3.52
+                },
+                "rotation": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "w": 6.123233995736766e-17
+                }
+              }
+            ],
+            "velocities": [],
+            "accelerations": [],
+            "time_from_start": {
+              "sec": 1,
+              "nanosec": 0
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

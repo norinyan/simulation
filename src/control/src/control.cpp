@@ -4,6 +4,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <stdexcept>
+#include <limits>
+#include <gazebo/physics/RayShape.hh>
+#include <gazebo/physics/ode/ODECollision.hh>
+#include <gazebo/physics/ode/ODERayShape.hh>
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <yaml-cpp/yaml.h>
@@ -48,6 +52,8 @@ void WheelLegControl::Load(gazebo::physics::ModelPtr model, sdf::ElementPtr sdf)
     link->SetGravityMode(false);
     link->SetKinematic(true);
   }
+  terrain_ray_ = boost::dynamic_pointer_cast<gazebo::physics::RayShape>(
+    model_->GetWorld()->Physics()->CreateShape("ray", gazebo::physics::CollisionPtr()));
   pose_ = model_->WorldPose();
   leg_ = sdf->Get<bool>("initial_leg_mode", false).first;
   ground_ = pose_.Pos().Z() - (leg_ ? cfg_.foot_height : cfg_.wheel_height);
@@ -103,22 +109,15 @@ void WheelLegControl::LoadConfig(sdf::ElementPtr sdf)
   cfg_.swing_duration = positive("foot", "swing_duration");
   cfg_.step_budget = positive("foot", "step_budget");
   cfg_.swing_lift = positive("foot", "swing_lift");
-  cfg_.stair_speed = positive("stair", "speed");
-  cfg_.stair_run = positive("stair", "run");
-  cfg_.stair_rise = positive("stair", "rise");
-  cfg_.stair_lift = positive("stair", "swing_lift");
-  cfg_.stair_first_up = positive("stair", "first_body_up");
-  cfg_.stair_first_down = positive("stair", "first_body_down");
   cfg_.mode_duration = positive(nullptr, "mode_duration");
   cfg_.feedback_period = positive(nullptr, "feedback_period");
   cfg_.position_tolerance = positive("trajectory", "position_tolerance");
   cfg_.orientation_tolerance = positive("trajectory", "orientation_tolerance");
   cfg_.geometry_tolerance = positive("trajectory", "geometry_tolerance");
   if (cfg_.wheel_lift < lower_[0] || cfg_.wheel_lift > upper_[0] ||
-    cfg_.stair_first_up > cfg_.stair_run || cfg_.stair_first_down > cfg_.stair_run ||
     cfg_.foot_height <= cfg_.wheel_height)
   {
-    throw std::runtime_error("站高、轮架位置或台阶分段位移不合法");
+    throw std::runtime_error("站高或轮架位置不合法");
   }
   RCLCPP_INFO(node_->get_logger(), "控制参数已加载：%s", path.c_str());
 }
@@ -159,18 +158,18 @@ ignition::math::Vector3d WheelLegControl::SwingFoot(
   double t, double lift)
 {
   const double top = std::max(from.Z(), to.Z()) + lift;
-  if (t < 0.25) {
+  if (t < 0.35) {
     auto result = from;
-    result.Z() += (top - from.Z()) * Smooth(t * 4.0);
+    result.Z() += (top - from.Z()) * Smooth(t / 0.35);
     return result;
   }
-  if (t < 0.75) {
-    auto result = from + (to - from) * Smooth((t - 0.25) * 2.0);
+  if (t < 0.65) {
+    auto result = from + (to - from) * Smooth((t - 0.35) / 0.30);
     result.Z() = top;
     return result;
   }
   auto result = to;
-  result.Z() = top + (to.Z() - top) * Smooth((t - 0.75) * 4.0);
+  result.Z() = top + (to.Z() - top) * Smooth((t - 0.65) / 0.35);
   return result;
 }
 
@@ -181,7 +180,9 @@ std::array<ignition::math::Vector3d, 2> WheelLegControl::GroundFeet(
   for (size_t i = 0; i < 2; ++i) {
     result[i] = body.Pos() + body.Rot().RotateVector(
       ignition::math::Vector3d(0.14, i == 0 ? 0.34 : -0.34, 0.0));
-    result[i].Z() = ground_ + 0.0175;
+    if (!Surface(result[i], body.Rot().Yaw(), body.Pos().Z() - 0.10)) {
+      result[i].Z() = std::numeric_limits<double>::quiet_NaN();
+    }
   }
   return result;
 }
@@ -191,109 +192,190 @@ bool WheelLegControl::SolveLegs()
 {
   auto next = q_;
   for (size_t i = 0; i < 2; ++i) {
-    auto p = pose_.Rot().RotateVectorReverse(feet_[i] - pose_.Pos()) -
-      ignition::math::Vector3d(0.04, i == 0 ? 0.34 : -0.34, 0.06);
-    double yaw = std::hypot(p.X(), p.Y()) < 1e-8 ? 0.0 : std::atan2(p.Y(), p.X());
-    if (yaw > M_PI_2) {yaw -= M_PI;}
-    if (yaw < -M_PI_2) {yaw += M_PI;}
-    const double x = p.X() * std::cos(yaw) + p.Y() * std::sin(yaw);
-    const double c = (x * x + p.Z() * p.Z() - 2.0 * 0.28 * 0.28) / (2.0 * 0.28 * 0.28);
-    if (c < -1.0 || c > 1.0) {return false;}
-    const double knee = -std::acos(c);
-    const double shoulder = std::atan2(-x, -p.Z()) -
-      std::atan2(0.28 * std::sin(knee), 0.28 + 0.28 * std::cos(knee));
-    const size_t j = 3 + i * 4;
-    next[j] = yaw;
-    next[j + 1] = shoulder - 1.15;
-    next[j + 2] = knee + 2.3;
-    next[j + 3] = -next[j + 1] - next[j + 2];
-    for (size_t k = j; k < j + 4; ++k) {
-      if (!std::isfinite(next[k]) || next[k] < lower_[k] || next[k] > upper_[k]) {
-        return false;
-      }
-    }
+    if (!LegAngles(pose_, feet_[i], i, next)) {return false;}
   }
   q_ = next;
   return true;
 }
 
-// 台阶动作初始化：仅由已校验的足式轨迹调用，沿用原有落足目标。
-void WheelLegControl::StartStair(bool up, double start, double duration)
+bool WheelLegControl::LegAngles(
+  const ignition::math::Pose3d & body, const ignition::math::Vector3d & foot,
+  size_t side, std::array<double, 11> & next) const
 {
-  velocity_ = geometry_msgs::msg::Twist();
-  stair_active_ = true;
-  stair_up_ = up;
-  stair_start_ = start;
-  stair_duration_ = duration;
-  stair_pose_ = pose_;
-  feet_start_ = feet_;
-  auto end = pose_;
-  end.Pos() += pose_.Rot().RotateVector(ignition::math::Vector3d(cfg_.stair_run, 0, 0));
-  feet_goal_ = GroundFeet(end);
-  for (auto & foot : feet_goal_) {foot.Z() += up ? cfg_.stair_rise : -cfg_.stair_rise;}
+  const auto p = body.Rot().RotateVectorReverse(foot - body.Pos()) -
+    ignition::math::Vector3d(0.04, side == 0 ? 0.34 : -0.34, 0.06);
+  double yaw = std::hypot(p.X(), p.Y()) < 1e-8 ? 0.0 : std::atan2(p.Y(), p.X());
+  if (yaw > M_PI_2) {yaw -= M_PI;}
+  if (yaw < -M_PI_2) {yaw += M_PI;}
+  const double x = p.X() * std::cos(yaw) + p.Y() * std::sin(yaw);
+  const double c = (x*x + p.Z()*p.Z() - 2.0*0.28*0.28) / (2.0*0.28*0.28);
+  if (c < -1.0 || c > 1.0) {return false;}
+  const double knee = -std::acos(c);
+  const double shoulder = std::atan2(-x, -p.Z()) -
+    std::atan2(0.28*std::sin(knee), 0.28 + 0.28*std::cos(knee));
+  const size_t j = 3 + side*4;
+  next[j] = yaw;
+  next[j+1] = shoulder - 1.15;
+  next[j+2] = knee + 2.3;
+  next[j+3] = -next[j+1] - next[j+2];
+  for (size_t k = j; k < j+4; ++k) {
+    if (!std::isfinite(next[k]) || next[k] < lower_[k] || next[k] > upper_[k]) {
+      return false;
+    }
+  }
+  return true;
 }
 
-// 足步控制：台阶段执行上下阶，否则按轨迹速度交替摆足。
-void WheelLegControl::Leg(double now, double dt)
+// 自上向下查询真实碰撞几何；跨楼层时射线起点在本体下方，不会选中楼上。
+bool WheelLegControl::Height(double x, double y, double ceiling, double & z) const
 {
-  const auto old_pose = pose_;
+  const auto ray = boost::dynamic_pointer_cast<gazebo::physics::ODERayShape>(terrain_ray_);
+  if (!ray) {return false;}  // 当前 World 使用 ODE。
+  ray->SetPoints({x, y, ceiling}, {x, y, ceiling - 0.9});
+  bool found = false;
+  z = ceiling - 0.9;
+  if (terrain_cache_time_ != last_time_) {
+    terrain_collisions_.clear();
+    for (const auto & model : model_->GetWorld()->Models()) {
+      if (model == model_) {continue;}
+      for (const auto & link : model->GetLinks()) {
+        for (const auto & collision : link->GetCollisions()) {
+          terrain_collisions_.emplace_back(collision, collision->BoundingBox());
+        }
+      }
+    }
+    terrain_cache_time_ = last_time_;
+  }
+  // 包围盒仅作粗筛；精确高度仍由射线与真实场景碰撞体求交得到。
+  for (const auto & entry : terrain_collisions_) {
+    const auto & box = entry.second;
+    if (x < box.Min().X() || x > box.Max().X() ||
+      y < box.Min().Y() || y > box.Max().Y() ||
+      box.Min().Z() > ceiling || box.Max().Z() < ceiling - 0.9) {continue;}
+    const auto ode = boost::dynamic_pointer_cast<gazebo::physics::ODECollision>(entry.first);
+    if (!ode) {continue;}
+    dContactGeom contact;
+    if (dCollide(ray->ODEGeomId(), ode->GetCollisionId(), 1, &contact, sizeof(contact)) > 0 &&
+      contact.pos[2] > z && contact.pos[2] <= ceiling)
+    {
+      z = contact.pos[2];
+      found = true;
+    }
+  }
+  return found;
+}
+
+// 足底中心与四角必须同高：拒绝边缘、窄支撑和斜面，不用包围盒代替碰撞体。
+bool WheelLegControl::Surface(
+  ignition::math::Vector3d & foot, double yaw, double ceiling) const
+{
+  double height;
+  if (!Height(foot.X(), foot.Y(), ceiling, height)) {return false;}
+  for (double x : {-0.0175, 0.1625}) {
+    for (double y : {-0.05, 0.05}) {
+      double corner;
+      if (!Height(foot.X() + x * std::cos(yaw) - y * std::sin(yaw),
+        foot.Y() + x * std::sin(yaw) + y * std::cos(yaw), ceiling, corner) ||
+        std::abs(corner - height) > cfg_.geometry_tolerance) {return false;}
+    }
+  }
+  foot.Z() = height + 0.0175;
+  return true;
+}
+
+bool WheelLegControl::Landing(
+  const ignition::math::Pose3d & body, size_t side, ignition::math::Vector3d & foot) const
+{
+  // 在名义落足点前后寻找完整水平支撑，优先最近位置。
+  for (int n = 0; n <= 48; ++n) {
+    const double offset = (n % 2 ? 1.0 : -1.0) * ((n + 1) / 2) * 0.01;
+    auto candidate = body.Pos() + body.Rot().RotateVector(
+      ignition::math::Vector3d(0.14 + offset, side == 0 ? 0.34 : -0.34, 0));
+    auto angles = q_;
+    if (Surface(candidate, body.Rot().Yaw(), body.Pos().Z() - 0.10) &&
+      LegAngles(body, candidate, side, angles) && LegAngles(pose_, candidate, side, angles)) {
+      foot = candidate;
+      return true;
+    }
+  }
+  return false;
+}
+
+ignition::math::Pose3d WheelLegControl::SampleTrajectory(double time) const
+{
+  for (const auto & segment : trajectory_) {
+    if (time > segment.end) {continue;}
+    const double t = std::clamp((time - segment.begin) / (segment.end - segment.begin), 0.0, 1.0);
+    const auto position = segment.from.Pos() + (segment.to.Pos() - segment.from.Pos()) * t;
+    const double yaw = segment.from.Rot().Yaw() + t * ignition::math::Angle(
+      segment.to.Rot().Yaw() - segment.from.Rot().Yaw()).Normalized().Radian();
+    return ignition::math::Pose3d(position, ignition::math::Quaterniond(0, 0, yaw));
+  }
+  return trajectory_.empty() ? pose_ : trajectory_.back().to;
+}
+
+// 足式本体已由轨迹采样推进；支撑脚不随本体滑动，左右脚自动交替摆动。
+void WheelLegControl::Leg(double now, double /*dt*/)
+{
   const auto old_feet = feet_;
-  bool finished = false;
-  if (stair_active_) {
-    const double t = std::clamp((now - stair_start_) / stair_duration_, 0.0, 1.0);
-    finished = t >= 1.0;
-    // 上下台阶子动作，仍属于足步控制；保留原有两阶段移身与跟步顺序。
-    // 先落领先足，再移身跟步；下阶时先降身。
-    const bool up = stair_up_;
-    const bool first = t < 0.5;
-    const double u = first ? t * 2.0 : (t - 0.5) * 2.0;
-    const double s = Smooth(u);
-    const double first_run = up ? cfg_.stair_first_up : cfg_.stair_first_down;
-    const double x = first ? first_run * s :
-      first_run + (cfg_.stair_run - first_run) * s;
-    const double z = up ? (first ? 0.0 : cfg_.stair_rise * s) :
-      (first ? -cfg_.stair_rise * s : -cfg_.stair_rise);
-    pose_ = stair_pose_;
-    pose_.Pos() += pose_.Rot().RotateVector(ignition::math::Vector3d(x, 0, z));
-    feet_ = feet_start_;
-    if (!first) {feet_[0] = feet_goal_[0];}
-    const size_t side = first ? 0 : 1;
-    feet_[side] = SwingFoot(feet_start_[side], feet_goal_[side], u, cfg_.stair_lift);
-  } else {
-    // 平地连续步态：使用轨迹平面段速度。
-    double v = std::clamp(velocity_.linear.x, -cfg_.foot_linear_speed, cfg_.foot_linear_speed);
-    double w = std::clamp(velocity_.angular.z, -cfg_.foot_angular_speed, cfg_.foot_angular_speed);
-    // 限制每步位移，避开髋偏航的侧向奇异位形。
-    const double scale = std::max(1.0,
-      (std::abs(v) + 0.34 * std::abs(w)) * cfg_.swing_duration / cfg_.step_budget);
-    v /= scale;
-    w /= scale;
-    MoveBody(dt, v, w);
-    if (!swing_ && (std::abs(v) > 1e-6 || std::abs(w) > 1e-6)) {
+  if (!swing_ && now >= next_foot_query_) {
+    next_foot_query_ = now + cfg_.feedback_period;
+    const double relative = now - trajectory_start_;
+    auto future = trajectory_.empty() ? pose_ : SampleTrajectory(relative + cfg_.swing_duration * 2);
+    ignition::math::Vector3d target;
+    if (!Landing(future, swing_side_, target)) {
+      FreezeMotion();
+      RCLCPP_WARN(node_->get_logger(), "无完整水平落足表面，运动已冻结");
+      return;
+    }
+    if (target.Distance(feet_[swing_side_]) > 0.015) {
+      swing_duration_ = cfg_.swing_duration + 4.5 * std::abs(target.Z() - feet_[swing_side_].Z());
+      // 高差较大时给抬落足更多时间，并重新预测落足时本体位置。
+      future = trajectory_.empty() ? pose_ : SampleTrajectory(relative + swing_duration_ * 1.5);
+      if (!Landing(future, swing_side_, target)) {FreezeMotion(); return;}
+      swing_duration_ = std::max(swing_duration_,
+        cfg_.swing_duration + 4.5 * std::abs(target.Z() - feet_[swing_side_].Z()));
       swing_ = true;
       swing_start_ = now;
       swing_from_ = feet_[swing_side_];
-      auto future = pose_;
-      MoveBody(cfg_.swing_duration, v, w);
-      swing_to_ = GroundFeet(pose_)[swing_side_];
-      pose_ = future;
+      swing_to_ = target;
+      swing_clearance_ = std::max(swing_from_.Z(), swing_to_.Z()) + cfg_.swing_lift;
+      // 沿整个足底扫过的水平路径采样，抬足高度覆盖中间障碍。
+      for (int i = 0; i <= 20; ++i) {
+        const auto p = swing_from_ + (swing_to_ - swing_from_) * (i / 20.0);
+        for (double x : {-0.0175, 0.0725, 0.1625}) {
+          double z;
+          if (Height(p.X() + x * std::cos(future.Rot().Yaw()),
+            p.Y() + x * std::sin(future.Rot().Yaw()),
+            std::max(pose_.Pos().Z(), future.Pos().Z()) - 0.10, z))
+          {
+            swing_clearance_ = std::max(swing_clearance_, z + 0.0175 + cfg_.swing_lift);
+          }
+        }
+      }
+    } else {
+      swing_side_ = 1 - swing_side_;
     }
-    if (swing_) {
-      const double t = std::clamp((now - swing_start_) / cfg_.swing_duration, 0.0, 1.0);
+  }
+  if (swing_) {
+    const double t = std::clamp((now - swing_start_) / swing_duration_, 0.0, 1.0);
+    // 平地保留原有正弦抬足；台阶采用先抬高、再平移、最后落足。
+    if (std::abs(swing_from_.Z() - swing_to_.Z()) < cfg_.geometry_tolerance &&
+      swing_clearance_ <= swing_from_.Z() + cfg_.swing_lift + 1e-6)
+    {
       feet_[swing_side_] = swing_from_ + (swing_to_ - swing_from_) * Smooth(t);
       feet_[swing_side_].Z() += cfg_.swing_lift * std::sin(M_PI * t);
-      if (t >= 1.0) {swing_ = false; swing_side_ = 1 - swing_side_;}
+    } else {
+      feet_[swing_side_] = SwingFoot(swing_from_, swing_to_, t,
+        swing_clearance_ - std::max(swing_from_.Z(), swing_to_.Z()));
     }
+    if (t >= 1.0) {swing_ = false; swing_side_ = 1 - swing_side_;}
   }
   q_[0] = cfg_.wheel_lift;
   if (!SolveLegs()) {
-    pose_ = old_pose;
     feet_ = old_feet;
     FreezeMotion();
-    RCLCPP_WARN(node_->get_logger(), "足端目标不可达，运动已停止");
-  } else if (finished) {
-    ground_ += stair_up_ ? cfg_.stair_rise : -cfg_.stair_rise;
-    stair_active_ = false;
+    RCLCPP_WARN(node_->get_logger(), "足端目标不可达，运动已冻结 body=(%.3f %.3f %.3f) feet0=(%.3f %.3f %.3f) feet1=(%.3f %.3f %.3f) swing=%zu t=%.3f/%.3f", pose_.Pos().X(),pose_.Pos().Y(),pose_.Pos().Z(), feet_[0].X(),feet_[0].Y(),feet_[0].Z(), feet_[1].X(),feet_[1].Y(),feet_[1].Z(), swing_side_,now-swing_start_,swing_duration_);
   }
 }
 
@@ -318,7 +400,12 @@ std::array<ignition::math::Vector3d, 2> WheelLegControl::FootPositions(
 // 轮足变换：静止后记录姿态，复用原有轮转足、足转轮的两阶段动作。
 bool WheelLegControl::SetMode(bool leg)
 {
-  if (switching_ || stair_active_ || swing_) {return false;}
+  if (switching_ || swing_) {return false;}
+  double terrain;
+  if (!Height(pose_.Pos().X(), pose_.Pos().Y(), pose_.Pos().Z() - 0.10, terrain)) {
+    return false;
+  }
+  ground_ = terrain;
   velocity_ = geometry_msgs::msg::Twist();
   frozen_ = false;
   switching_ = true;
@@ -366,7 +453,7 @@ void WheelLegControl::SwitchMode(double now)
     feet_ = old_feet;
     q_ = old_q;
     FreezeMotion();
-    RCLCPP_WARN(node_->get_logger(), "切换目标不可达，已保持当前姿态");
+    RCLCPP_WARN(node_->get_logger(), "切换目标不可达，已保持当前姿态 feet=(%.3f %.3f %.3f)/(%.3f %.3f %.3f), ground=%.3f", feet_[0].X(), feet_[0].Y(), feet_[0].Z(), feet_[1].X(), feet_[1].Y(), feet_[1].Z(), ground_);
   } else if (t >= 1.0) {
     leg_ = target_leg_;
     switching_ = false;
@@ -386,7 +473,6 @@ void WheelLegControl::ClearTrajectory()
 void WheelLegControl::FreezeMotion()
 {
   ClearTrajectory();
-  stair_active_ = false;
   swing_ = switching_ = false;
   frozen_ = true;
 }
@@ -400,7 +486,7 @@ void WheelLegControl::ReceiveTrajectory(const interfaces::msg::LocalTrajectory &
   const bool foot = msg.mode == "foot";
   if (msg.header.frame_id != "world") {reject("仅支持 world 坐标系"); return;}
   if (msg.points.size() < 2) {reject("至少需要两个轨迹点"); return;}
-  if (frozen_ || stair_active_ || (switching_ && target_leg_ != foot)) {
+  if (frozen_ || (switching_ && target_leg_ != foot)) {
     reject("当前动作未完成或控制已冻结（冻结后需重新生成机器人）");
     return;
   }
@@ -470,17 +556,18 @@ void WheelLegControl::ReceiveTrajectory(const interfaces::msg::LocalTrajectory &
       segment.to.Pos() - segment.from.Pos());
     const double theta = ignition::math::Angle(
       segment.to.Rot().Yaw() - segment.from.Rot().Yaw()).Normalized().Radian();
-    if (std::abs(delta.Z()) > cfg_.geometry_tolerance) {
-      // 当前只执行与场景尺寸相符的完整单阶，不把任意变高曲线解释为楼梯。
-      if (!foot || std::abs(delta.X() - cfg_.stair_run) > cfg_.geometry_tolerance ||
-        std::abs(delta.Y()) > cfg_.geometry_tolerance || std::abs(theta) > 1e-6 ||
-        std::abs(std::abs(delta.Z()) - cfg_.stair_rise) > cfg_.geometry_tolerance ||
-        duration + 1e-9 < cfg_.stair_run / cfg_.stair_speed)
+    if (foot) {
+      if (delta.Length() / duration > cfg_.foot_linear_speed + 1e-9 ||
+        std::abs(theta) / duration > cfg_.foot_angular_speed + 1e-9 ||
+        (delta.Length() + 0.34 * std::abs(theta)) / duration * cfg_.swing_duration >
+        cfg_.step_budget + 1e-9)
       {
-        reject("变高段必须为足式单阶前进，尺寸和时长须符合配置"); return;
+        reject("足式 XYZ 或 yaw 速度超限"); return;
       }
-      segment.stair = true;
     } else {
+      if (std::abs(delta.Z()) > cfg_.geometry_tolerance) {
+        reject("轮式轨迹不支持变高"); return;
+      }
       // 相邻位姿定义直线、原地转向或常曲率圆弧；保持旧 MoveBody 的非完整约束。
       const double half = theta * 0.5;
       const double lateral = -delta.X() * std::sin(half) + delta.Y() * std::cos(half);
@@ -542,23 +629,19 @@ void WheelLegControl::ExecuteTrajectory(double now, double dt)
     const auto & segment = trajectory_[trajectory_index_];
     const double begin = trajectory_start_ + segment.begin;
     const double end = trajectory_start_ + segment.end;
-    // 在浮点误差内取精确末帧，保证阶步动作完成并累计 ground_。
+    // 在浮点误差内取精确末帧。
     const double sample = now + 1e-9 >= end ? end : now;
     const double motion_dt = sample - std::max(last_time_, begin);
     if (motion_dt <= 0.0 && now < end) {return;}
-    if (!segment_started_) {
-      if (segment.stair) {
-        if (swing_) {fail("台阶前须增加保持段，等待摆足落地"); return;}
-        StartStair(segment.to.Pos().Z() > segment.from.Pos().Z(), begin, segment.end - segment.begin);
-      }
-      segment_started_ = true;
-    }
-    if (segment.stair) {
+    if (leg_) {
+      const auto previous = pose_;
+      pose_ = SampleTrajectory(sample - trajectory_start_);
       Leg(sample, std::max(0.0, motion_dt));
+      if (frozen_) {pose_ = previous;}
     } else if (motion_dt > 0.0) {
       velocity_.linear.x = segment.forward;
       velocity_.angular.z = segment.yaw_rate;
-      if (leg_) {Leg(sample, motion_dt);} else {Wheel(motion_dt);}
+      Wheel(motion_dt);
     }
     // 足步失败会冻结并清除轨迹，必须先退出，再访问当前段。
     if (frozen_) {fail("逆解或关节检查失败，请重新生成机器人"); return;}
@@ -660,6 +743,9 @@ void WheelLegControl::Update(const gazebo::common::UpdateInfo & info)
     joints_[i]->SetPosition(0, q_[i]);
   }
   if (now - last_publish_ >= cfg_.feedback_period) {
+    double support_height;
+    if (!switching_ && Height(pose_.Pos().X(), pose_.Pos().Y(),
+      pose_.Pos().Z() - 0.10, support_height)) {ground_ = support_height;}
     Publish(now, now - last_publish_, reported_pose_);
     reported_pose_ = model_->GetLink("base_link")->WorldPose();
     last_publish_ = now;

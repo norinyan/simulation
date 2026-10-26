@@ -1,0 +1,8 @@
+# Install in the container's isolated PCT environment, not over ROS packages.
+cupy-cuda12x==13.6.0
+numpy==1.24.4
+scipy>=1.8
+PyYAML>=5.4
+nvidia-cuda-runtime-cu12==12.6.77
+nvidia-cuda-nvrtc-cu12==12.6.85
+nvidia-cuda-cccl-cu12==12.6.77

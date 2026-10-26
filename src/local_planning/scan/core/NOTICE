@@ -1,0 +1,19 @@
+SCAN-Planner numerical core
+Source: https://github.com/wuyi2121/SCAN-Planner
+Upstream main commit: 348e8a5 (add: sensor layout)
+Authors: Han Zheng, Zhe Chen, Yiwen Fu, Ming Yang, Tong Qin
+License: Apache-2.0; embedded L-BFGS retains its own license header.
+
+Local adaptation for simulation_new (2026-10-26):
+- Replace ROS parameters and timing with C++ options and steady deadlines.
+- Inject a request-local static-world occupancy interface. Preserve projected
+  XY A-star guidance and locked-Z spline optimization.
+- Bound visited A-star nodes, allocate them lazily, and release search storage.
+- Replace variable-length stack arrays; support fixed endpoint control counts.
+- Observe deadlines in optimization/search and reject timed-out results.
+- Suppress routine solver console output; retain failure diagnostics.
+- Correct stale A-star priority entries on decreased cost and its initial score.
+- Follow the supplied terrain reference for projected A-star heights and endpoint
+  adjustment, preserving stair landings instead of imposing a straight Z plane.
+The upstream robot, sensors, mapping frontend, navigation FSM and controllers
+are not included.
