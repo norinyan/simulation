@@ -10,6 +10,8 @@
   <depend>rclcpp</depend>
   <depend>interfaces</depend>
   <depend>nav_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>geometry_msgs</depend>
   <depend>trajectory_msgs</depend>
   <depend>yaml-cpp</depend>

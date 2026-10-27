@@ -15,6 +15,9 @@ services:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: graphics,utility,compute,display
 
+    ports:
+      - "127.0.0.1:8000:8000"
+
     gpus: all
     shm_size: "1gb"
 

@@ -133,6 +133,32 @@ bool ScanMap::height(double x, double y, double ceiling, double depth, double & 
 }
 
 
+// Signed distance to the union of World OBBs. The nearest box supplies the
+// piecewise-smooth gradient used by SCAN's actual-curve collision objective.
+double ScanMap::signedDistance(const Eigen::Vector3d & point,Eigen::Vector3d & gradient) const
+{
+  gradient.setZero();
+  if (boxes_.empty() || !point.allFinite()) {throw std::runtime_error("SCAN_INVALID_DISTANCE_QUERY");}
+  double best=std::numeric_limits<double>::infinity();
+  for (const auto & box:boxes_) {
+    const Eigen::Vector3d broad=(point-box.maximum).cwiseMax(box.minimum-point).cwiseMax(0);
+    if (broad.squaredNorm()>0 && (best<=0 || broad.squaredNorm()>=best*best)) {continue;}
+    const Eigen::Vector3d local=box.rotation.transpose()*(point-box.center);
+    const Eigen::Vector3d delta=local.cwiseAbs()-box.half;
+    const Eigen::Vector3d outside=delta.cwiseMax(0);
+    const double length=outside.norm();
+    double value;Eigen::Vector3d direction=Eigen::Vector3d::Zero();
+    if (length>1e-12) {
+      value=length;
+      for (int i=0;i<3;++i) {direction[i]=outside[i]/length*(local[i]>=0?1:-1);}
+    } else {
+      Eigen::Index axis;value=delta.maxCoeff(&axis);direction[axis]=local[axis]>=0?1:-1;
+    }
+    if (value<best) {best=value;gradient=box.rotation*direction;}
+  }
+  return best;
+}
+
 double ScanMap::clearance(const Eigen::Vector3d & point) const
 {
   return segmentClearance(point, point);

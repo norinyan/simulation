@@ -24,6 +24,17 @@ namespace global_planning
 {
 namespace
 {
+std::string jsonString(const std::string & value)
+{
+  static const char * hex = "0123456789abcdef";
+  std::string out = "\"";
+  for (const unsigned char c : value) {
+    if (c == '"' || c == '\\') {out += '\\'; out += c;}
+    else if (c < 0x20) {out += "\\u00"; out += hex[c >> 4]; out += hex[c & 15];}
+    else {out += c;}
+  }
+  return out + "\"";
+}
 bool validPose(const geometry_msgs::msg::Pose & p)
 {
   const auto & q = p.orientation;
@@ -50,6 +61,10 @@ class GlobalNode : public rclcpp::Node
 public:
   GlobalNode() : Node("global_node")
   {
+    status_publisher_ = create_publisher<std_msgs::msg::String>(
+      "/global_planning/status", rclcpp::QoS(1).reliable().transient_local());
+    timing_publisher_ = create_publisher<std_msgs::msg::String>(
+      "/global_planning/timing", rclcpp::QoS(1).reliable().transient_local());
     publisher_ = create_publisher<interfaces::msg::GlobalPath>(
       "/global_path", rclcpp::QoS(1).reliable().transient_local());
     try {
@@ -60,6 +75,7 @@ public:
       error_ = e.what();
     }
     if (!error_.empty()) {publishFailure(error_);}
+    else {publishStatus("idle", "等待全局规划请求");}
 
     input_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     rclcpp::SubscriptionOptions options;
@@ -80,6 +96,13 @@ public:
 
 private:
   struct Pending {std::string goal; bool actual; geometry_msgs::msg::Pose start;};
+
+  void publishStatus(const std::string & state, const std::string & reason)
+  {
+    std_msgs::msg::String message;
+    message.data = "{\"state\":" + jsonString(state) + ",\"reason\":" + jsonString(reason) + "}";
+    status_publisher_->publish(message);
+  }
 
   void loadConfig()
   {
@@ -185,6 +208,7 @@ private:
     current_goal_ = goal;
     pending_ = Pending{goal, actual_start, actual_start ? *odom_ : points_.at(start_name_)};
     reason = "Planning request accepted";
+    publishStatus("planning", reason);
     return true;
   }
 
@@ -245,7 +269,17 @@ private:
   void plan(const Pending & pending)
   {
     const auto request = resolveEndpoints(pending);
-    const auto result = planner_->plan(request);
+    const auto started = std::chrono::steady_clock::now();
+    auto timing = [&](bool success) {
+      std_msgs::msg::String message;
+      message.data = "{\"elapsed_ms\":" + std::to_string(std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now()-started).count()) + ",\"success\":" + (success ? "true" : "false") + "}";
+      timing_publisher_->publish(message);
+    };
+    PlanResult result;
+    try {result = planner_->plan(request);}
+    catch (...) {timing(false); throw;}
+    timing(result.success && std::chrono::steady_clock::now() < request.deadline);
     if (std::chrono::steady_clock::now() >= request.deadline) {
       throw std::runtime_error("Global planning timeout");
     }
@@ -253,6 +287,7 @@ private:
     const auto message = buildGlobalPath(result);
     validateResult(message, request);
     publisher_->publish(message);
+    publishStatus("ready", "全局规划成功，路径已发布");
     RCLCPP_INFO(get_logger(), "Published global path: %zu points", message.points.size());
   }
 
@@ -261,6 +296,7 @@ private:
     interfaces::msg::GlobalPath empty;
     empty.header.frame_id = "world"; empty.header.stamp = now();
     publisher_->publish(empty);
+    publishStatus("failed", reason);
     RCLCPP_ERROR(get_logger(), "%s", reason.c_str());
   }
 
@@ -289,6 +325,7 @@ private:
   std::unique_ptr<GlobalPlanner> planner_;
   rclcpp::CallbackGroup::SharedPtr input_group_;
   rclcpp::Publisher<interfaces::msg::GlobalPath>::SharedPtr publisher_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_publisher_, timing_publisher_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr goal_sub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr replan_service_;

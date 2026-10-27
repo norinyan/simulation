@@ -4,6 +4,7 @@
 #include <chrono>
 #include <string>
 
+#include <geometry_msgs/msg/vector3.hpp>
 #include <interfaces/msg/global_path.hpp>
 #include <interfaces/msg/local_trajectory.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -22,6 +23,8 @@ struct LocalRequest
   interfaces::msg::GlobalPath segment;  // world 地面路径，模式仅作为地形标签。
   MotionLimits limits;
   std::chrono::steady_clock::time_point deadline;
+  geometry_msgs::msg::Vector3 acceleration;  // world；切换时刻的本体加速度。
+  interfaces::msg::LocalTrajectory warm_start;  // 已生效旧轨迹；header 是绝对仿真生效时间。
 };
 
 struct LocalResult

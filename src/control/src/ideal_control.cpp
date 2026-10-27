@@ -73,7 +73,29 @@ public:
 
 private:
   struct Gate {std::mutex mutex; bool active{true};};
-  struct Point {ignition::math::Vector3d position; double yaw{}, time{};};
+  struct Point {
+    ignition::math::Vector3d position, velocity;
+    double yaw{}, rate{}, time{};
+  };
+  struct State {ignition::math::Vector3d position, velocity; double yaw{}, rate{};};
+  static State Sample(const std::vector<Point> & points, double elapsed)
+  {
+    if (elapsed >= points.back().time) {
+      return {points.back().position, ignition::math::Vector3d::Zero, points.back().yaw, 0};
+    }
+    const auto end = std::upper_bound(points.begin(), points.end(), elapsed,
+      [](double t, const Point & p) {return t < p.time;});
+    const auto & b = *end; const auto & a = *(end - 1);
+    const double h = b.time-a.time, u = std::clamp((elapsed-a.time)/h, 0.0, 1.0);
+    const double u2=u*u, u3=u2*u;
+    const double h00=2*u3-3*u2+1, h10=u3-2*u2+u, h01=-2*u3+3*u2, h11=u3-u2;
+    const double d00=(6*u2-6*u)/h, d10=3*u2-4*u+1, d01=-d00, d11=3*u2-2*u;
+    const double delta=Angle(b.yaw-a.yaw);
+    return {h00*a.position+h*h10*a.velocity+h01*b.position+h*h11*b.velocity,
+      d00*a.position+d10*a.velocity+d01*b.position+d11*b.velocity,
+      a.yaw+h01*delta+h*h10*a.rate+h*h11*b.rate,
+      d01*delta+d10*a.rate+d11*b.rate};
+  }
   static double Angle(double value) {return std::atan2(std::sin(value), std::cos(value));}
 
   void ReceiveTrajectory(const interfaces::msg::LocalTrajectory & msg)
@@ -81,13 +103,27 @@ private:
     auto reject = [this](const char * reason) {
         RCLCPP_WARN(node_->get_logger(), "理想轨迹拒绝：%s", reason);
       };
-    if (!points_.empty()) {reject("正在执行轨迹"); return;}
+    if (!pending_.empty()) {reject("已有等待生效的轨迹"); return;}
+    const double now = model_->GetWorld()->SimTime().Double();
+    const double begin = msg.header.stamp.sec + msg.header.stamp.nanosec*1e-9;
+    if (msg.header.stamp.sec < 0 || msg.header.stamp.nanosec >= 1000000000u || begin <= now) {
+      reject("轨迹生效时间已过期"); return;
+    }
     if (msg.header.frame_id != "world" || msg.points.size() < 2) {
       reject("需要 world 坐标系及至少两个点"); return;
     }
     std::vector<Point> next;
     for (const auto & point : msg.points) {
-      if (point.transforms.size() != 1) {reject("每点需要一个变换"); return;}
+      if (point.transforms.size() != 1 || point.velocities.size() != 1 || point.accelerations.size() != 1) {
+        reject("每点需要位姿、速度和加速度"); return;
+      }
+      const auto & v = point.velocities.front(); const auto & acc = point.accelerations.front();
+      auto finite = [](const geometry_msgs::msg::Twist & value) {
+        return std::isfinite(value.linear.x) && std::isfinite(value.linear.y) && std::isfinite(value.linear.z) &&
+          std::isfinite(value.angular.x) && std::isfinite(value.angular.y) && std::isfinite(value.angular.z) &&
+          std::abs(value.angular.x) < 1e-8 && std::abs(value.angular.y) < 1e-8;
+      };
+      if (!finite(v) || !finite(acc)) {reject("运动导数格式无效"); return;}
       const auto & tr = point.transforms.front();
       const auto & p = tr.translation; const auto & q = tr.rotation;
       const double norm = std::sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
@@ -105,51 +141,49 @@ private:
       if ((next.empty() && time != 0) || (!next.empty() && time <= next.back().time)) {
         reject("时间必须从零严格递增"); return;
       }
-      next.push_back({{p.x, p.y, p.z}, rotation.Yaw(), time});
+      next.push_back({{p.x, p.y, p.z}, {v.linear.x,v.linear.y,v.linear.z}, rotation.Yaw(), v.angular.z, time});
     }
-    const auto actual = model_->WorldPose();
-    if (next.front().position.Distance(actual.Pos()) > position_tolerance_ ||
-      std::abs(Angle(next.front().yaw - actual.Rot().Yaw())) > orientation_tolerance_)
+    State expected{pose_.Pos(), ignition::math::Vector3d::Zero, pose_.Rot().Yaw(), 0};
+    if (!points_.empty()) {expected = Sample(points_, begin-start_);}
+    if (next.front().position.Distance(expected.position) > position_tolerance_ ||
+      std::abs(Angle(next.front().yaw-expected.yaw)) > orientation_tolerance_ ||
+      next.front().velocity.Distance(expected.velocity) > 1e-3 ||
+      std::abs(next.front().rate-expected.rate) > 1e-3)
     {
-      reject("首点未衔接当前位姿"); return;
+      reject("切换时刻位姿或速度不连续"); return;
     }
-    points_ = std::move(next);
-    started_ = false;
-    index_ = 1;
-    RCLCPP_INFO(node_->get_logger(), "接受理想轨迹，%zu 点，时长 %.3f s", points_.size(), points_.back().time);
+    if (next.back().velocity.Length() > 1e-6 || std::abs(next.back().rate) > 1e-6) {
+      reject("轨迹必须保留停车末端"); return;
+    }
+    pending_ = std::move(next); pending_start_ = begin;
+    RCLCPP_INFO(node_->get_logger(), "预约理想轨迹，%zu 点，生效 %.3f s", pending_.size(), begin);
   }
 
   void Update(double now)
   {
     if (now < last_time_) {
-      points_.clear();
-      started_ = false;
+      points_.clear(); pending_.clear();
       linear_.Set(0, 0, 0); angular_ = 0;
       last_publish_ = now;
     }
     if (now <= last_time_) {last_time_ = now; return;}
-    const auto previous = pose_;
+    if (!pending_.empty() && now >= pending_start_) {
+      points_ = std::move(pending_); pending_.clear(); start_ = pending_start_;
+      RCLCPP_INFO(node_->get_logger(), "理想轨迹生效，sim=%.3f", now);
+    }
+    linear_.Set(0, 0, 0); angular_ = 0;
     if (!points_.empty()) {
-      if (!started_) {start_ = now; started_ = true;}
-      const double elapsed = now - start_;
-      while (index_ + 1 < points_.size() && elapsed >= points_[index_].time) {++index_;}
-      const auto & a = points_[index_ - 1]; const auto & b = points_[index_];
-      const double fraction = std::clamp((elapsed - a.time)/(b.time - a.time), 0.0, 1.0);
-      const auto p = a.position + fraction*(b.position - a.position);
-      pose_ = ignition::math::Pose3d(p,
-        ignition::math::Quaterniond(0, 0, a.yaw + fraction*Angle(b.yaw-a.yaw)));
-      if (elapsed >= points_.back().time) {
-        points_.clear(); started_ = false;
+      const auto state = Sample(points_, now-start_);
+      pose_ = ignition::math::Pose3d(state.position, ignition::math::Quaterniond(0, 0, state.yaw));
+      linear_ = pose_.Rot().RotateVectorReverse(state.velocity); angular_ = state.rate;
+      if (now >= start_+points_.back().time) {
+        points_.clear();
         RCLCPP_INFO(node_->get_logger(), "理想轨迹执行完成");
       }
     }
     model_->SetWorldPose(pose_);
     model_->SetLinearVel(ignition::math::Vector3d::Zero);
     model_->SetAngularVel(ignition::math::Vector3d::Zero);
-    const double dt = now-last_time_;
-    linear_ = pose_.Rot().RotateVectorReverse((pose_.Pos()-previous.Pos())/dt);
-    angular_ = Angle(pose_.Rot().Yaw()-previous.Rot().Yaw())/dt;
-    if (points_.empty()) {linear_.Set(0, 0, 0); angular_ = 0;}
     if (now-last_publish_ + 1e-9 >= feedback_period_) {PublishOdometry(now); last_publish_ = now;}
     last_time_ = now;
   }
@@ -178,13 +212,11 @@ private:
   rclcpp::Subscription<interfaces::msg::LocalTrajectory>::SharedPtr subscription_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr publisher_;
   std::shared_ptr<Gate> gate_{std::make_shared<Gate>()};
-  std::vector<Point> points_;
+  std::vector<Point> points_, pending_;
   ignition::math::Pose3d pose_;
   ignition::math::Vector3d linear_;
   double feedback_period_{}, position_tolerance_{}, orientation_tolerance_{};
-  double last_time_{}, last_publish_{}, start_{}, angular_{};
-  std::size_t index_{1};
-  bool started_{false};
+  double last_time_{}, last_publish_{}, start_{}, pending_start_{}, angular_{};
 };
 GZ_REGISTER_MODEL_PLUGIN(IdealTrajectoryControl)
 }  // namespace control

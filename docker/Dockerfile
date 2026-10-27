@@ -18,9 +18,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     python3-scipy \
     python3-yaml \
+    libxcb-cursor0 \
     mesa-utils \
     x11-utils \
     && rm -rf /var/lib/apt/lists/*
+
+# HMI 后端运行于同一 ROS Python 环境。
+RUN python3 -m pip install --no-cache-dir \
+    "fastapi>=0.95,<1" "uvicorn>=0.22,<1" "websockets>=11,<16" \
+    "psutil>=5.9,<7" "PySide6==6.8.3"
 
 # 隔离 PCT 的 GPU 地图依赖，不覆盖 ROS 系统 Python。
 RUN python3 -m venv --system-site-packages /opt/pct \

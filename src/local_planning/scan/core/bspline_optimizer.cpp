@@ -8,6 +8,23 @@
 
 namespace scan_planner
 {
+  namespace
+  {
+    // A uniform cubic's derivative is contained in its derivative-control
+    // polygon. Bound distance between samples without relying on end-to-end
+    // distance (which is zero for a closed or returning trajectory).
+    int collisionSamples(const Eigen::MatrixXd & points, double interval, double resolution)
+    {
+      double speed = 0;
+      for (int i = 1; i < points.cols(); ++i)
+        speed = std::max(speed, (points.col(i)-points.col(i-1)).norm()/interval);
+      const double spans = points.cols()-3;
+      const double count = std::ceil(std::max(spans, spans*interval*speed/(resolution*0.5)));
+      if (!std::isfinite(count) || count > std::numeric_limits<int>::max())
+        throw std::runtime_error("SCAN_INVALID_COLLISION_SAMPLING");
+      return std::max(1, static_cast<int>(count));
+    }
+  }
 
   void BsplineOptimizer::setParam(const Options &options)
   {
@@ -20,6 +37,7 @@ namespace scan_planner
     lambda3_ = options.lambda_feasibility;
     lambda4_ = options.lambda_fitness;
     dist0_ = options.clearance;
+    cps_.clearance = dist0_;
     max_vel_ = options.max_velocity;
     max_acc_ = options.max_acceleration;
     order_ = 3;
@@ -71,19 +89,23 @@ namespace scan_planner
 
     /*** Segment the initial trajectory according to obstacles ***/
     constexpr int ENOUGH_INTERVAL = 2;
-    double step_size = grid_map_->getResolution() / ((init_points.col(0) - init_points.rightCols(1)).norm() / (init_points.cols() - 1)) / 2;
     int in_id = -1, out_id = -1;
     vector<std::pair<int, int>> segment_ids;
     int same_occ_state_times = ENOUGH_INTERVAL + 1;
     bool occ, last_occ = false;
     bool flag_got_start = false, flag_got_end = false, flag_got_end_maybe = false;
-    int i_end = (int)init_points.cols() - order_ - ((int)init_points.cols() - 2 * order_) / 3; // only check closed 2/3 points.
+    // Cover every free control point and its adjacent fixed boundary. The
+    // entire published trajectory, including its stopping tail, is executable.
+    const int i_end = static_cast<int>(init_points.cols())-order_;
     for (int i = order_; i <= i_end; ++i)
     {
       checkDeadline();
-      for (double a = 1.0; a >= 0.0; a -= step_size)
+      const double length = (init_points.col(i)-init_points.col(i-1)).norm();
+      const int samples = std::max(1, static_cast<int>(std::ceil(length/(grid_map_->getResolution()*0.5))));
+      for (int sample = 0; sample <= samples; ++sample)
       {
         checkDeadline();
+        const double a = 1.0-static_cast<double>(sample)/samples;
         Eigen::Vector3d sample_pt = a * init_points.col(i - 1) + (1 - a) * init_points.col(i);
         double sample_yaw = estimateSegmentYaw(init_points.col(i - 1), init_points.col(i));
         occ = grid_map_->getInflateOccupancy(sample_pt, sample_yaw);
@@ -130,6 +152,9 @@ namespace scan_planner
         }
       }
     }
+
+    if (flag_got_start && last_occ)
+      throw std::runtime_error("SCAN_TERMINAL_CONTROL_COLLISION");
 
     /*** a star search ***/
     vector<vector<Eigen::Vector3d>> a_star_paths;
@@ -453,6 +478,57 @@ namespace scan_planner
     }
   }
 
+  void BsplineOptimizer::addCurveDistanceCost(const Eigen::MatrixXd &q, double &cost,
+                                               Eigen::MatrixXd &gradient)
+  {
+    // Optimize the same cubic curve that is published and executed. A safe
+    // control polygon can still cut inside an obstacle at a rounded corner.
+    // Keep parameter samples fixed throughout each line search, so the cost
+    // and its chain-rule gradient describe the same objective function.
+    constexpr int subdivisions = 4;
+    const double clearance = cps_.clearance;
+    for (int span = 0; span+3 < q.cols(); ++span)
+    {
+      for (int sample = 0; sample <= subdivisions; ++sample)
+      {
+        checkDeadline();
+        const double u = static_cast<double>(sample)/subdivisions;
+        const double u2 = u*u, u3 = u2*u;
+        const double basis[4] = {
+          (1-3*u+3*u2-u3)/6, (4-6*u2+3*u3)/6,
+          (1+3*u+3*u2-3*u3)/6, u3/6};
+        Eigen::Vector3d position = Eigen::Vector3d::Zero();
+        for (int j = 0; j < 4; ++j) position += basis[j]*q.col(span+j);
+        Eigen::Vector3d distance_gradient;
+        const double distance = grid_map_->signedDistance(position, distance_gradient);
+        if (!std::isfinite(distance) || !distance_gradient.allFinite())
+          throw std::runtime_error("SCAN_INVALID_DISTANCE_GRADIENT");
+        const double error = clearance-distance;
+        if (error <= 0) continue;
+        // The continued cubic penalty has units of distance cubed, whereas
+        // smoothness uses squared distances. Normalize by the configured
+        // clearance so equal weights do not suppress collision corrections
+        // simply because the map is expressed in metres.
+        const double weight = (sample == 0 || sample == subdivisions ? 0.5 : 1.0)/
+          (subdivisions*clearance);
+        double value, derivative;
+        if (error < clearance)
+        {
+          value = error*error*error;
+          derivative = 3*error*error;
+        }
+        else
+        {
+          value = 3*clearance*error*error-3*clearance*clearance*error+clearance*clearance*clearance;
+          derivative = 6*clearance*error-3*clearance*clearance;
+        }
+        cost += weight*value;
+        for (int j = 0; j < 4; ++j)
+          gradient.col(span+j) -= weight*derivative*basis[j]*distance_gradient;
+      }
+    }
+  }
+
   void BsplineOptimizer::calcFitnessCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient)
   {
 
@@ -461,12 +537,15 @@ namespace scan_planner
     int end_idx = q.cols() - order_;
 
     // def: f = |x*v|^2/a^2 + |x×v|^2/b^2
-    double a2 = 25, b2 = 1;
+    double b2 = 1;
     for (auto i = order_ - 1; i < end_idx + 1; ++i)
     {
       checkDeadline();
       Eigen::Vector3d x = (q.col(i - 1) + 4 * q.col(i) + q.col(i + 1)) / 6.0 - ref_pts_[i - 1];
       Eigen::Vector3d v = (ref_pts_[i] - ref_pts_[i - 2]).normalized();
+      // Sliding along an inclined reference while freezing Z would no longer
+      // follow the terrain. Only flat spans permit the upstream tangent slack.
+      const double a2 = std::abs(v.z())>1e-6 ? 1.0 : 25.0;
 
       double xdotv = x.dot(v);
       Eigen::Vector3d xcrossv = x.cross(v);
@@ -741,14 +820,14 @@ namespace scan_planner
 
   bool BsplineOptimizer::check_collision_and_rebound(void)
   {
-
+    bool added_direction = false;
     int end_idx = cps_.size - order_;
 
     /*** Check and segment the initial trajectory according to obstacles ***/
     int in_id, out_id;
     vector<std::pair<int, int>> segment_ids;
     bool flag_new_obs_valid = false;
-    int i_end = end_idx - (end_idx - order_) / 3;
+    const int i_end = end_idx;
     for (int i = order_ - 1; i <= i_end; ++i)
     {
       checkDeadline();
@@ -927,6 +1006,7 @@ namespace scan_planner
                     a += grid_map_->getResolution();
                   cps_.base_point[j].push_back((a / length) * intersection_point + (1 - a / length) * cps_.points.col(j));
                   cps_.direction[j].push_back((intersection_point - cps_.points.col(j)).normalized());
+                  added_direction = true;
                   break;
                 }
               }
@@ -959,8 +1039,15 @@ namespace scan_planner
           std::fprintf(stderr, "SCAN: Failed to generate direction. It doesn't matter.");
       }
 
-      force_stop_type_ = STOP_FOR_REBOUND;
-      return true;
+      // Cancel L-BFGS only when its objective actually changed. A virtual
+      // control-point collision may yield no usable A* direction; restarting
+      // the identical objective would just repeat the same cancellation.
+      // Continue optimizing the curve; full-curve safety is still checked.
+      if (added_direction)
+      {
+        force_stop_type_ = STOP_FOR_REBOUND;
+        return true;
+      }
     }
 
     return false;
@@ -990,6 +1077,20 @@ namespace scan_planner
     return flag_success;
   }
 
+  void BsplineOptimizer::copyToSolver(double *variables) const
+  {
+    for (int i = 0; i < variable_num_/3; ++i)
+      for (int axis = 0; axis < 3; ++axis)
+        variables[3*i+axis] = cps_.points(axis, options_.fixed_boundary_points+i)-solver_origin_[axis];
+  }
+
+  void BsplineOptimizer::copyFromSolver(const double *variables)
+  {
+    for (int i = 0; i < variable_num_/3; ++i)
+      for (int axis = 0; axis < 3; ++axis)
+        cps_.points(axis, options_.fixed_boundary_points+i) = variables[3*i+axis]+solver_origin_[axis];
+  }
+
   bool BsplineOptimizer::rebound_optimize()
   {
     iter_num_ = 0;
@@ -997,6 +1098,10 @@ namespace scan_planner
     int end_id = this->cps_.size - options_.fixed_boundary_points;
     variable_num_ = 3 * (end_id - start_id);
     if (variable_num_ <= 0) throw std::invalid_argument("SCAN_TOO_FEW_CONTROL_POINTS");
+    // L-BFGS normalizes its gradient tolerance by ||x||. Use coordinates
+    // relative to the fixed initial pose so changing the world origin cannot
+    // change convergence. Costs still query the actual world geometry.
+    solver_origin_ = (cps_.points.col(0)+4*cps_.points.col(1)+cps_.points.col(2))/6;
     double final_cost;
 
     int restart_nums = 0, rebound_times = 0;
@@ -1016,19 +1121,19 @@ namespace scan_planner
 
       std::vector<double> storage(variable_num_);
       double *q = storage.data();
-      memcpy(q, cps_.points.data() + 3 * start_id, variable_num_ * sizeof(q[0]));
+      copyToSolver(q);
 
       lbfgs::lbfgs_parameter_t lbfgs_params;
       lbfgs::lbfgs_load_default_parameters(&lbfgs_params);
       lbfgs_params.mem_size = 16;
       lbfgs_params.max_iterations = options_.max_iterations;
-      lbfgs_params.g_epsilon = 0.01;
+      // Keep the library default gradient precision (1e-5).
 
       /* ---------- optimize ---------- */
 
       int result = lbfgs::lbfgs_optimize(variable_num_, q, &final_cost, BsplineOptimizer::costFunctionRebound, NULL, BsplineOptimizer::earlyExit, this, &lbfgs_params);
       checkDeadline();
-      memcpy(cps_.points.data() + 3 * start_id, q, variable_num_ * sizeof(q[0]));
+      copyFromSolver(q);
 
 
 
@@ -1044,10 +1149,12 @@ namespace scan_planner
         UniformBspline traj = UniformBspline(cps_.points, 3, bspline_interval_);
         double tm, tmp;
         traj.getTimeSpan(tm, tmp);
-        double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution());
-        for (double t = tm; t < tmp * 2 / 3; t += t_step) // Only check the closest 2/3 partition of the whole trajectory.
+        const int samples = collisionSamples(cps_.points, bspline_interval_, grid_map_->getResolution());
+        const double t_step = (tmp-tm)/samples;
+        for (int sample = 0; sample <= samples; ++sample)
         {
           checkDeadline();
+          const double t = tm+(tmp-tm)*sample/samples;
           Eigen::Vector3d pos = traj.evaluateDeBoorT(t);
           Eigen::Vector3d pos_next = traj.evaluateDeBoorT(std::min(t + t_step, tmp));
           flag_occ = grid_map_->getInflateOccupancy(pos, estimateSegmentYaw(pos, pos_next));
@@ -1107,28 +1214,30 @@ namespace scan_planner
     int end_id = this->cps_.points.cols() - options_.fixed_boundary_points;
     variable_num_ = 3 * (end_id - start_id);
     if (variable_num_ <= 0) throw std::invalid_argument("SCAN_TOO_FEW_CONTROL_POINTS");
+    solver_origin_ = (cps_.points.col(0)+4*cps_.points.col(1)+cps_.points.col(2))/6;
 
     std::vector<double> storage(variable_num_);
     double *q = storage.data();
     double final_cost;
 
-    memcpy(q, cps_.points.data() + 3 * start_id, variable_num_ * sizeof(q[0]));
+    copyToSolver(q);
 
-    double origin_lambda4 = lambda4_;
+    const double origin_lambda2 = lambda2_;
     bool flag_safe = true;
     int iter_count = 0;
     do
     {
       checkDeadline();
+      flag_safe = true;
       lbfgs::lbfgs_parameter_t lbfgs_params;
       lbfgs::lbfgs_load_default_parameters(&lbfgs_params);
       lbfgs_params.mem_size = 16;
       lbfgs_params.max_iterations = options_.max_iterations;
-      lbfgs_params.g_epsilon = 0.001;
+      // Same default precision and local-coordinate contract as rebound.
 
       int result = lbfgs::lbfgs_optimize(variable_num_, q, &final_cost, BsplineOptimizer::costFunctionRefine, NULL, BsplineOptimizer::earlyExit, this, &lbfgs_params);
       checkDeadline();
-      memcpy(cps_.points.data() + 3 * start_id, q, variable_num_ * sizeof(q[0]));
+      copyFromSolver(q);
       if (result == lbfgs::LBFGS_CONVERGENCE ||
           result == lbfgs::LBFGSERR_MAXIMUMITERATION ||
           result == lbfgs::LBFGS_ALREADY_MINIMIZED ||
@@ -1139,15 +1248,19 @@ namespace scan_planner
       else
       {
         std::fprintf(stderr, "SCAN: Solver error in refining!, return = %d, %s", result, lbfgs::lbfgs_strerror(result));
+        lambda2_ = origin_lambda2;
+        return false;
       }
 
       UniformBspline traj = UniformBspline(cps_.points, 3, bspline_interval_);
       double tm, tmp;
       traj.getTimeSpan(tm, tmp);
-      double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution()); // Step size is defined as the maximum size that can passes through every grid.
-      for (double t = tm; t < tmp * 2 / 3; t += t_step)
+      const int samples = collisionSamples(cps_.points, bspline_interval_, grid_map_->getResolution());
+      const double t_step = (tmp-tm)/samples;
+      for (int sample = 0; sample <= samples; ++sample)
       {
         checkDeadline();
+        const double t = tm+(tmp-tm)*sample/samples;
         Eigen::Vector3d pos = traj.evaluateDeBoorT(t);
         Eigen::Vector3d pos_next = traj.evaluateDeBoorT(std::min(t + t_step, tmp));
         if (grid_map_->getInflateOccupancy(pos, estimateSegmentYaw(pos, pos_next)))
@@ -1167,12 +1280,12 @@ namespace scan_planner
       }
 
       if (!flag_safe)
-        lambda4_ *= 2;
+        lambda2_ *= 2;
 
       iter_count++;
-    } while (!flag_safe && iter_count <= 0);
+    } while (!flag_safe && iter_count < 3);
 
-    lambda4_ = origin_lambda4;
+    lambda2_ = origin_lambda2;
 
     //cout << "iter_num_=" << iter_num_ << endl;
 
@@ -1182,24 +1295,27 @@ namespace scan_planner
   void BsplineOptimizer::combineCostRebound(const double *x, double *grad, double &f_combine, const int n)
   {
 
-    memcpy(cps_.points.data() + 3 * options_.fixed_boundary_points, x, n * sizeof(x[0]));
+    copyFromSolver(x);
 
     /* ---------- evaluate cost and gradient ---------- */
-    double f_smoothness, f_distance, f_feasibility;
+    double f_smoothness, f_distance, f_feasibility, f_fitness=0;
 
     Eigen::MatrixXd g_smoothness = Eigen::MatrixXd::Zero(3, cps_.size);
     Eigen::MatrixXd g_distance = Eigen::MatrixXd::Zero(3, cps_.size);
     Eigen::MatrixXd g_feasibility = Eigen::MatrixXd::Zero(3, cps_.size);
+    Eigen::MatrixXd g_fitness = Eigen::MatrixXd::Zero(3, cps_.size);
 
     calcSmoothnessCost(cps_.points, f_smoothness, g_smoothness);
     calcDistanceCostRebound(cps_.points, f_distance, g_distance, iter_num_, f_smoothness);
+    addCurveDistanceCost(cps_.points, f_distance, g_distance);
     calcFeasibilityCost(cps_.points, f_feasibility, g_feasibility);
+    if (!ref_pts_.empty()) {calcFitnessCost(cps_.points, f_fitness, g_fitness);}
 
-    f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility;
+    f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility + lambda4_ * f_fitness;
     //printf("origin %f %f %f %f\n", f_smoothness, f_distance, f_feasibility, f_combine);
 
     Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance +
-                              lambda3_ * g_feasibility;
+                              lambda3_ * g_feasibility + lambda4_ * g_fitness;
     grad_3D.row(2).setZero();
     memcpy(grad, grad_3D.data() + 3 * options_.fixed_boundary_points, n * sizeof(grad[0]));
   }
@@ -1207,27 +1323,29 @@ namespace scan_planner
   void BsplineOptimizer::combineCostRefine(const double *x, double *grad, double &f_combine, const int n)
   {
 
-    memcpy(cps_.points.data() + 3 * options_.fixed_boundary_points, x, n * sizeof(x[0]));
+    copyFromSolver(x);
 
     /* ---------- evaluate cost and gradient ---------- */
-    double f_smoothness, f_fitness, f_feasibility;
+    double f_smoothness, f_fitness, f_feasibility, f_distance = 0;
 
     Eigen::MatrixXd g_smoothness = Eigen::MatrixXd::Zero(3, cps_.points.cols());
     Eigen::MatrixXd g_fitness = Eigen::MatrixXd::Zero(3, cps_.points.cols());
+    Eigen::MatrixXd g_distance = Eigen::MatrixXd::Zero(3, cps_.points.cols());
     Eigen::MatrixXd g_feasibility = Eigen::MatrixXd::Zero(3, cps_.points.cols());
 
     //time_satrt = ros::Time::now();
 
     calcSmoothnessCost(cps_.points, f_smoothness, g_smoothness);
     calcFitnessCost(cps_.points, f_fitness, g_fitness);
+    addCurveDistanceCost(cps_.points, f_distance, g_distance);
     calcFeasibilityCost(cps_.points, f_feasibility, g_feasibility);
 
     /* ---------- convert to solver format...---------- */
-    f_combine = lambda1_ * f_smoothness + lambda4_ * f_fitness + lambda3_ * f_feasibility;
+    f_combine = lambda1_ * f_smoothness + lambda4_ * f_fitness + lambda3_ * f_feasibility + lambda2_ * f_distance;
     // printf("origin %f %f %f %f\n", f_smoothness, f_fitness, f_feasibility, f_combine);
 
     Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + lambda4_ * g_fitness +
-                              lambda3_ * g_feasibility;
+                              lambda3_ * g_feasibility + lambda2_ * g_distance;
     grad_3D.row(2).setZero();
     memcpy(grad, grad_3D.data() + 3 * options_.fixed_boundary_points, n * sizeof(grad[0]));
   }

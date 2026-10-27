@@ -8,6 +8,7 @@ namespace local_planning {
 class ScanMap {
 public:
   void load(const std::string & filename);
+  double signedDistance(const Eigen::Vector3d & point, Eigen::Vector3d & gradient) const;
   double clearance(const Eigen::Vector3d & point) const;
   double segmentClearance(const Eigen::Vector3d & from,const Eigen::Vector3d & to) const;
   bool height(double x,double y,double ceiling,double depth,double & z) const;

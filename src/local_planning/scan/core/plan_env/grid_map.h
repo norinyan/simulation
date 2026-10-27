@@ -9,5 +9,7 @@ public:
   virtual ~GridMap() = default;
   virtual double getResolution() const = 0;
   virtual int getInflateOccupancy(const Eigen::Vector3d &position, double yaw) const = 0;
+  // Signed distance to actual geometry and its world-coordinate gradient.
+  virtual double signedDistance(const Eigen::Vector3d &position, Eigen::Vector3d &gradient) const = 0;
   virtual bool expired() const = 0;
 };

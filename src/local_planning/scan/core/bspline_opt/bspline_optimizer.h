@@ -127,6 +127,9 @@ namespace scan_planner
     double dist0_;             // safe distance
     double max_vel_, max_acc_; // dynamic limits
 
+    Eigen::Vector3d solver_origin_{Eigen::Vector3d::Zero()};
+    void copyToSolver(double *variables) const;
+    void copyFromSolver(const double *variables);
     int variable_num_;              // optimization variables
     int iter_num_;                  // iteration of the solver
     Eigen::VectorXd best_variable_; //
@@ -146,6 +149,7 @@ namespace scan_planner
     void calcFeasibilityCost(const Eigen::MatrixXd &q, double &cost,
                              Eigen::MatrixXd &gradient);
     void calcDistanceCostRebound(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient, int iter_num, double smoothness_cost);
+    void addCurveDistanceCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
     void calcFitnessCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
     bool check_collision_and_rebound(void);
     double estimateSegmentYaw(const Eigen::Vector3d &from, const Eigen::Vector3d &to) const;
