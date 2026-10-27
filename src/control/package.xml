@@ -2,7 +2,7 @@
 <package format="3">
   <name>control</name>
   <version>0.0.0</version>
-  <description>Wheel-leg robot model and ideal kinematic Gazebo control.</description>
+  <description>Ideal point-trajectory Gazebo execution and visualization.</description>
   <maintainer email="norin@example.com">Norin</maintainer>
   <license>TODO</license>
 
@@ -15,7 +15,6 @@
   <depend>rclcpp</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
-  <depend>sensor_msgs</depend>
   <depend>trajectory_msgs</depend>
   <depend>yaml-cpp</depend>
 

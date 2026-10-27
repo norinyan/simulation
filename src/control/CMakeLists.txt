@@ -9,22 +9,21 @@ find_package(interfaces REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
-find_package(sensor_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
-add_library(wheel_leg_control SHARED src/control.cpp)
-target_compile_features(wheel_leg_control PUBLIC cxx_std_17)
-target_compile_options(wheel_leg_control PRIVATE -Wall -Wextra -Wpedantic)
-target_include_directories(wheel_leg_control PRIVATE include ${GAZEBO_INCLUDE_DIRS})
-target_link_directories(wheel_leg_control PRIVATE ${GAZEBO_LIBRARY_DIRS})
-target_link_libraries(wheel_leg_control ${GAZEBO_LIBRARIES} yaml-cpp)
-ament_target_dependencies(wheel_leg_control
-  ament_index_cpp gazebo_ros interfaces rclcpp geometry_msgs nav_msgs sensor_msgs
+add_library(ideal_trajectory_control SHARED src/ideal_control.cpp)
+target_compile_features(ideal_trajectory_control PUBLIC cxx_std_17)
+target_compile_options(ideal_trajectory_control PRIVATE -Wall -Wextra -Wpedantic)
+target_include_directories(ideal_trajectory_control PRIVATE ${GAZEBO_INCLUDE_DIRS})
+target_link_directories(ideal_trajectory_control PRIVATE ${GAZEBO_LIBRARY_DIRS})
+target_link_libraries(ideal_trajectory_control ${GAZEBO_LIBRARIES} yaml-cpp)
+ament_target_dependencies(ideal_trajectory_control
+  ament_index_cpp gazebo_ros interfaces rclcpp geometry_msgs nav_msgs
   trajectory_msgs
 )
 
-install(TARGETS wheel_leg_control LIBRARY DESTINATION lib)
+install(TARGETS ideal_trajectory_control LIBRARY DESTINATION lib)
 
 install(DIRECTORY urdf config
   DESTINATION share/${PROJECT_NAME}

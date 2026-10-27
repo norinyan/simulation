@@ -12,16 +12,14 @@ namespace local_planning
 {
 struct MotionLimits
 {
-  double wheel_speed{}, wheel_yaw_rate{}, wheel_height{};
-  double foot_speed{}, foot_yaw_rate{}, foot_height{};
-  double swing_duration{}, step_budget{}, stair_run{}, stair_rise{};
-  double position_tolerance{}, orientation_tolerance{}, geometry_tolerance{};
+  double speed{}, yaw_rate{}, acceleration{}, reference_height{};
+  double position_tolerance{}, orientation_tolerance{};
 };
 
 struct LocalRequest
 {
   nav_msgs::msg::Odometry state;
-  interfaces::msg::GlobalPath segment;  // world 地面路径，仅包含一种模式。
+  interfaces::msg::GlobalPath segment;  // world 地面路径，模式仅作为地形标签。
   MotionLimits limits;
   std::chrono::steady_clock::time_point deadline;
 };

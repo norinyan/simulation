@@ -39,7 +39,7 @@ private:
     double wheel_linear_speed{}, wheel_angular_speed{}, wheel_height{};
     // 足步控制：平地步态和上下台阶。
     double foot_linear_speed{}, foot_angular_speed{}, foot_height{}, wheel_lift{};
-    double swing_duration{}, step_budget{}, swing_lift{};
+    double swing_duration{}, step_budget{}, swing_lift{}, obstacle_clearance{};
     // 轮足变换与状态反馈周期。
     double mode_duration{}, feedback_period{};
     // 轨迹起终点衔接与当前运动能力的匹配容差。
@@ -72,6 +72,10 @@ private:
   // 射线查询只在 Gazebo 更新线程使用，排除机器人自身碰撞体。
   bool Height(double x, double y, double ceiling, double & z) const;
   bool Surface(ignition::math::Vector3d & foot, double yaw, double ceiling) const;
+  bool FootClearance(const ignition::math::Pose3d & body,
+    const ignition::math::Vector3d & foot, size_t side,
+    const std::array<double, 11> & angles,
+    const std::array<double, 2> & support_heights) const;
   bool Landing(const ignition::math::Pose3d & body, size_t side,
     ignition::math::Vector3d & foot) const;
   ignition::math::Pose3d SampleTrajectory(double time) const;

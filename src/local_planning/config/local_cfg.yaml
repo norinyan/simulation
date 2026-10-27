@@ -1,19 +1,21 @@
-algorithm: scan                 # teb / ego / scan / mppi；当前仅接入 scan
+algorithm: scan
 map_file: /workspace/src/sim_bringup/worlds/three_floor.world
-planning_range: 2.0             # 轮式局部段的最大参考弧长，m；不拆分完整单阶动作
-planning_timeout: 5.0           # 秒；拒绝超时结果，不强制终止后端
-control_config: ""             # 空值读取 control 包安装目录中的 config/control.yaml
-odom_timeout: 1.0               # 最近一次有效里程计的墙钟接收超时，秒
+ideal_config: ""                # 空值读取 control/config/ideal.yaml
+planning_range: 2.0             # 当前局部段最大参考弧长，m
+segment_heading_change: 0.7853981633974483 # 相对段首方向最多45°；PCT八邻域的一个方向间隔
+planning_timeout: 5.0           # 墙钟秒
+odom_timeout: 1.0               # 墙钟接收超时；不用于轨迹执行计时
+linear_speed: 0.8               # 通用三维速度上限，m/s
+angular_speed: 1.0              # yaw速度上限，rad/s
+max_acceleration: 0.8           # 三维加速度上限，m/s²
+point_clearance: 0.05           # 点轨迹到World障碍的最小距离，m
 
 scan:
-  resolution: 0.05              # 静态几何查询及 A* 分辨率，m
-  control_spacing: 0.10         # 采样上限；足式还取 min(足长/3, 踏深/3)，当前为0.06m
-  sample_dt: 0.05               # 样条采样间隔；执行时间按控制约束放慢，s
-  max_acceleration: 0.5         # SCAN 优化参数，m/s²
-  clearance: 0.10               # 优化避障代价距离，m
+  resolution: 0.05
+  control_spacing: 0.10
+  sample_dt: 0.05
+  clearance: 0.10               # 优化器避障代价距离，m
   smooth_weight: 1.0
   collision_weight: 1.0
   feasibility_weight: 1.0
   iterations: 200
-  robot_file: ""                # 空值使用 control 包的 robot.urdf，几何与关节限位从模型读取
-  safety_margin: 0.05            # 部件外形到非支撑障碍的欧氏距离，m；合法接地不要求悬空5cm

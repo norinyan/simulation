@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <limits>
 #include <gazebo/physics/RayShape.hh>
+#include <gazebo/physics/BoxShape.hh>
+#include <gazebo/physics/PlaneShape.hh>
 #include <gazebo/physics/ode/ODECollision.hh>
 #include <gazebo/physics/ode/ODERayShape.hh>
 
@@ -14,6 +16,57 @@
 
 namespace control
 {
+namespace
+{
+using V3 = ignition::math::Vector3d;
+struct OBB {V3 center, half; std::array<V3,3> axis;};
+double SegmentDistance(const V3 & a, const V3 & b, const V3 & c, const V3 & d)
+{
+  const V3 u=b-a,v=d-c,w=a-c;
+  const double aa=u.Dot(u),bb=u.Dot(v),cc=v.Dot(v),dd=u.Dot(w),ee=v.Dot(w);
+  const double denominator=aa*cc-bb*bb;
+  double t=denominator>1e-18?std::clamp((bb*ee-cc*dd)/denominator,0.0,1.0):0.0;
+  double r=(bb*t+ee)/cc;
+  if(r<0){r=0;t=std::clamp(-dd/aa,0.0,1.0);}
+  else if(r>1){r=1;t=std::clamp((bb-dd)/aa,0.0,1.0);}
+  return (w+t*u-r*v).SquaredLength();
+}
+double BoxDistance(const OBB & a, const OBB & b)
+{
+  const V3 delta=b.center-a.center;
+  auto separated=[&](const V3 & axis){
+    if(axis.SquaredLength()<1e-18){return false;}
+    double ar=0,br=0;
+    for(int j=0;j<3;++j){ar+=std::abs(a.axis[j].Dot(axis))*a.half[j];br+=std::abs(b.axis[j].Dot(axis))*b.half[j];}
+    return std::abs(axis.Dot(delta))>ar+br+1e-9;
+  };
+  bool apart=false;
+  for(int j=0;j<3&&!apart;++j){apart=separated(a.axis[j])||separated(b.axis[j]);}
+  for(int j=0;j<3&&!apart;++j){for(int k=0;k<3&&!apart;++k){apart=separated(a.axis[j].Cross(b.axis[k]));}}
+  if(!apart){return 0;}
+  std::array<V3,8> av,bv;double best=std::numeric_limits<double>::infinity();
+  auto pointDistance=[](const V3 & p,const OBB & box){
+    double value=0;
+    for(int j=0;j<3;++j){const double d=std::max(0.0,std::abs((p-box.center).Dot(box.axis[j]))-box.half[j]);value+=d*d;}
+    return value;
+  };
+  for(int i=0;i<8;++i){
+    av[i]=a.center;bv[i]=b.center;
+    for(int j=0;j<3;++j){const double sign=(i&(1<<j))?1:-1;av[i]+=sign*a.half[j]*a.axis[j];bv[i]+=sign*b.half[j]*b.axis[j];}
+    best=std::min({best,pointDistance(av[i],b),pointDistance(bv[i],a)});
+  }
+  for(int i=0;i<8;++i){for(int j=0;j<3;++j){if(i&(1<<j)){continue;}
+    for(int k=0;k<8;++k){for(int l=0;l<3;++l){if(!(k&(1<<l))){best=std::min(best,SegmentDistance(av[i],av[i|(1<<j)],bv[k],bv[k|(1<<l)]));}}}
+  }
+  }
+  return std::sqrt(best);
+}
+OBB MakeBox(const ignition::math::Pose3d & pose,const V3 & half)
+{
+  return {pose.Pos(),half,{pose.Rot().RotateVector(V3::UnitX),pose.Rot().RotateVector(V3::UnitY),pose.Rot().RotateVector(V3::UnitZ)}};
+}
+}  // namespace
+
 // 插件生命周期与接口接入：加载模型、参数和轨迹订阅。
 WheelLegControl::~WheelLegControl()
 {
@@ -109,6 +162,7 @@ void WheelLegControl::LoadConfig(sdf::ElementPtr sdf)
   cfg_.swing_duration = positive("foot", "swing_duration");
   cfg_.step_budget = positive("foot", "step_budget");
   cfg_.swing_lift = positive("foot", "swing_lift");
+  cfg_.obstacle_clearance = positive("foot", "obstacle_clearance");
   cfg_.mode_duration = positive(nullptr, "mode_duration");
   cfg_.feedback_period = positive(nullptr, "feedback_period");
   cfg_.position_tolerance = positive("trajectory", "position_tolerance");
@@ -204,25 +258,37 @@ bool WheelLegControl::LegAngles(
 {
   const auto p = body.Rot().RotateVectorReverse(foot - body.Pos()) -
     ignition::math::Vector3d(0.04, side == 0 ? 0.34 : -0.34, 0.06);
-  double yaw = std::hypot(p.X(), p.Y()) < 1e-8 ? 0.0 : std::atan2(p.Y(), p.X());
-  if (yaw > M_PI_2) {yaw -= M_PI;}
-  if (yaw < -M_PI_2) {yaw += M_PI;}
-  const double x = p.X() * std::cos(yaw) + p.Y() * std::sin(yaw);
-  const double c = (x*x + p.Z()*p.Z() - 2.0*0.28*0.28) / (2.0*0.28*0.28);
-  if (c < -1.0 || c > 1.0) {return false;}
-  const double knee = -std::acos(c);
-  const double shoulder = std::atan2(-x, -p.Z()) -
-    std::atan2(0.28*std::sin(knee), 0.28 + 0.28*std::cos(knee));
   const size_t j = 3 + side*4;
-  next[j] = yaw;
-  next[j+1] = shoulder - 1.15;
-  next[j+2] = knee + 2.3;
-  next[j+3] = -next[j+1] - next[j+2];
-  for (size_t k = j; k < j+4; ++k) {
-    if (!std::isfinite(next[k]) || next[k] < lower_[k] || next[k] > upper_[k]) {
-      return false;
+  const double azimuth = std::hypot(p.X(), p.Y()) < 1e-8 ? next[j] :
+    std::atan2(p.Y(), p.X());
+  const auto reference = next;
+  double best = std::numeric_limits<double>::infinity();
+  std::array<double, 11> result = next;
+  for (int branch = -1; branch <= 1; ++branch) {
+    const double heading = azimuth + branch*M_PI;
+    if (heading < lower_[j] || heading > upper_[j]) {continue;}
+    const double x = p.X()*std::cos(heading) + p.Y()*std::sin(heading);
+    const double c = (x*x + p.Z()*p.Z() - 2.0*0.28*0.28)/(2.0*0.28*0.28);
+    if (c < -1.0 || c > 1.0) {continue;}
+    {
+      const double knee = -std::acos(c);
+      const double shoulder = std::atan2(-x, -p.Z()) -
+        std::atan2(0.28*std::sin(knee), 0.28 + 0.28*std::cos(knee));
+      auto candidate = reference;
+      candidate[j] = heading; candidate[j+1] = shoulder - 1.15;
+      candidate[j+2] = knee + 2.3;
+      candidate[j+3] = -candidate[j+1] - candidate[j+2];
+      bool valid = true; double distance = 0.0;
+      for (size_t k = j; k < j+4; ++k) {
+        valid = valid && std::isfinite(candidate[k]) &&
+          candidate[k] >= lower_[k] && candidate[k] <= upper_[k];
+        distance += (candidate[k]-reference[k])*(candidate[k]-reference[k]);
+      }
+      if (valid && distance < best) {best = distance; result = candidate;}
     }
   }
+  if (!std::isfinite(best)) {return false;}
+  next = result;
   return true;
 }
 
@@ -283,6 +349,53 @@ bool WheelLegControl::Surface(
   return true;
 }
 
+bool WheelLegControl::FootClearance(const ignition::math::Pose3d & body,
+  const ignition::math::Vector3d & foot, size_t side,
+  const std::array<double, 11> & angles,
+  const std::array<double, 2> & support_heights) const
+{
+  const auto link=model_->GetLink(side==0?"left_foot":"right_foot");
+  if(!link){return false;}
+  const ignition::math::Pose3d foot_pose(foot,
+    ignition::math::Quaterniond(0,0,body.Rot().Yaw()+angles[3+side*4]));
+  for(const auto & collision:link->GetCollisions()){
+    const auto shape=boost::dynamic_pointer_cast<gazebo::physics::BoxShape>(collision->GetShape());
+    if(!shape){return false;}
+    const OBB part=MakeBox(foot_pose*collision->RelativePose(),shape->Size()*.5);
+    V3 extent;
+    for(int j=0;j<3;++j){for(int k=0;k<3;++k){extent[k]+=std::abs(part.axis[j][k])*part.half[j];}}
+    const V3 minimum=part.center-extent,maximum=part.center+extent;
+    for(const auto & entry:terrain_collisions_){
+      const auto & bounds=entry.second;double gap2=0;
+      for(int j=0;j<3;++j){const double gap=std::max({0.0,minimum[j]-bounds.Max()[j],bounds.Min()[j]-maximum[j]});gap2+=gap*gap;}
+      if(gap2>cfg_.obstacle_clearance*cfg_.obstacle_clearance+1e-12){continue;}
+      const auto obstacle=boost::dynamic_pointer_cast<gazebo::physics::BoxShape>(entry.first->GetShape());
+      if(!obstacle){
+        const auto plane=boost::dynamic_pointer_cast<gazebo::physics::PlaneShape>(entry.first->GetShape());
+        if(!plane){return false;}
+        const auto world_pose=entry.first->WorldPose();
+        const V3 normal=world_pose.Rot().RotateVector(plane->Normal());
+        if(std::abs(normal.Z()-1)>1e-9){return false;}
+        const double top=world_pose.Pos().Z();
+        const bool supporting=std::abs(top-support_heights[0])<=cfg_.geometry_tolerance||
+          std::abs(top-support_heights[1])<=cfg_.geometry_tolerance;
+        const double distance=minimum.Z()-top;
+        if(supporting&&distance>=-cfg_.geometry_tolerance){continue;}
+        if(distance<=1e-9||distance<cfg_.obstacle_clearance-1e-9){return false;}
+        continue;
+      }
+      const OBB box=MakeBox(entry.first->WorldPose(),obstacle->Size()*.5);
+      const double top=bounds.Max().Z();
+      const bool contact=std::abs(top-support_heights[0])<=cfg_.geometry_tolerance||
+        std::abs(top-support_heights[1])<=cfg_.geometry_tolerance;
+      if(contact&&std::abs(std::abs(box.axis[2].Z())-1)<1e-9&&minimum.Z()>=top-cfg_.geometry_tolerance){continue;}
+      const double distance=BoxDistance(part,box);
+      if(distance<=1e-9||distance<cfg_.obstacle_clearance-1e-9){return false;}
+    }
+  }
+  return true;
+}
+
 bool WheelLegControl::Landing(
   const ignition::math::Pose3d & body, size_t side, ignition::math::Vector3d & foot) const
 {
@@ -292,8 +405,14 @@ bool WheelLegControl::Landing(
     auto candidate = body.Pos() + body.Rot().RotateVector(
       ignition::math::Vector3d(0.14 + offset, side == 0 ? 0.34 : -0.34, 0));
     auto angles = q_;
-    if (Surface(candidate, body.Rot().Yaw(), body.Pos().Z() - 0.10) &&
-      LegAngles(body, candidate, side, angles) && LegAngles(pose_, candidate, side, angles)) {
+    double ground;
+    if (!Height(candidate.X(),candidate.Y(),body.Pos().Z()-0.10,ground)) {continue;}
+    candidate.Z()=ground+0.0175;
+    if (LegAngles(body, candidate, side, angles) &&
+      Surface(candidate, body.Rot().Yaw()+angles[3+side*4], body.Pos().Z()-0.10) &&
+      LegAngles(body, candidate, side, angles) &&
+      FootClearance(body,candidate,side,angles,{candidate.Z()-0.0175,candidate.Z()-0.0175}) &&
+      LegAngles(pose_, candidate, side, angles)) {
       foot = candidate;
       return true;
     }
@@ -318,6 +437,7 @@ ignition::math::Pose3d WheelLegControl::SampleTrajectory(double time) const
 void WheelLegControl::Leg(double now, double /*dt*/)
 {
   const auto old_feet = feet_;
+  const auto old_q = q_;
   if (!swing_ && now >= next_foot_query_) {
     next_foot_query_ = now + cfg_.feedback_period;
     const double relative = now - trajectory_start_;
@@ -376,6 +496,14 @@ void WheelLegControl::Leg(double now, double /*dt*/)
     feet_ = old_feet;
     FreezeMotion();
     RCLCPP_WARN(node_->get_logger(), "足端目标不可达，运动已冻结 body=(%.3f %.3f %.3f) feet0=(%.3f %.3f %.3f) feet1=(%.3f %.3f %.3f) swing=%zu t=%.3f/%.3f", pose_.Pos().X(),pose_.Pos().Y(),pose_.Pos().Z(), feet_[0].X(),feet_[0].Y(),feet_[0].Z(), feet_[1].X(),feet_[1].Y(),feet_[1].Z(), swing_side_,now-swing_start_,swing_duration_);
+  }
+  for (size_t side=0;side<2&&!frozen_;++side) {
+    std::array<double,2> supports{feet_[side].Z()-0.0175,feet_[side].Z()-0.0175};
+    if(swing_&&side==swing_side_){supports={swing_from_.Z()-0.0175,swing_to_.Z()-0.0175};}
+    if(!FootClearance(pose_,feet_[side],side,q_,supports)){
+      feet_=old_feet;q_=old_q;FreezeMotion();
+      RCLCPP_WARN(node_->get_logger(),"足端障碍净空不足，运动已冻结");
+    }
   }
 }
 

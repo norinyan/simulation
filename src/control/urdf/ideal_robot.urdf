@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<robot name="ideal_robot">
+  <link name="base_link">
+    <inertial>
+      <mass value="1"/>
+      <inertia ixx="0.00667" ixy="0" ixz="0" iyy="0.00667" iyz="0" izz="0.00667"/>
+    </inertial>
+    <visual>
+      <geometry><box size="0.2 0.2 0.2"/></geometry>
+      <material name="ideal_blue"><color rgba="0.1 0.5 1 1"/></material>
+    </visual>
+  </link>
+  <gazebo reference="base_link">
+    <gravity>false</gravity>
+    <material>Gazebo/Blue</material>
+  </gazebo>
+  <gazebo>
+    <plugin name="ideal_trajectory_control" filename="libideal_trajectory_control.so"/>
+  </gazebo>
+</robot>

@@ -39,13 +39,13 @@ public:
     options_.step_cost_weight=o["step_cost_weight"].as<double>();
     const auto opt=c["optimizer"];
     options_.optimize=opt["enabled"].as<bool>();
-    options_.reference_height=opt["reference_height"].as<double>();
+
     options_.max_heading_rate=opt["max_heading_rate"].as<double>();
     options_.optimizer_cost_margin=opt["cost_margin"].as<double>();
     options_.optimizer_jerk_sigma=opt["jerk_sigma"].as<double>();
     options_.optimizer_sample_interval=opt["sample_interval"].as<int>();
     options_.optimizer_iterations=opt["iterations"].as<int>();
-    for (double v:{options_.cost_threshold,options_.reference_height,options_.max_heading_rate,
+    for (double v:{options_.cost_threshold,options_.max_heading_rate,
       options_.optimizer_jerk_sigma}) {
       if(!std::isfinite(v)||v<=0) throw std::runtime_error("PCT_INVALID_OPTIONS");
     }
@@ -59,14 +59,14 @@ public:
     expected_={limits["length"].as<double>(),limits["width"].as<double>(),
       limits["safety_margin"].as<double>(),limits["max_step"].as<double>(),
       limits["clearance"].as<double>()};
-    auto path=std::filesystem::path(c["control_config"].as<std::string>());
+    auto path=std::filesystem::path(c["ideal_config"].as<std::string>());
     if(path.is_relative())path=std::filesystem::path(filename).parent_path()/path;
-    const auto control=YAML::LoadFile(path.string());
-    wheel_height_=control["wheel"]["body_height"].as<double>();
-    foot_height_=control["foot"]["body_height"].as<double>();
-    position_tolerance_=control["trajectory"]["position_tolerance"].as<double>();
-    for(double value:{wheel_height_,foot_height_,position_tolerance_}) {
-      if(!std::isfinite(value)||value<=0)throw std::runtime_error("PCT_INVALID_CONTROL_HEIGHT");
+    const auto ideal=YAML::LoadFile(path.string());
+    reference_height_=ideal["reference_height"].as<double>();
+    options_.reference_height=reference_height_;
+    position_tolerance_=ideal["position_tolerance"].as<double>();
+    for(double value:{reference_height_,position_tolerance_}) {
+      if(!std::isfinite(value)||value<=0)throw std::runtime_error("PCT_INVALID_REFERENCE_HEIGHT");
     }
   }
 
@@ -126,7 +126,7 @@ public:
       if(!std::isfinite(g)||!std::isfinite(cost)||cost>options_.cost_threshold||
         (std::isfinite(ceiling)&&ceiling-g<m.clearance-height_epsilon))continue;
       const double height=body.position.z-g;
-      if(std::min(std::abs(height-wheel_height_),std::abs(height-foot_height_))>
+      if(std::abs(height-reference_height_)>
         position_tolerance_+height_epsilon)continue;
       if(std::none_of(candidates.begin(),candidates.end(),[g](double v){return std::abs(g-v)<height_epsilon;})) {
         candidates.push_back(g);
@@ -191,7 +191,7 @@ private:
   TraversalConstraints expected_;
   std::vector<Region> regions_;
   std::vector<pct_native::Pose> optimized_reference_;
-  double wheel_height_{0},foot_height_{0},position_tolerance_{0};
+  double reference_height_{0},position_tolerance_{0};
 };
 }
 std::unique_ptr<GlobalPlanner> makePctPlanner(const std::string & config_file) {
