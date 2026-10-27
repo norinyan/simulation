@@ -10,6 +10,7 @@ find_package(trajectory_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/GlobalPath.msg"
   "msg/LocalTrajectory.msg"
+  "msg/DynamicObstacle.msg"
   DEPENDENCIES std_msgs geometry_msgs trajectory_msgs
 )
 

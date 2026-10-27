@@ -1,0 +1,44 @@
+# 每任务每层最多触发一次，A→B后删除；不再按时间周期再生。
+# trigger为机器人实际本体XYZ范围及世界移动方向；不按yaw判断方向。
+obstacles:
+  - id: f1_ped
+    size: [0.5, 0.5, 0.8]
+    route: [[-0.9, -4.7, 0.4], [2.0, -4.7, 0.4]]
+    speed: 0.3
+    hold_time: 0.0
+    triggers:
+      - min: [-0.3, -6.25, 0.3]
+        max: [0.3, -6.0, 0.6]
+        direction: [0, 1]
+      - min: [-0.3, -3.4, 0.3]
+        max: [0.3, -3.1, 0.6]
+        direction: [0, -1]
+    enabled: true
+  - id: f2_ped
+    size: [0.5, 0.5, 0.8]
+    route: [[-4.05, 1.0, 3.6], [-4.05, 1.95, 3.6], [2.7, 1.95, 3.6], [2.7, 4.5, 3.6]]
+    speed: 0.25
+    hold_time: 2.0
+    triggers:
+      - min: [-7.6, 1.7, 3.5]
+        max: [-7.35, 2.5, 3.8]
+        direction: [1, 0]
+      - min: [5.85, 1.7, 3.5]
+        max: [6.15, 2.9, 3.8]
+        direction: [-1, 0]
+    enabled: true
+  - id: f3_ped
+    size: [0.5, 0.5, 0.8]
+    route: [[2.7, 4.0, 6.8], [2.7, 2.55, 6.8], [-4.05, 2.55, 6.8], [-4.05, 0.0, 6.8]]
+    speed: 0.25
+    hold_time: 2.0
+    adapt_lane: {ground_z: 6.4, at_x: 0.0, min: 1.95, max: 2.55}
+    triggers:
+      - min: [-6.15, 1.7, 6.7]
+        max: [-5.85, 3.0, 7.0]
+        direction: [1, 0]
+      - min: [5.85, 1.7, 6.7]
+        max: [6.15, 3.0, 7.0]
+        direction: [-1, 0]
+        reverse_route: true
+    enabled: true

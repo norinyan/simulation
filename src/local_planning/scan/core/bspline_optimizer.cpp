@@ -500,7 +500,7 @@ namespace scan_planner
         Eigen::Vector3d position = Eigen::Vector3d::Zero();
         for (int j = 0; j < 4; ++j) position += basis[j]*q.col(span+j);
         Eigen::Vector3d distance_gradient;
-        const double distance = grid_map_->signedDistance(position, distance_gradient);
+        const double distance = grid_map_->signedDistanceAt(position,(span+u)*bspline_interval_,distance_gradient);
         if (!std::isfinite(distance) || !distance_gradient.allFinite())
           throw std::runtime_error("SCAN_INVALID_DISTANCE_GRADIENT");
         const double error = clearance-distance;
@@ -1157,7 +1157,7 @@ namespace scan_planner
           const double t = tm+(tmp-tm)*sample/samples;
           Eigen::Vector3d pos = traj.evaluateDeBoorT(t);
           Eigen::Vector3d pos_next = traj.evaluateDeBoorT(std::min(t + t_step, tmp));
-          flag_occ = grid_map_->getInflateOccupancy(pos, estimateSegmentYaw(pos, pos_next));
+          flag_occ = grid_map_->getInflateOccupancyAt(pos, estimateSegmentYaw(pos, pos_next),t);
           if (flag_occ)
           {
             //cout << "hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
@@ -1169,7 +1169,7 @@ namespace scan_planner
                    << cps_.points.col(3).transpose() << "\n"
                    << cps_.points.col(4).transpose() << endl;
               std::fprintf(stderr, "SCAN: First 3 control points in obstacles! return false, t=%f", t);
-              return false;
+              throw std::runtime_error("SCAN_REBOUND_START_COLLISION t="+std::to_string(t));
             }
 
             break;
@@ -1197,13 +1197,14 @@ namespace scan_planner
       }
       else
       {
-        std::fprintf(stderr, "SCAN: Solver error. Return = %d, %s. Skip this planning.", result, lbfgs::lbfgs_strerror(result));
+        throw std::runtime_error("SCAN_REBOUND_SOLVER code="+std::to_string(result)+" "+lbfgs::lbfgs_strerror(result));
         // while (ros::ok());
       }
 
     } while ((flag_occ && restart_nums < MAX_RESART_NUMS_SET) ||
              (flag_force_return && force_stop_type_ == STOP_FOR_REBOUND && rebound_times <= 20));
 
+    if (!success) {throw std::runtime_error(flag_occ?"SCAN_REBOUND_CURVE_COLLISION":"SCAN_REBOUND_CANCELED");}
     return success;
   }
 
@@ -1249,7 +1250,7 @@ namespace scan_planner
       {
         std::fprintf(stderr, "SCAN: Solver error in refining!, return = %d, %s", result, lbfgs::lbfgs_strerror(result));
         lambda2_ = origin_lambda2;
-        return false;
+        throw std::runtime_error("SCAN_REFINE_SOLVER code="+std::to_string(result)+" "+lbfgs::lbfgs_strerror(result));
       }
 
       UniformBspline traj = UniformBspline(cps_.points, 3, bspline_interval_);
@@ -1263,7 +1264,7 @@ namespace scan_planner
         const double t = tm+(tmp-tm)*sample/samples;
         Eigen::Vector3d pos = traj.evaluateDeBoorT(t);
         Eigen::Vector3d pos_next = traj.evaluateDeBoorT(std::min(t + t_step, tmp));
-        if (grid_map_->getInflateOccupancy(pos, estimateSegmentYaw(pos, pos_next)))
+        if (grid_map_->getInflateOccupancyAt(pos, estimateSegmentYaw(pos, pos_next),t))
         {
           // cout << "Refined traj hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
 
@@ -1289,6 +1290,7 @@ namespace scan_planner
 
     //cout << "iter_num_=" << iter_num_ << endl;
 
+    if (!flag_safe) {throw std::runtime_error("SCAN_REFINE_CURVE_COLLISION");}
     return flag_safe;
   }
 

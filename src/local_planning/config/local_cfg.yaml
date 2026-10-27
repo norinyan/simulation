@@ -11,6 +11,14 @@ angular_speed: 1.0              # yaw速度上限，rad/s
 max_acceleration: 0.8           # 三维加速度上限，m/s²
 point_clearance: 0.05           # 点轨迹到World障碍的最小距离，m
 
+dynamic_obstacles:
+  enabled: false
+  expected_ids: [f1_crossing, f1_head_on, f2_follow, f2_blockage, f3_crossing, f3_head_on]
+  observation_timeout: 0.3       # 仿真秒
+  horizon: 20.0                 # 覆盖局部轨迹及停车末端，秒
+  margin: 0.03                  # 额外预测余量，m
+  margin_rate: 0.01             # 每预测一秒增加的余量，m/s
+
 scan:
   resolution: 0.05
   control_spacing: 0.10

@@ -3,10 +3,12 @@
 
 #include <chrono>
 #include <string>
+#include <vector>
 
 #include <geometry_msgs/msg/vector3.hpp>
 #include <interfaces/msg/global_path.hpp>
 #include <interfaces/msg/local_trajectory.hpp>
+#include <interfaces/msg/dynamic_obstacle.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 
 namespace local_planning
@@ -17,6 +19,12 @@ struct MotionLimits
   double position_tolerance{}, orientation_tolerance{};
 };
 
+struct DynamicSettings
+{
+  bool enabled{false};
+  double horizon{}, base_margin{}, growth{};
+};
+
 struct LocalRequest
 {
   nav_msgs::msg::Odometry state;
@@ -25,6 +33,8 @@ struct LocalRequest
   std::chrono::steady_clock::time_point deadline;
   geometry_msgs::msg::Vector3 acceleration;  // world；切换时刻的本体加速度。
   interfaces::msg::LocalTrajectory warm_start;  // 已生效旧轨迹；header 是绝对仿真生效时间。
+  DynamicSettings dynamic;
+  std::vector<interfaces::msg::DynamicObstacle> obstacles;  // 不可变的观测快照。
 };
 
 struct LocalResult
@@ -42,6 +52,10 @@ public:
   virtual void loadMap(const std::string & filename) = 0;
   virtual bool supports(const std::string & mode) const = 0;
   virtual LocalResult plan(const LocalRequest & request) = 0;
+  virtual bool trajectorySafe(const interfaces::msg::LocalTrajectory & trajectory,
+    const LocalRequest & request,double from_absolute,double until_absolute,
+    std::string & reason) const = 0;
+  virtual LocalResult brake(const LocalRequest & request) const = 0;
 };
 }  // namespace local_planning
 #endif

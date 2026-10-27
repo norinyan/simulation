@@ -93,7 +93,7 @@ export function Preview({world, path, mode}) {
   return <div className={`preview preview-${mode}`} ref={host}>{error && <div className="empty">{error}</div>}{(mode === 'map' ? !world : !path?.points?.length) && <div className="empty">{mode === 'map' ? '等待场景' : '等待全局规划'}</div>}</div>;
 }
 
-export default function Scene({ world, globalPath, localTrajectory, initialTrajectories, odom, sessionKey }) {
+export default function Scene({ world, globalPath, localTrajectory, initialTrajectories, dynamicObstacles, odom, sessionKey }) {
   const host = useRef(null), orbitSurface = useRef(null), state = useRef(null), live = useRef({ odom });
   const trajectories = useRef([]);
   const [filter, setFilter] = useState('all'), [error, setError] = useState('');
@@ -117,13 +117,13 @@ export default function Scene({ world, globalPath, localTrajectory, initialTraje
     controls.enableDamping = true;
     const grid = new THREE.GridHelper(32, 32, 0x344559, 0x1c2c3d); grid.rotation.x = Math.PI / 2; grid.position.z = -.12; scene.add(grid);
     const axes = new THREE.AxesHelper(2); axes.position.set(-11, -8, .02); scene.add(axes);
-    const geometry = new THREE.Group(), global = new THREE.Group(), local = new THREE.Group(), trail = new THREE.Group();
-    scene.add(geometry, global, local, trail);
+    const geometry = new THREE.Group(), global = new THREE.Group(), local = new THREE.Group(), trail = new THREE.Group(), obstacles = new THREE.Group();
+    scene.add(geometry, global, local, trail, obstacles);
     const robot = new THREE.Mesh(new THREE.BoxGeometry(.2, .2, .2), new THREE.MeshStandardMaterial({ color: 0x50e3c2, emissive: 0x143e37 }));
     const nose = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(), .65, 0x62f5d3, .16, .09); robot.add(nose);
     robot.visible = false; scene.add(robot);
     const history = [];
-    state.current = { scene, renderer, geometry, global, local, trail, robot, history, overview, controls };
+    state.current = { scene, renderer, geometry, global, local, trail, obstacles, robot, history, overview, controls };
     let frame;
     const rendererSize = new THREE.Vector2();
     const render = () => {
@@ -135,6 +135,7 @@ export default function Scene({ world, globalPath, localTrajectory, initialTraje
       if (currentFilter === 'current' && current) floor = Math.max(0, Math.floor((current.pose.pose.position.z - .2) / 3.2));
       else if (currentFilter !== 'all' && currentFilter !== 'current') floor = Number(currentFilter);
       geometry.children.forEach(mesh => { mesh.visible = floor === null || mesh.userData.floor === floor; });
+      obstacles.children.forEach(mesh => { mesh.visible = floor === null || mesh.userData.floor === floor; });
       const pose = current?.pose?.pose;
       if (pose) {
         const p = pose.position, q = pose.orientation;
@@ -155,7 +156,7 @@ export default function Scene({ world, globalPath, localTrajectory, initialTraje
     render();
     return () => {
       cancelAnimationFrame(frame); controls.dispose();
-      [geometry, global, local, trail].forEach(release);
+      [geometry, global, local, trail, obstacles].forEach(release);
       robot.geometry.dispose(); robot.material.dispose(); renderer.dispose(); renderer.domElement.remove(); state.current = null;
     };
   }, []);
@@ -163,8 +164,25 @@ export default function Scene({ world, globalPath, localTrajectory, initialTraje
     if (!state.current || !world?.boxes) return;
     const group = state.current.geometry; release(group);
     buildWorld(group, world);
-
   }, [world]);
+  useEffect(() => {
+    if (!state.current) return;
+    const group = state.current.obstacles, existing = new Map(group.children.map(mesh => [mesh.name, mesh]));
+    for (const obstacle of Object.values(dynamicObstacles || {})) {
+      const { id, pose, size } = obstacle;
+      if (!pose || !size || ![size.x, size.y, size.z].every(value => Number.isFinite(value) && value > 0)) continue;
+      let mesh = existing.get(id);
+      if (!mesh) {
+        mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial({color: 0xe76b82, roughness: .65}));
+        mesh.name = id; group.add(mesh);
+      }
+      existing.delete(id);
+      const p = pose.position, q = pose.orientation;
+      mesh.position.set(p.x, p.y, p.z); mesh.quaternion.set(q.x, q.y, q.z, q.w); mesh.scale.set(size.x, size.y, size.z);
+      mesh.userData.floor = Math.max(0, Math.floor((p.z - size.z / 2 + .1) / 3.2));
+    }
+    for (const mesh of existing.values()) {group.remove(mesh); mesh.geometry.dispose(); mesh.material.dispose();}
+  }, [dynamicObstacles]);
   useEffect(() => { if (state.current) route(state.current.global, (globalPath?.points || []).map(p => [p.position.x, p.position.y, p.position.z]), 0x57a7ff, 3); }, [globalPath]);
   useEffect(() => {
     if (!state.current) return;
@@ -202,6 +220,6 @@ export default function Scene({ world, globalPath, localTrajectory, initialTraje
   return <section className="scene-panel panel">
     <div className="panel-heading"><h2>任务现场</h2><div className="scene-tools"><select aria-label="三维显示楼层" value={filter} onChange={e => setFilter(e.target.value)}><option value="all">全部楼层 · 透明</option><option value="current">机器人当前楼层</option><option value="0">一层</option><option value="1">二层</option><option value="2">三层</option></select><button className="text-button" onClick={() => { const s = state.current; if (s) {s.overview.position.set(25, -32, 27); s.controls.target.set(0, 0, 3);} }}>重置视角</button></div></div>
     <div className="scene-viewport" ref={host}><div className="orbit-surface" ref={orbitSurface}/><div className="view-label overview-label">地图总览</div><div className="view-divider"/><div className="view-label follow-label">机器人跟随</div>{error && <div className="scene-error">{error}</div>}</div>
-    <div className="scene-legend"><span><i className="line blue"/>全局路径</span><span><i className="line orange"/>剩余局部轨迹</span><span><i className="line gray"/>已走轨迹</span></div>
+    <div className="scene-legend"><span><i className="line blue"/>全局路径</span><span><i className="line orange"/>剩余局部轨迹</span><span><i className="line gray"/>已走轨迹</span><span><i className="obstacle-key"/>动态障碍</span></div>
   </section>;
 }

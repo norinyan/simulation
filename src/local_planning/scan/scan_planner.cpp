@@ -17,6 +17,38 @@ double yaw(const geometry_msgs::msg::Quaternion & q)
 void budget(const LocalRequest & r) {
   if (std::chrono::steady_clock::now()>=r.deadline) {throw std::runtime_error("SCAN_TIMEOUT");}
 }
+double stamp(const builtin_interfaces::msg::Time & t) {return t.sec+t.nanosec*1e-9;}
+double dynamicDistance(const LocalRequest & request,const Eigen::Vector3d & point,
+  double absolute_time,Eigen::Vector3d & gradient) {
+  double best=std::numeric_limits<double>::infinity();gradient.setZero();
+  if (!request.dynamic.enabled) {return best;}
+  for (const auto & obstacle:request.obstacles) {
+    const double elapsed=absolute_time-stamp(obstacle.header.stamp);
+    if (elapsed < -1e-6 || elapsed>request.dynamic.horizon+1e-6) {
+      throw std::runtime_error("DYNAMIC_PREDICTION_HORIZON");
+    }
+    const auto & q=obstacle.pose.orientation;
+    const Eigen::Quaterniond quaternion(q.w,q.x,q.y,q.z);
+    const Eigen::Matrix3d rotation=quaternion.normalized().toRotationMatrix();
+    const auto & v=obstacle.twist.linear;
+    const Eigen::Vector3d center=position(obstacle.pose)+std::max(0.0,elapsed)*Eigen::Vector3d(v.x,v.y,v.z);
+    const Eigen::Vector3d local=rotation.transpose()*(point-center);
+    const auto & size=obstacle.size;
+    const Eigen::Vector3d delta=local.cwiseAbs()-.5*Eigen::Vector3d(size.x,size.y,size.z);
+    const Eigen::Vector3d outside=delta.cwiseMax(0);
+    const double length=outside.norm();double distance;
+    Eigen::Vector3d direction=Eigen::Vector3d::Zero();
+    if (length>1e-12) {
+      distance=length;
+      for (int axis=0;axis<3;++axis) {direction[axis]=outside[axis]/length*(local[axis]>=0?1:-1);}
+    } else {
+      Eigen::Index axis;distance=delta.maxCoeff(&axis);direction[axis]=local[axis]>=0?1:-1;
+    }
+    distance-=request.dynamic.base_margin+request.dynamic.growth*std::max(0.0,elapsed);
+    if (distance<best) {best=distance;gradient=rotation*direction;}
+  }
+  return best;
+}
 class Environment final : public GridMap {
 public:
   Environment(const ScanMap & map,const LocalRequest & r,double margin,double resolution)
@@ -24,6 +56,17 @@ public:
   double getResolution() const override {return resolution_;}
   double signedDistance(const Eigen::Vector3d & p,Eigen::Vector3d & gradient) const override {
     budget(request_);return map_.signedDistance(p,gradient);
+  }
+  double signedDistanceAt(const Eigen::Vector3d & p,double time,Eigen::Vector3d & gradient) const override {
+    double result=signedDistance(p,gradient);Eigen::Vector3d dynamic_gradient;
+    const double distance=dynamicDistance(request_,p,stamp(request_.state.header.stamp)+time,dynamic_gradient);
+    if (distance<result) {result=distance;gradient=dynamic_gradient;}
+    return result;
+  }
+  int getInflateOccupancyAt(const Eigen::Vector3d & p,double heading,double time) const override {
+    Eigen::Vector3d gradient;
+    return getInflateOccupancy(p,heading) ||
+      dynamicDistance(request_,p,stamp(request_.state.header.stamp)+time,gradient)<margin_;
   }
   bool expired() const override {return std::chrono::steady_clock::now()>=request_.deadline;}
   int getInflateOccupancy(const Eigen::Vector3d & p,double) const override {
@@ -37,11 +80,11 @@ private:
   const LocalRequest & request_;
   double margin_,resolution_;
 };
-double stamp(const builtin_interfaces::msg::Time & t) {return t.sec+t.nanosec*1e-9;}
 double pointTime(const trajectory_msgs::msg::MultiDOFJointTrajectoryPoint & p)
 {return p.time_from_start.sec+p.time_from_start.nanosec*1e-9;}
 Eigen::Vector3d vector(const geometry_msgs::msg::Vector3 & p) {return {p.x,p.y,p.z};}
 Eigen::Vector3d oldPosition(const interfaces::msg::LocalTrajectory & tr,double elapsed) {
+  if (elapsed<=0) {return vector(tr.points.front().transforms[0].translation);}
   if (elapsed>=pointTime(tr.points.back())) {return vector(tr.points.back().transforms[0].translation);}
   const auto end=std::upper_bound(tr.points.begin(),tr.points.end(),elapsed,
     [](double t,const auto & p){return t<pointTime(p);});
@@ -314,7 +357,7 @@ LocalResult ScanPlanner::plan(const LocalRequest & request) {
         const double t=std::min(duration,ts*i/subdivisions);
         const Eigen::Vector3d p=spline.evaluateDeBoorT(t),v=velocity.evaluateDeBoorT(t),acc=acceleration.evaluateDeBoorT(t);
         const double heading=initial_yaw+w0*t+b*t*t+a*t*t*t;
-        if (env->getInflateOccupancy(p,heading)) {throw std::runtime_error("SCAN_NO_TERRAIN_OR_COLLISION");}
+        if (env->getInflateOccupancyAt(p,heading,t)) {throw std::runtime_error("SCAN_NO_TERRAIN_OR_COLLISION");}
         if (i) {
           const double dt=ts/subdivisions;
           // A curve with |acceleration| <= A deviates from its chord by at most
@@ -339,12 +382,172 @@ LocalResult ScanPlanner::plan(const LocalRequest & request) {
         point.time_from_start.nanosec=static_cast<uint32_t>(ns%1000000000);
         trajectory.points.push_back(std::move(point));previous=p;
       }
+      trajectory.header.stamp=request.state.header.stamp;
+      if (request.dynamic.enabled) {
+        std::string reason;
+        const double start=stamp(trajectory.header.stamp);
+        if (!trajectorySafe(trajectory,request,start,start+duration,reason)) {throw std::runtime_error(reason);}
+      }
       budget(request);result.success=true;
       result.reason="length="+std::to_string(output_length)+" min_clearance="+std::to_string(min_clearance);
       return result;
     }
     throw std::runtime_error(failure);
   } catch (const std::exception & e) {result.trajectory.points.clear();result.reason=e.what();}
+  return result;
+}
+
+bool ScanPlanner::trajectorySafe(const interfaces::msg::LocalTrajectory & trajectory,
+  const LocalRequest & request,double from,double until,std::string & reason) const {
+  try {
+    budget(request);
+    if (trajectory.points.empty() || !std::isfinite(from) || !std::isfinite(until) || until<from) {
+      throw std::runtime_error("INVALID_SAFETY_INTERVAL");
+    }
+    const double start=stamp(trajectory.header.stamp);
+    if (from<start-1e-6) {throw std::runtime_error("SAFETY_BEFORE_TRAJECTORY_START");}
+    double relative_speed=request.limits.speed;
+    for (const auto & obstacle:request.obstacles) {
+      const auto & v=obstacle.twist.linear;
+      relative_speed=std::max(relative_speed,request.limits.speed+Eigen::Vector3d(v.x,v.y,v.z).norm()+request.dynamic.growth);
+    }
+    const double step=std::min(.02,margin_/(4*std::max(.01,relative_speed)));
+    const int count=std::max(1,static_cast<int>(std::ceil((until-from)/step)));
+    if (count>100000) {throw std::runtime_error("SAFETY_SAMPLE_LIMIT");}
+    Eigen::Vector3d previous=oldPosition(trajectory,from-start),gradient;
+    const Environment environment(map_,request,margin_,resolution_);
+    for (int i=0;i<=count;++i) {
+      budget(request);
+      const double time=from+(until-from)*i/count;
+      const Eigen::Vector3d p=oldPosition(trajectory,time-start);
+      if (environment.getInflateOccupancy(p,0)) {throw std::runtime_error("STATIC_TRAJECTORY_COLLISION_OR_NO_TERRAIN");}
+      const double dt=(until-from)/count;
+      if (i && map_.segmentClearance(previous,p)-request.limits.acceleration*dt*dt/8<margin_-1e-9) {
+        throw std::runtime_error("STATIC_EXECUTED_CURVE_COLLISION");
+      }
+      const double gap=dynamicDistance(request,p,time,gradient);
+      // Signed distance is 1-Lipschitz in relative position. Protect the gap
+      // between samples as well as the samples themselves, including holds.
+      if (gap-relative_speed*dt*.5<margin_-1e-9) {throw std::runtime_error("DYNAMIC_TRAJECTORY_COLLISION");}
+      previous=p;
+    }
+    return true;
+  } catch (const std::exception & error) {reason=error.what();return false;}
+}
+
+LocalResult ScanPlanner::brake(const LocalRequest & request) const {
+  LocalResult result;
+  try {
+    budget(request);
+    const auto & state=request.state;const double heading=yaw(state.pose.pose.orientation);
+    const auto & twist=state.twist.twist;
+    const double c=std::cos(heading),s=std::sin(heading);
+    const Eigen::Vector3d v(c*twist.linear.x-s*twist.linear.y,s*twist.linear.x+c*twist.linear.y,twist.linear.z);
+    const Eigen::Vector3d a=vector(request.acceleration),p=position(state.pose.pose);
+    if (!v.allFinite() || !a.allFinite() || v.norm()>request.limits.speed+1e-6 ||
+      a.norm()>request.limits.acceleration+1e-6) {throw std::runtime_error("INVALID_BRAKE_BOUNDARY");}
+    // |v|/A is a physical lower bound; search upward instead of starting at
+    // 3|v|/A, which doubles the required stopping distance when a(0)=0.
+    double duration=std::max(.05,v.norm()/request.limits.acceleration);
+    // Cubic velocity Bernstein controls preserve the initial acceleration and
+    // end with zero velocity/acceleration. Their convex hull bounds motion.
+    bool feasible=false;
+    auto bounded=[](std::vector<Eigen::Vector3d> controls,double limit,auto && self,int depth)->bool {
+      double peak=0;for (const auto & control:controls) {peak=std::max(peak,control.norm());}
+      if (peak<=limit+1e-6) {return true;}
+      if (depth==0 || controls.front().norm()>limit+1e-6 || controls.back().norm()>limit+1e-6) {return false;}
+      // Subdivision tightens the Bernstein convex-hull bound without confusing
+      // a conservative control polygon violation with an actual motion limit.
+      std::vector<Eigen::Vector3d> left{controls.front()},right{controls.back()};
+      while (controls.size()>1) {
+        for (std::size_t i=0;i+1<controls.size();++i) {controls[i]=.5*(controls[i]+controls[i+1]);}
+        controls.pop_back();left.push_back(controls.front());right.push_back(controls.back());
+      }
+      std::reverse(right.begin(),right.end());
+      return self(left,limit,self,depth-1) && self(right,limit,self,depth-1);
+    };
+    auto motionFeasible=[&](double time) {
+      const Eigen::Vector3d middle=v+a*time/3;
+      if (!bounded({v,middle,Eigen::Vector3d::Zero(),Eigen::Vector3d::Zero()},request.limits.speed,bounded,8) ||
+        !bounded({a,-3*v/time-a,Eigen::Vector3d::Zero()},request.limits.acceleration,bounded,8)) {return false;}
+      // Check the actual Hermite execution during the duration search too.
+      // A feasible generating quartic alone does not bound its interpolant.
+      const Eigen::Vector3d b=-3*v/(time*time)-2*a/time;
+      const Eigen::Vector3d d=2*v/(time*time*time)+a/(time*time);
+      const int count=std::max(1,static_cast<int>(std::ceil(time/.02)));
+      auto positionAt=[&](double t)->Eigen::Vector3d {return v*t+.5*a*t*t+b*t*t*t/3+d*t*t*t*t/4;};
+      auto velocityAt=[&](double t)->Eigen::Vector3d {return v+a*t+b*t*t+d*t*t*t;};
+      for (int i=0;i<count;++i) {
+        const double lo=time*i/count,hi=time*(i+1)/count,h=hi-lo;
+        const Eigen::Vector3d va=velocityAt(lo),vb=velocityAt(hi);
+        const Eigen::Vector3d mid=3*(positionAt(hi)-positionAt(lo))/h-va-vb;
+        if (!bounded({va,mid,vb},request.limits.speed,bounded,8) ||
+          std::max((2*(mid-va)/h).norm(),(2*(vb-mid)/h).norm())>request.limits.acceleration+1e-6) {return false;}
+      }
+      return true;
+    };
+    double rejected=duration;
+    for (int attempt=0;attempt<32;++attempt) {
+      budget(request);
+      if (motionFeasible(duration)) {feasible=true;break;}
+      rejected=duration;duration*=1.1;
+    }
+    if (!feasible) {throw std::runtime_error("BRAKE_MOTION_LIMITS");}
+    for (int step=0;step<20 && duration-rejected>1e-6;++step) {
+      const double middle=.5*(rejected+duration);
+      if (motionFeasible(middle)) {duration=middle;} else {rejected=middle;}
+    }
+    // Keep a small time margin for the subsequently checked sampled Hermite
+    // execution, while retaining every original speed/acceleration limit.
+    if (motionFeasible(duration*1.001)) {duration*=1.001;}
+    auto & tr=result.trajectory;tr.header=state.header;tr.header.frame_id="world";
+    tr.mode=request.segment.modes.empty()?"wheel":request.segment.modes.front();
+    const int count=std::max(1,static_cast<int>(std::ceil(duration/.02)));
+    const Eigen::Vector3d b=-3*v/(duration*duration)-2*a/duration;
+    const Eigen::Vector3d d=2*v/(duration*duration*duration)+a/(duration*duration);
+    const double w=twist.angular.z;
+    if (!std::isfinite(w) || std::abs(w)>request.limits.yaw_rate+1e-6) {throw std::runtime_error("BRAKE_YAW_LIMIT");}
+    for (int i=0;i<=count;++i) {
+      const double t=duration*i/count;
+      const Eigen::Vector3d pos=p+v*t+.5*a*t*t+b*t*t*t/3+d*t*t*t*t/4;
+      const Eigen::Vector3d velocity=v+a*t+b*t*t+d*t*t*t;
+      const Eigen::Vector3d acceleration=a+2*b*t+3*d*t*t;
+      const double u=t/duration;
+      const double theta=heading+w*duration*(u-u*u*u+.5*u*u*u*u);
+      trajectory_msgs::msg::MultiDOFJointTrajectoryPoint point;geometry_msgs::msg::Transform transform;
+      transform.translation.x=pos.x();transform.translation.y=pos.y();transform.translation.z=pos.z();
+      transform.rotation.z=std::sin(theta/2);transform.rotation.w=std::cos(theta/2);point.transforms.push_back(transform);
+      geometry_msgs::msg::Twist first,second;
+      first.linear.x=velocity.x();first.linear.y=velocity.y();first.linear.z=velocity.z();
+      first.angular.z=w*(1-3*u*u+2*u*u*u);
+      second.linear.x=acceleration.x();second.linear.y=acceleration.y();second.linear.z=acceleration.z();
+      second.angular.z=w*(-6*u+6*u*u)/duration;
+      point.velocities.push_back(first);point.accelerations.push_back(second);
+      const auto ns=static_cast<int64_t>(std::llround(t*1e9));
+      point.time_from_start.sec=static_cast<int32_t>(ns/1000000000);
+      point.time_from_start.nanosec=static_cast<uint32_t>(ns%1000000000);tr.points.push_back(std::move(point));
+    }
+    // The executor uses cubic Hermite between samples, not the generating
+    // quartic. Bound that actual interpolation through its derivative control
+    // polygon and acceleration endpoints before accepting the brake.
+    for (std::size_t i=1;i<tr.points.size();++i) {
+      const auto & first=tr.points[i-1];const auto & last=tr.points[i];
+      const double dt=pointTime(last)-pointTime(first);
+      const Eigen::Vector3d pa=vector(first.transforms[0].translation),pb=vector(last.transforms[0].translation);
+      const Eigen::Vector3d va=vector(first.velocities[0].linear),vb=vector(last.velocities[0].linear);
+      const Eigen::Vector3d middle=3*(pb-pa)/dt-va-vb;
+      if (!bounded({va,middle,vb},request.limits.speed,bounded,8) ||
+        std::max((2*(middle-va)/dt).norm(),(2*(vb-middle)/dt).norm())>request.limits.acceleration+1e-6) {
+        throw std::runtime_error("BRAKE_EXECUTED_MOTION_LIMITS speed_bound="+
+          std::to_string(std::max({va.norm(),vb.norm(),middle.norm()}))+"/"+std::to_string(request.limits.speed)+
+          " acceleration="+std::to_string(std::max((2*(middle-va)/dt).norm(),(2*(vb-middle)/dt).norm()))+
+          "/"+std::to_string(request.limits.acceleration));
+      }
+    }
+    std::string reason;const double start=stamp(tr.header.stamp);
+    if (!trajectorySafe(tr,request,start,start+duration,reason)) {throw std::runtime_error(reason);}
+    result.success=true;result.reason="SAFE_BRAKE";
+  } catch (const std::exception & error) {result.trajectory.points.clear();result.reason=error.what();}
   return result;
 }
 }  // namespace local_planning

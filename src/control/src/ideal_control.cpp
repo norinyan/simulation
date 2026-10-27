@@ -103,11 +103,13 @@ private:
     auto reject = [this](const char * reason) {
         RCLCPP_WARN(node_->get_logger(), "理想轨迹拒绝：%s", reason);
       };
-    if (!pending_.empty()) {reject("已有等待生效的轨迹"); return;}
     const double now = model_->GetWorld()->SimTime().Double();
     const double begin = msg.header.stamp.sec + msg.header.stamp.nanosec*1e-9;
     if (msg.header.stamp.sec < 0 || msg.header.stamp.nanosec >= 1000000000u || begin <= now) {
       reject("轨迹生效时间已过期"); return;
+    }
+    if (!pending_.empty() && begin > pending_start_) {
+      reject("替换预约的生效时间不能晚于原预约"); return;
     }
     if (msg.header.frame_id != "world" || msg.points.size() < 2) {
       reject("需要 world 坐标系及至少两个点"); return;

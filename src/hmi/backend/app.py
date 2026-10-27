@@ -35,7 +35,7 @@ os.environ['GAZEBO_MASTER_URI'] = MASTER
 
 import rclpy
 from gazebo_msgs.srv import DeleteEntity, SpawnEntity
-from interfaces.msg import GlobalPath, LocalTrajectory
+from interfaces.msg import DynamicObstacle, GlobalPath, LocalTrajectory
 from nav_msgs.msg import Odometry
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
@@ -51,6 +51,7 @@ class Selection(BaseModel):
     goal: str = 'F3-EAST'
     global_algorithm: str = 'pct'
     local_algorithm: str = 'scan'
+    dynamic_obstacles: bool = True
 
 
 def selection_dict(value):
@@ -61,10 +62,12 @@ class Session:
     def __init__(self, loop):
         self.loop, self.lock = loop, threading.RLock()
         self.clients = set()
+        self.obstacle_versions = {}
         self.state = {'simulation': {'state': 'stopped', 'paused': False, 'reason': ''},
                       'selection': selection_dict(Selection()), 'global_status': {'state': 'idle', 'reason': ''},
                       'local_status': {'state': 'idle', 'reason': '', 'current': 0, 'total': 0},
                       'global_path': None, 'local_trajectory': None, 'local_trajectories': [],
+                      'dynamic_obstacles': {},
                       'odom': None, 'received_at': {},
                       'global_timing': None, 'local_timing': None,
                       'resources': {'global': None, 'local': None, 'stamp': time.time()}}
@@ -110,7 +113,8 @@ class Session:
 
     def busy(self):
         state = self.snapshot()
-        return state['global_status']['state'] == 'planning' or state['local_status']['state'] in ('planning', 'executing')
+        return state['global_status']['state'] == 'planning' or state['local_status']['state'] in (
+            'planning', 'executing', 'waiting', 'avoiding', 'stale')
 
     def require_running(self):
         if not self.running():
@@ -213,6 +217,8 @@ class Session:
                 config[section][key] = str((GLOBAL_CONFIG.parent / value).resolve())
         local = yaml.safe_load(LOCAL_CONFIG.read_text())
         local['algorithm'] = selection.local_algorithm
+        dynamic = local.setdefault('dynamic_obstacles', {})
+        dynamic['enabled'] = selection.dynamic_obstacles
         for key in ('map_file', 'ideal_config'):
             if local.get(key):
                 value = Path(local[key])
@@ -286,13 +292,16 @@ class Session:
         self.update('selection', selection_dict(selection))
         self.reset_planning()
         self.update('odom', None)
+        self.update('dynamic_obstacles', {})
+        self.obstacle_versions.clear()
         self.update('simulation', {'state': 'starting', 'paused': False, 'reason': ''})
         pose = yaml.safe_load(GLOBAL_CONFIG.read_text())['points'][selection.start]['pose']
         height = yaml.safe_load(IDEAL_CONFIG.read_text())['reference_height']
         try:
             self.spawn_process('simulation', ['ros2', 'launch', 'sim_bringup', 'sim.launch.py', 'gui:=false',
                                                f'x:={pose[0]}', f'y:={pose[1]}', f'z:={pose[2]+height}',
-                                               f'yaw:={pose[3]}', f'ideal_config:={IDEAL_CONFIG}'])
+                                               f'yaw:={pose[3]}', f'ideal_config:={IDEAL_CONFIG}',
+                                               f'dynamic_obstacles:={str(selection.dynamic_obstacles).lower()}'])
             await self.wait_until(lambda: self.snapshot()['odom'] is not None, 35, '等待模型里程计超时')
             self.start_planners(selection, False)
             await self.wait_until(lambda: self.node.start_task.service_is_ready(), 20, '等待局部规划节点超时')
@@ -309,6 +318,8 @@ class Session:
         await self.stop_process('simulation')
         self.reset_planning()
         self.update('odom', None)
+        self.update('dynamic_obstacles', {})
+        self.obstacle_versions.clear()
         if self.directory:
             self.directory.cleanup(); self.directory = None
         self.update('simulation', {'state': 'stopped', 'paused': False, 'reason': ''})
@@ -316,6 +327,8 @@ class Session:
 
     async def plan(self, selection):
         self.require_running(); self.validate_selection(selection)
+        if selection.dynamic_obstacles != self.snapshot()['selection']['dynamic_obstacles']:
+            raise HTTPException(409, '切换动态障碍需先停止并重新启动仿真')
         if self.busy():
             raise HTTPException(409, '规划或执行中不能修改任务')
         if self.snapshot()['simulation']['paused']:
@@ -387,6 +400,7 @@ class RosBridge(Node):
         self.create_subscription(GlobalPath, '/global_path', lambda msg: self.receive('global_path', msg), retained)
         self.create_subscription(LocalTrajectory, '/local_trajectory', lambda msg: self.receive('local_trajectory', msg), 10)
         self.create_subscription(Odometry, '/robot/odom', self.odom, qos_profile_sensor_data)
+        self.create_subscription(DynamicObstacle, '/dynamic_obstacles', self.obstacle, 128)
         self.create_subscription(String, '/global_planning/status', lambda msg: self.status('global_status', msg), retained)
         self.create_subscription(String, '/local_planning/status', lambda msg: self.status('local_status', msg), retained)
         self.create_subscription(String, '/global_planning/timing', lambda msg: self.timing('global_timing', msg), retained)
@@ -411,6 +425,38 @@ class RosBridge(Node):
         if now-self.last_odom >= .05:
             self.last_odom = now
             self.receive('odom', msg)
+
+    def obstacle(self, msg):
+        if self.session.simulation_state() not in ('starting', 'running'):
+            return
+        if not msg.id or msg.header.frame_id != 'world':
+            return
+        data = message_to_ordereddict(msg)
+        with self.session.lock:
+            if not self.session.state['selection'].get('dynamic_obstacles'):
+                return
+            obstacles = dict(self.session.state['dynamic_obstacles'])
+            at = lambda item: (item['header']['stamp']['sec'], item['header']['stamp']['nanosec'])
+            timestamp = at(data)
+            current = self.session.state.get('odom')
+            now = (current['header']['stamp']['sec'] + current['header']['stamp']['nanosec']*1e-9
+                   if current else timestamp[0]+timestamp[1]*1e-9)
+            if timestamp[0]+timestamp[1]*1e-9 < now-1.0:
+                return
+            versions = self.session.obstacle_versions
+            previous = versions.get(msg.id)
+            if previous and (timestamp < previous[0] or
+                             timestamp == previous[0] and (msg.active or not previous[1])):
+                return
+            versions[msg.id] = (timestamp, msg.active)
+            if msg.active:
+                obstacles[msg.id] = data
+            else:
+                obstacles.pop(msg.id, None)
+            for key, (when, active) in list(versions.items()):
+                if not active and now-(when[0]+when[1]*1e-9) > 1.0:
+                    del versions[key]
+        self.session.update('dynamic_obstacles', obstacles, received=True)
 
     def status(self, key, msg):
         try:

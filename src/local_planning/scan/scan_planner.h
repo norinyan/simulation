@@ -10,6 +10,10 @@ public:
   void loadMap(const std::string & filename) override;
   bool supports(const std::string & mode) const override;
   LocalResult plan(const LocalRequest & request) override;
+  bool trajectorySafe(const interfaces::msg::LocalTrajectory & trajectory,
+    const LocalRequest & request,double from_absolute,double until_absolute,
+    std::string & reason) const override;
+  LocalResult brake(const LocalRequest & request) const override;
 private:
   ScanMap map_;
   double margin_,resolution_,spacing_,sample_dt_,clearance_;

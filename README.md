@@ -129,6 +129,7 @@ simulation/
                                           /robot/odom、/joint_states
 ```
 
+
 | 方向 | 话题与消息类型 | 主要数据 |
 | --- | --- | --- |
 | 输入 | `/local_trajectory` · `interfaces/msg/LocalTrajectory` | `header.frame_id`、`mode`、`points` |
