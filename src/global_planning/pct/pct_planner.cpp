@@ -73,6 +73,16 @@ public:
   void loadMap(const std::string & filename) override {
     map_=pct_native::loadPctMap(filename);
     const auto metadata=YAML::LoadFile(std::filesystem::path(filename).replace_extension(".json").string());
+    // Sampled PCD surfaces retain measured slopes and voxel-sized steps. They
+    // have no semantic stair regions; the unchanged core still validates every
+    // transition against the map's traversability, clearance and max_step.
+    observed_surface_=metadata["map_kind"] &&
+      metadata["map_kind"].as<std::string>()=="pcd_surface_voxel_union_v1";
+    if(observed_surface_ &&
+      (!metadata["terrain_model"] ||
+      metadata["terrain_model"].as<std::string>()!="observed_surface")) {
+      throw std::runtime_error("PCT_BAD_OBSERVED_SURFACE_METADATA");
+    }
     const auto parameters=metadata["parameters"];
     const auto shape=metadata["shape"];
     if(shape.size()!=4 || shape[0].as<int>()!=5 || shape[1].as<unsigned>()!=map_->layers ||
@@ -98,6 +108,9 @@ public:
     }
     regions_.clear();
     if(!metadata["regions"].IsSequence())throw std::runtime_error("PCT_MISSING_TERRAIN_REGIONS");
+    if(observed_surface_ && metadata["regions"].size()!=0) {
+      throw std::runtime_error("PCT_OBSERVED_SURFACE_HAS_STAIR_REGIONS");
+    }
     for(const auto & item:metadata["regions"]) {
       const auto kind=item["kind"].as<std::string>();
       if(kind!="stair"&&kind!="stair_landing")throw std::runtime_error("PCT_BAD_TERRAIN_KIND");
@@ -178,7 +191,7 @@ private:
           }
         }
       }
-      if(kind==Terrain::Flat&&std::abs(a.z-b.z)>height_epsilon) {
+      if(!observed_surface_&&kind==Terrain::Flat&&std::abs(a.z-b.z)>height_epsilon) {
         throw std::runtime_error("PCT_HEIGHT_CHANGE_OUTSIDE_STAIR_REGION");
       }
       terrain.push_back(kind);
@@ -191,6 +204,7 @@ private:
   TraversalConstraints expected_;
   std::vector<Region> regions_;
   std::vector<pct_native::Pose> optimized_reference_;
+  bool observed_surface_{false};
   double reference_height_{0},position_tolerance_{0};
 };
 }

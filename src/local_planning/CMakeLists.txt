@@ -18,14 +18,17 @@ find_package(yaml-cpp REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(tinyxml2_vendor REQUIRED)
 find_package(TinyXML2 REQUIRED)
+find_path(MINIZIP_INCLUDE_DIR minizip/unzip.h REQUIRED)
+find_library(MINIZIP_LIBRARY minizip REQUIRED)
 
 add_executable(local_node local_node.cpp
   scan/scan_planner.cpp scan/scan_map.cpp
   scan/core/bspline_optimizer.cpp scan/core/uniform_bspline.cpp scan/core/dyn_a_star.cpp)
 target_include_directories(local_node PRIVATE scan/core)
+target_include_directories(local_node PRIVATE ${MINIZIP_INCLUDE_DIR})
 target_compile_features(local_node PRIVATE cxx_std_17)
 target_compile_options(local_node PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(local_node yaml-cpp Eigen3::Eigen tinyxml2::tinyxml2)
+target_link_libraries(local_node yaml-cpp Eigen3::Eigen tinyxml2::tinyxml2 ${MINIZIP_LIBRARY})
 ament_target_dependencies(local_node
   ament_index_cpp rclcpp interfaces nav_msgs geometry_msgs trajectory_msgs std_msgs std_srvs)
 

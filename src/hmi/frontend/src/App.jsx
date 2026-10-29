@@ -8,7 +8,7 @@ const empty = {
   resources: null, global_timing: null, local_timing: null, dynamic_obstacles: {},
 };
 const names = { idle: '空闲', starting: '启动中', running: '运行中', stopped: '未启动', stopping: '停止中', planning: '规划中', ready: '已就绪', executing: '执行中', completed: '已完成', failed: '失败', waiting: '等待障碍', avoiding: '避让中', stale: '观测过期' };
-const keys = ['start', 'goal', 'global_algorithm', 'local_algorithm', 'dynamic_obstacles'];
+const keys = ['map_id', 'start', 'goal', 'global_algorithm', 'local_algorithm', 'dynamic_obstacles'];
 const sameSelection = (a, b) => keys.every(key => a?.[key] === b?.[key]);
 const number = (v, digits = 2) => Number.isFinite(v) ? v.toFixed(digits) : '—';
 const stamp = value => value ? value.sec + value.nanosec * 1e-9 : null;
@@ -57,17 +57,39 @@ function Resources({ live, history }) {
 export default function App() {
   const [config, setConfig] = useState(null), [world, setWorld] = useState(null);
   const [live, setLive] = useState(empty), [connected, setConnected] = useState(false);
-  const [selection, setSelection] = useState({ start: '', goal: '', global_algorithm: 'pct', local_algorithm: 'scan', dynamic_obstacles: true });
+  const [selection, setSelection] = useState({ map_id: 'three-floor', start: '', goal: '', global_algorithm: 'pct', local_algorithm: 'scan', dynamic_obstacles: true });
   const [busy, setBusy] = useState(''), [error, setError] = useState(''), [clock, setClock] = useState(Date.now());
   const [records, setRecords] = useState([]), [resourceHistory, setResourceHistory] = useState([]);
   const [pausedDisplay, setPausedDisplay] = useState(false), [frozen, setFrozen] = useState(null);
   const initialized = useRef(false), selectionEdited = useRef(false);
+  const mapRequest = useRef(0);
+  const loadedMap = useRef(null);
   useEffect(() => {
     let cancelled = false;
-    get('/api/config').then(data => { if (!cancelled) { setConfig(data); if (!initialized.current && data.selection) {setSelection(data.selection); initialized.current = true;} } }).catch(e => !cancelled && setError(`配置读取失败：${e.message}`));
-    get('/api/map/world').then(data => !cancelled && setWorld(data)).catch(e => !cancelled && setError(`场景读取失败：${e.message}`));
+    const request = mapRequest.current;
+    get('/api/config').then(async data => {
+      const scene = await get(`/api/map/world?map_id=${encodeURIComponent(data.map_id || data.selection?.map_id || 'three-floor')}`);
+      if (!cancelled && request === mapRequest.current) {
+        setConfig(data); setWorld(scene); loadedMap.current = data.map_id || data.selection?.map_id || 'three-floor';
+        if (!initialized.current && data.selection) {setSelection(data.selection); initialized.current = true;}
+      }
+    }).catch(e => !cancelled && request === mapRequest.current && setError(`场景配置读取失败：${e.message}`));
     return () => {cancelled = true;};
   }, []);
+  useEffect(() => {
+    const map_id = live.selection?.map_id;
+    if (!map_id || loadedMap.current === map_id || busy === 'map/select') return;
+    let cancelled = false;
+    const request = ++mapRequest.current;
+    setWorld(null); setConfig(null); setRecords([]); setResourceHistory([]); setFrozen(null); setPausedDisplay(false);
+    setSelection(live.selection); selectionEdited.current = false;
+    Promise.all([get(`/api/config?map_id=${encodeURIComponent(map_id)}`), get(`/api/map/world?map_id=${encodeURIComponent(map_id)}`)]).then(([nextConfig, nextWorld]) => {
+      if (!cancelled && request === mapRequest.current) {
+        loadedMap.current = map_id; setConfig(nextConfig); setWorld(nextWorld);
+      }
+    }).catch(e => {if (!cancelled && request === mapRequest.current) setError(`地图同步失败：${e.message}`);});
+    return () => {cancelled = true;};
+  }, [live.selection?.map_id, busy]);
   useEffect(() => {
     let stopped = false, socket, timer;
     function addRecord(message) {
@@ -104,6 +126,8 @@ export default function App() {
   }, []);
   useEffect(() => {const timer = setInterval(() => setClock(Date.now()), 1000); return () => clearInterval(timer);}, []);
   const running = live.simulation?.state === 'running', paused = !!live.simulation?.paused;
+  const selectedMap = config?.maps?.find(map => map.id === selection.map_id);
+  const pedestriansAllowed = selectedMap?.features?.dynamic_obstacles !== false;
   const executing = ['planning', 'executing', 'waiting', 'avoiding', 'stale'].includes(live.local_status?.state), planning = live.global_status?.state === 'planning';
   const locked = !!busy || executing || planning || ['starting', 'stopping'].includes(live.simulation?.state);
   const dirty = !sameSelection(selection, live.selection);
@@ -124,6 +148,23 @@ export default function App() {
       if (path === 'planning/global' || path === 'simulation/start') selectionEdited.current = false;
     } catch (e) {setError(e.message);} finally {setBusy('');}
   }
+  async function selectMap(map_id) {
+    setBusy('map/select'); setError('');
+    const request = ++mapRequest.current;
+    try {
+      const response = await fetch('/api/map/select', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({map_id})});
+      const snapshot = await response.json();
+      if (!response.ok) throw new Error(typeof snapshot.detail === 'string' ? snapshot.detail : JSON.stringify(snapshot.detail));
+      if (request !== mapRequest.current) return;
+      setLive({...empty, ...snapshot}); setSelection(snapshot.selection);
+      setWorld(null); setConfig(null); setRecords([]); setResourceHistory([]); setFrozen(null); setPausedDisplay(false);
+      selectionEdited.current = false;
+      const [nextConfig, nextWorld] = await Promise.all([get(`/api/config?map_id=${encodeURIComponent(map_id)}`), get(`/api/map/world?map_id=${encodeURIComponent(map_id)}`)]);
+      if (request !== mapRequest.current) return;
+      loadedMap.current = map_id; setConfig(nextConfig); setWorld(nextWorld);
+    } catch (e) {if (request === mapRequest.current) setError(`地图切换失败：${e.message}`);}
+    finally {if (request === mapRequest.current) setBusy('');}
+  }
   const change = (key, value) => {selectionEdited.current = true; setSelection(previous => ({ ...previous, [key]: value }));};
   const sessionKey = `${live.simulation?.state === 'stopped'}:${JSON.stringify(live.selection)}:${stamp(live.global_path?.header?.stamp)}`;
   const progress = live.local_status?.total ? Math.min(100, live.local_status.current / live.local_status.total * 100) : 0;
@@ -132,14 +173,14 @@ export default function App() {
     {!connected && <div className="disconnect-banner" role="status">数据连接断开，画面保留最后状态。</div>}
     {error && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="关闭提示" onClick={() => setError('')}>×</button></div>}
     <main className="workspace"><div className="visual-column"><div className="data-row">
-      <section className="panel data-card map-card"><div className="panel-heading"><h2>场景概览</h2><span className="heading-meta">World 剖切</span></div><Preview world={world} mode="map"/><div className="card-bottom">{world?.file?.split('/').at(-1) || '等待场景数据'}</div></section>
+      <section className="panel data-card map-card"><div className="panel-heading"><h2>场景概览</h2><span className="heading-meta">{world?.mesh_url ? '实测地图网格' : 'World 剖切'}</span></div><Preview world={world} mode="map"/><div className="card-bottom">{world?.file?.split('/').at(-1) || '等待场景数据'}</div></section>
       <section className="panel data-card global-card"><div className="panel-heading"><h2>全局路线</h2><StateBadge value={live.global_status?.state}/></div><Preview world={world} path={display.global_path} mode="path"/><div className="global-metrics"><span><strong>{number(pathLength(display.global_path))}</strong> m</span><span><strong>{number(display.global_timing?.elapsed_ms)}</strong> ms</span>{display.global_path && <Raw message={display.global_path}/>}</div></section>
       <section className="panel data-card local-card"><div className="panel-heading"><h2>局部实时输出</h2><StateBadge value={live.local_status?.state}/></div><div className="local-feed" aria-label="局部轨迹真实消息记录">{shownRecords.length ? shownRecords.map((record, index) => <LocalRecord key={record.stamp} record={record} index={index} message={record.stamp === stamp(display.local_trajectory?.header?.stamp) ? display.local_trajectory : null}/>) : <div className="empty">等待 /local_trajectory</div>}</div></section>
     </div>
       <Scene initialTrajectories={live.local_trajectories} world={world} dynamicObstacles={live.dynamic_obstacles} globalPath={live.global_path} localTrajectory={live.local_trajectory} odom={live.odom} sessionKey={sessionKey}/>
       <section className="panel odom-strip"><div className="odom-title"><h2>机器人状态</h2><StateBadge value={live.local_status?.state}/></div><div><span>位置 XYZ · m</span><strong>{xyz(p?.position)}</strong></div><div><span>yaw · rad</span><strong>{number(yaw(p?.orientation))}</strong></div><div><span>速度 · m/s</span><strong>{velocity ? number(Math.hypot(velocity.linear.x, velocity.linear.y, velocity.linear.z)) : '—'}</strong></div><div><span>角速度 · rad/s</span><strong>{number(velocity?.angular?.z)}</strong></div><span className={`odom-health ${!odomValid && running ? 'stale' : ''}`}>{paused ? '仿真暂停' : live.odom ? age > 2 ? '里程计已过期' : '实时' : '等待数据'}</span><details className="odom-raw"><summary>数据</summary><pre className="raw-message">{display.odom ? JSON.stringify(display.odom, null, 2) : '尚未收到消息'}</pre></details></section>
       <Resources live={display} history={shownResources}/>
-    </div><aside className="panel controls"><div className="panel-heading"><h2>任务控制</h2><StateBadge value={live.simulation?.state}/></div><section className="control-section"><h3>仿真</h3><button type="button" className="wide pedestrian-toggle" aria-label="行人" aria-pressed={!!selection.dynamic_obstacles} disabled={!connected || !!busy || !config || live.simulation?.state !== 'stopped'} onClick={() => change('dynamic_obstacles', !selection.dynamic_obstacles)}><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="13" cy="4" r="2"/><path d="m7 11 4-4 4 3 4 1M11 7l-1 7-4 6m4-6 5 2 1 5"/></svg><span>行人</span><span className="pedestrian-toggle-status">{selection.dynamic_obstacles ? '已开启' : '已关闭'}</span><i className="pedestrian-switch" aria-hidden="true"/></button><div className="button-row"><button className="primary" disabled={!connected || !!busy || running || executing || live.simulation?.state === 'starting'} onClick={() => action('simulation/start', selection)}>启动仿真</button><button className="danger-subtle" disabled={!connected || !!busy || ['stopped', 'stopping'].includes(live.simulation?.state)} onClick={() => action('simulation/stop')}>停止仿真</button></div><button className="wide secondary" disabled={!connected || !running || !!busy} onClick={() => action(`simulation/${paused ? 'resume' : 'pause'}`)}>{paused ? '恢复仿真' : '暂停仿真'}</button></section>
+    </div><aside className="panel controls"><div className="panel-heading"><h2>任务控制</h2><StateBadge value={live.simulation?.state}/></div><section className="control-section"><h3>仿真</h3><label className="map-selection">地图<select aria-label="地图" value={selection.map_id || 'three-floor'} disabled={!connected || !!busy || !config || live.simulation?.state !== 'stopped'} onChange={e => selectMap(e.target.value)}>{config?.maps?.map(map => <option key={map.id} value={map.id} disabled={map.available === false}>{map.name}{map.available === false ? ' · 不可用' : ''}</option>)}</select></label>{config?.maps?.filter(map => map.available === false).map(map => <p className="map-unavailable" role="status" key={map.id}>{map.name}：{map.reason || '地图资源不可用'}</p>)}<button type="button" className="wide pedestrian-toggle" aria-label="行人" aria-pressed={!!selection.dynamic_obstacles} disabled={!pedestriansAllowed || !connected || !!busy || !config || live.simulation?.state !== 'stopped'} onClick={() => change('dynamic_obstacles', !selection.dynamic_obstacles)}><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="13" cy="4" r="2"/><path d="m7 11 4-4 4 3 4 1M11 7l-1 7-4 6m4-6 5 2 1 5"/></svg><span>行人</span><span className="pedestrian-toggle-status">{selection.dynamic_obstacles ? '已开启' : '已关闭'}</span><i className="pedestrian-switch" aria-hidden="true"/></button><div className="button-row"><button className="primary" disabled={!connected || !!busy || !config || !world || running || executing || live.simulation?.state === 'starting'} onClick={() => action('simulation/start', selection)}>启动仿真</button><button className="danger-subtle" disabled={!connected || !!busy || ['stopped', 'stopping'].includes(live.simulation?.state)} onClick={() => action('simulation/stop')}>停止仿真</button></div><button className="wide secondary" disabled={!connected || !running || !!busy} onClick={() => action(`simulation/${paused ? 'resume' : 'pause'}`)}>{paused ? '恢复仿真' : '暂停仿真'}</button></section>
       <section className="control-section"><h3>任务配置</h3><label>起点<select aria-label="起点" value={selection.start} disabled={locked || !config} onChange={e => change('start', e.target.value)}>{config?.points?.map(point => <option key={point.id} value={point.id}>{point.label || point.id}</option>)}</select></label><label>终点<select aria-label="终点" value={selection.goal} disabled={locked || !config} onChange={e => change('goal', e.target.value)}>{config?.points?.map(point => <option key={point.id} value={point.id}>{point.label || point.id}</option>)}</select></label><div className="algorithm-row"><label>全局算法<select aria-label="全局算法" value={selection.global_algorithm} disabled={locked} onChange={e => change('global_algorithm', e.target.value)}>{config?.algorithms?.global?.map(item => <option key={item.id} value={item.id} disabled={!item.available}>{item.id.toUpperCase()}{!item.available ? ' · 未接入' : ''}</option>)}</select></label><label>局部算法<select aria-label="局部算法" value={selection.local_algorithm} disabled={locked} onChange={e => change('local_algorithm', e.target.value)}>{config?.algorithms?.local?.map(item => <option key={item.id} value={item.id} disabled={!item.available}>{item.id.toUpperCase()}{!item.available ? ' · 未接入' : ''}</option>)}</select></label></div>{dirty && running && <p className="warning-note">配置已改变，请重新全局规划。</p>}</section>
       <section className="control-section"><h3>规划与执行</h3><button className="wide plan-button" disabled={!connected || !running || paused || locked || !odomValid} onClick={() => action('planning/global', selection)}>开始全局规划</button><button className="wide primary task-button" disabled={!canTask} onClick={() => action('task/start')}>启动任务</button></section>
       <section className="control-section task-status"><div><span>全局</span><StateBadge value={live.global_status?.state}/></div><div><span>局部 / 执行</span><StateBadge value={live.local_status?.state}/></div><div className="progress-track" aria-label="任务进度"><i style={{width:`${progress}%`}}/></div><p className="progress-value">{number(progress, 0)}%</p>{['waiting', 'avoiding', 'stale'].includes(live.local_status?.state) && <p className="warning-note">{live.local_status.reason}</p>}{[live.global_status, live.local_status, live.simulation].filter(s => s?.state === 'failed').map((s, i) => <p key={i} className="failure-text">{s.reason}</p>)}{busy && <p className="pending">正在处理…</p>}</section>

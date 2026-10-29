@@ -3,6 +3,7 @@
 #include <Eigen/QR>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <memory>
 #include <limits>
 #include <stdexcept>
@@ -300,6 +301,26 @@ LocalResult ScanPlanner::plan(const LocalRequest & request) {
         // time, rather than searching for a new route with rebound again.
         for (int i=0;i<=controls.cols()-3;++i) {
           optimizer.ref_pts_.push_back(initial.evaluateDeBoorT(i*ts));
+        }
+        if (!controls.allFinite()) {
+          throw std::runtime_error("SCAN_REFINE_DIAGNOSTIC_NONFINITE_CONTROLS");
+        }
+        for (std::size_t i=0;i<optimizer.ref_pts_.size();++i) {
+          if (!optimizer.ref_pts_[i].allFinite()) {
+            throw std::runtime_error("SCAN_REFINE_DIAGNOSTIC_NONFINITE_REFERENCE");
+          }
+          if (i>=1 && (optimizer.ref_pts_[i]-optimizer.ref_pts_[i-1]).norm()<1e-9) {
+            throw std::runtime_error("SCAN_REFINE_DIAGNOSTIC_DUPLICATE_REFERENCE");
+          }
+          if (i>=2 && (optimizer.ref_pts_[i]-optimizer.ref_pts_[i-2]).norm()<1e-9) {
+            throw std::runtime_error("SCAN_REFINE_DIAGNOSTIC_DEGENERATE_REFERENCE_TANGENT");
+          }
+        }
+        static bool refine_diagnostic_reported=false;
+        if (!refine_diagnostic_reported) {
+          std::fprintf(stderr,"SCAN_REFINE_DIAGNOSTIC controls=%d refs=%zu ts=%.9g\n",
+            static_cast<int>(controls.cols()),optimizer.ref_pts_.size(),ts);
+          refine_diagnostic_reported=true;
         }
         optimized=optimizer.BsplineOptimizeTrajRefine(controls,ts,controls);
       } else {

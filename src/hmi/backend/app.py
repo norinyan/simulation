@@ -1,6 +1,7 @@
 """Single-session HMI bridge. All movement and planning data come from ROS."""
 import asyncio
 import copy
+import hashlib
 from contextlib import asynccontextmanager
 import json
 import math
@@ -21,7 +22,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from maps import global_map, world_map
+from maps import global_map, world_map, load_scene, scene_catalog
 
 ROOT = Path(os.environ.get('HMI_PROJECT_ROOT', Path(__file__).resolve().parents[3])).resolve()
 FRONTEND = ROOT / 'src/hmi/frontend/dist'
@@ -47,6 +48,7 @@ from std_srvs.srv import Trigger
 
 
 class Selection(BaseModel):
+    map_id: str = 'three-floor'
     start: str = 'F1-ENTRY'
     goal: str = 'F3-EAST'
     global_algorithm: str = 'pct'
@@ -74,6 +76,7 @@ class Session:
         self.processes, self.logs = {}, {}
         self.samples = {}
         self.directory = None
+        self.run_scene_identity = None
         self.operation = asyncio.Lock()
         self.node = RosBridge(self)
         self.executor = SingleThreadedExecutor()
@@ -121,13 +124,20 @@ class Session:
             raise HTTPException(409, '请先启动仿真并等待里程计就绪')
 
     def validate_selection(self, value):
-        config = yaml.safe_load(GLOBAL_CONFIG.read_text())
-        if value.start not in config['points'] or value.goal not in config['points']:
-            raise HTTPException(422, '起终点必须来自当前九个预设点位')
+        scene = selected_scene(value.map_id)
+        if value.start not in scene['points'] or value.goal not in scene['points']:
+            raise HTTPException(422, '起终点必须来自所选地图的预设点位')
+        if value.dynamic_obstacles and not scene['features']['dynamic_obstacles']:
+            raise HTTPException(422, '所选地图禁用行人')
         if value.global_algorithm != 'pct' or value.local_algorithm != 'scan':
             raise HTTPException(422, '目前仅接入 PCT / SCAN')
         if value.start == value.goal:
             raise HTTPException(422, '起点和终点不能相同')
+
+    def require_same_scene(self, map_id):
+        scene = selected_scene(map_id)
+        if scene_identity(scene) != self.run_scene_identity:
+            raise HTTPException(409, '地图产物已改变，请停止仿真后重新启动')
 
     def reset_planning(self):
         with self.lock:
@@ -208,6 +218,8 @@ class Session:
 
     def write_configs(self, selection, plan):
         config = yaml.safe_load(GLOBAL_CONFIG.read_text())
+        scene = selected_scene(selection.map_id)
+        config['points'] = scene['points']
         config['planning'].update(start=selection.start, goal=selection.goal, start_source='preset',
                                   algorithm=selection.global_algorithm, plan_on_startup=plan)
         # Moving a copy to /tmp must not change any source-relative map paths.
@@ -216,6 +228,10 @@ class Session:
             if not value.is_absolute():
                 config[section][key] = str((GLOBAL_CONFIG.parent / value).resolve())
         local = yaml.safe_load(LOCAL_CONFIG.read_text())
+        if scene['manifest'] is not None:
+            config['planning']['map_file'] = str(scene['files']['pctmap'])
+            config['pct']['world_file'] = str(scene['files']['world'])
+            local['map_file'] = str(scene['files']['npz'])
         local['algorithm'] = selection.local_algorithm
         dynamic = local.setdefault('dynamic_obstacles', {})
         dynamic['enabled'] = selection.dynamic_obstacles
@@ -269,7 +285,7 @@ class Session:
         self.update('odom', None)
         request = SpawnEntity.Request(); request.name = 'ideal_robot'
         request.xml = (ROOT / 'src/control/urdf/ideal_robot.urdf').read_text()
-        p = yaml.safe_load(GLOBAL_CONFIG.read_text())['points'][selection.start]['pose']
+        p = selected_scene(selection.map_id)['points'][selection.start]['pose']
         request.initial_pose.position.x, request.initial_pose.position.y = float(p[0]), float(p[1])
         request.initial_pose.position.z = float(p[2])+float(yaml.safe_load(IDEAL_CONFIG.read_text())['reference_height'])
         request.initial_pose.orientation.z, request.initial_pose.orientation.w = math.sin(p[3]/2), math.cos(p[3]/2)
@@ -295,12 +311,15 @@ class Session:
         self.update('dynamic_obstacles', {})
         self.obstacle_versions.clear()
         self.update('simulation', {'state': 'starting', 'paused': False, 'reason': ''})
-        pose = yaml.safe_load(GLOBAL_CONFIG.read_text())['points'][selection.start]['pose']
+        scene = selected_scene(selection.map_id)
+        pose = scene['points'][selection.start]['pose']
+        self.run_scene_identity = scene_identity(scene)
         height = yaml.safe_load(IDEAL_CONFIG.read_text())['reference_height']
         try:
             self.spawn_process('simulation', ['ros2', 'launch', 'sim_bringup', 'sim.launch.py', 'gui:=false',
                                                f'x:={pose[0]}', f'y:={pose[1]}', f'z:={pose[2]+height}',
                                                f'yaw:={pose[3]}', f'ideal_config:={IDEAL_CONFIG}',
+                                               f'world:={scene["files"]["world"]}',
                                                f'dynamic_obstacles:={str(selection.dynamic_obstacles).lower()}'])
             await self.wait_until(lambda: self.snapshot()['odom'] is not None, 35, '等待模型里程计超时')
             self.start_planners(selection, False)
@@ -322,11 +341,15 @@ class Session:
         self.obstacle_versions.clear()
         if self.directory:
             self.directory.cleanup(); self.directory = None
+        self.run_scene_identity = None
         self.update('simulation', {'state': 'stopped', 'paused': False, 'reason': ''})
         return self.snapshot()
 
     async def plan(self, selection):
         self.require_running(); self.validate_selection(selection)
+        if selection.map_id != self.snapshot()['selection']['map_id']:
+            raise HTTPException(409, '切换地图需先停止仿真')
+        self.require_same_scene(selection.map_id)
         if selection.dynamic_obstacles != self.snapshot()['selection']['dynamic_obstacles']:
             raise HTTPException(409, '切换动态障碍需先停止并重新启动仿真')
         if self.busy():
@@ -345,6 +368,8 @@ class Session:
     async def task(self):
         self.require_running()
         state = self.snapshot()
+        self.validate_selection(Selection(**state['selection']))
+        self.require_same_scene(state['selection']['map_id'])
         if state['simulation']['paused']:
             raise HTTPException(409, '请先恢复仿真')
         if not state['global_path'] or not state['global_path']['points'] or state['global_status']['state'] != 'ready':
@@ -502,34 +527,77 @@ async def lifespan(app):
 app = FastAPI(title='Simulation HMI', lifespan=lifespan)
 
 
-def read_config():
-    global_config = yaml.safe_load(GLOBAL_CONFIG.read_text())
+def selected_scene(map_id):
+    try:
+        return load_scene(map_id, GLOBAL_CONFIG)
+    except (OSError, ValueError, KeyError, TypeError, yaml.YAMLError) as exc:
+        raise HTTPException(503, f'所选地图不可用：{exc}') from exc
+
+
+def scene_identity(scene):
+    if scene['manifest'] is not None:
+        # Validation above checks every artifact against this manifest. Pin the
+        # whole generation while Gazebo and planners retain loaded resources.
+        return (scene['id'], hashlib.sha256(scene['manifest'].read_bytes()).hexdigest())
+    return (scene['id'], GLOBAL_CONFIG.read_bytes(), tuple(
+        (key, str(path), path.stat().st_size, path.stat().st_mtime_ns)
+        for key, path in sorted(scene['files'].items())))
+
+
+def read_config(map_id=None):
+    selection = session.snapshot()['selection']
+    scene = selected_scene(map_id or selection['map_id'])
+    try:
+        maps = scene_catalog(GLOBAL_CONFIG)
+    except (OSError, ValueError, KeyError, TypeError, yaml.YAMLError) as exc:
+        raise HTTPException(503, f'地图目录不可用：{exc}') from exc
     return {'points': [{'id': key, 'label': item.get('label', key), 'pose': item['pose']}
-                       for key, item in global_config['points'].items()],
+                       for key, item in scene['points'].items()],
+            'map_id': scene['id'], 'maps': maps,
             'algorithms': {'global': [{'id': item, 'available': item == 'pct'} for item in ('pct', 'mesh', 'gb')],
                            'local': [{'id': item, 'available': item == 'scan'} for item in ('scan', 'teb', 'ego', 'mppi')]},
             'reference_height': yaml.safe_load(IDEAL_CONFIG.read_text())['reference_height'],
-            'selection': session.snapshot()['selection'], 'topic_hz': 20}
+            'selection': selection, 'topic_hz': 20}
 
 
 @app.get('/api/config')
-async def config():
-    return read_config()
+async def config(map_id: str = None):
+    return await asyncio.to_thread(read_config, map_id)
+
+
+class MapSelection(BaseModel):
+    map_id: str
+
+
+@app.post('/api/map/select')
+async def select_map(value: MapSelection):
+    async with session.operation:
+        if session.simulation_state() != 'stopped':
+            raise HTTPException(409, '停止仿真后才能切换地图')
+        scene = selected_scene(value.map_id)
+        selection = Selection(map_id=scene['id'], start=scene['start'], goal=scene['goal'],
+                              dynamic_obstacles=scene['features']['dynamic_obstacles'])
+        session.validate_selection(selection)
+        session.reset_planning()
+        session.update('odom', None)
+        session.update('dynamic_obstacles', {})
+        session.obstacle_versions.clear()
+        session.update('selection', selection_dict(selection))
+        return session.snapshot()
 
 
 map_cache = {}
 
 
-def map_data(kind):
-    cfg = yaml.safe_load(GLOBAL_CONFIG.read_text())
-    source = Path(cfg['planning']['map_file'] if kind == 'global' else cfg['pct']['world_file'])
-    if not source.is_absolute():
-        source = GLOBAL_CONFIG.parent / source
+def map_data(kind, map_id=None):
+    scene = selected_scene(map_id or session.snapshot()['selection']['map_id'])
+    source = scene['files']['pctmap' if kind == 'global' else 'world']
     try:
-        marker = (str(source), source.stat().st_mtime_ns)
-        if map_cache.get(kind, {}).get('marker') != marker:
-            map_cache[kind] = {'marker': marker, 'data': global_map(source) if kind == 'global' else world_map(source)}
-        return map_cache[kind]['data']
+        key = (scene['id'], kind)
+        marker = (str(source), source.stat().st_mtime_ns, scene.get('geometry_fingerprint'))
+        if map_cache.get(key, {}).get('marker') != marker:
+            map_cache[key] = {'marker': marker, 'data': global_map(source) if kind == 'global' else world_map(source, scene)}
+        return map_cache[key]['data']
     except (OSError, ValueError, struct_error) as exc:
         raise HTTPException(503, f'实际地图不可用：{exc}') from exc
 
@@ -538,13 +606,21 @@ from struct import error as struct_error
 
 
 @app.get('/api/map/world')
-async def world():
-    return await asyncio.to_thread(map_data, 'world')
+async def world(map_id: str = None):
+    return await asyncio.to_thread(map_data, 'world', map_id)
 
 
 @app.get('/api/map/global')
-async def offline():
-    return await asyncio.to_thread(map_data, 'global')
+async def offline(map_id: str = None):
+    return await asyncio.to_thread(map_data, 'global', map_id)
+
+
+@app.get('/api/map/mesh')
+async def mesh(map_id: str):
+    scene = await asyncio.to_thread(selected_scene, map_id)
+    if 'mesh' not in scene['files']:
+        raise HTTPException(404, '所选地图没有网格资源')
+    return FileResponse(scene['files']['mesh'], media_type='model/vnd.collada+xml')
 
 
 @app.post('/api/simulation/start')

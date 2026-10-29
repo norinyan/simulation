@@ -2,7 +2,16 @@
 
 基于 **ROS 2 Humble + Gazebo Classic** 的三维规划实验平台，支持跨楼层路径规划、局部滚动轨迹规划、动态行人避障及 HMI 可视化。当前接入 **PCT 全局规划 + SCAN 局部规划**，使用理想点模型执行轨迹。
 
+实测 PCD 地图的资源生成、地图选择和规划接口已接入。D2 已修复 SCAN 在 2 m 滚动截段中的 L-BFGS rounding error 安全处理；新版地图真实任务、暂停/恢复、绕障和原三层楼回归已通过。
+
 ## 构建
+
+地图大文件 `map.pctmap`、`map.dae` 使用 Git LFS。克隆仓库后先安装 Git LFS，并在项目根目录执行，确认获取实际文件后再构建：
+
+```bash
+git lfs install
+git lfs pull
+```
 
 宿主机需安装 Docker Engine、Docker Compose（支持 `gpus: all`）、NVIDIA 驱动及 NVIDIA Container Toolkit；桌面启动需可用的 X11 显示环境。PCT 地图预处理使用 CUDA 12 / CuPy，需兼容的 NVIDIA GPU 与驱动。前端在宿主机构建，需 Node.js **20.19+ 或 22.12+** 及 npm；其余依赖由 Docker 镜像提供。
 
@@ -37,6 +46,42 @@ source install/setup.bash
 
 地图输出为 `build/pct_maps/three_floor_ideal.pctmap` 及同名 `.json` 元数据。首次运行必须生成；修改 World 或地图预处理参数后重新执行上述命令，未变化时自动复用缓存。
 
+### 3. 实测 PCD 地图
+
+当前源为 `/home/hfun/norin/files/datafromwisal/pcd/clean_map.pcd`，共 77,247 点，SHA-256 为 `1c41ecd7042650a573d5f949a9650ba31c43873c8f9a63c06fa6eb484cafa7db`。项目保存原字节副本 `src/sim_bringup/maps/source/clean_map.pcd`，运行不依赖外部源路径。
+
+在容器中生成六个产物：
+
+```bash
+/opt/pct/bin/python3 src/sim_bringup/scripts/prepare_scene.py \
+  --source src/sim_bringup/maps/source/clean_map.pcd \
+  --config src/global_planning/config/global_cfg.yaml \
+  --output src/sim_bringup/maps
+colcon build --packages-select sim_bringup
+```
+
+`--source` 可指定容器可读的其他 PCD；脚本不默认去噪、对齐或填洞。安装后的脚本必须指定可写输出目录：
+
+```bash
+/opt/pct/bin/python3 "$(ros2 pkg prefix sim_bringup)/lib/sim_bringup/prepare_scene.py" \
+  --source "$(ros2 pkg prefix --share sim_bringup)/maps/source/clean_map.pcd" \
+  --output /tmp/pcd-scene
+```
+
+产物为 `map.pctmap`、`map.json`、`map.npz`、`map.dae`、`map.world` 和 `map.yaml`。转换仅连接有观测依据、最长边不超过 0.3 m 且坡度不超过原约束的地面三角面，并保留全部原点对应的 0.05 m 占据体素；未知区域拒绝导航，NPZ 未知地面为 NaN。坐标沿用源数据，米制为运行约定，尚无外部尺度标定文档。清单记录相对路径、指纹、预设点和功能开关，资源缺失或校验不符时明确报错。
+
+D3 显示沿用六产物：绿色表示该地面栅格中心同时通过 PCT 与地面上方 0.44 m 的 SCAN 净空检查，红色表示已提取支撑但未通过，未着色处没有有效支撑保证；灰色保留原点云体素几何。颜色不保证相邻栅格连通，路线仍由实际规划和轨迹检查决定。覆盖裁切到已有观测三角面，不填洞、不参与碰撞；离线图例生成另需 `matplotlib`（包依赖已声明）。
+
+默认点对 `PCD-LONG-START → PCD-LONG-GOAL` 间距 2.25 m、PCT 路径 2.682 m；原 `PCD-START → PCD-GOAL` 保留。优先评估的 5.628 m 候选在实际滚动时被安全检查拒绝，未保留为可用预设，不代表已完成 5～10 m 路线。详细技术证据和视觉确认状态见 `doc/二阶段PRD.md` 的 D3。
+
+HMI“对照原始外观”只切换着色显示。实际 Gazebo 中可旋转/缩放观察整层；在左侧 Models 选择 `display_overlay` 后按 Delete，可移除仅显示覆盖并对照原几何，重启场景恢复覆盖。所有碰撞始终只引用 `original` 子网格。连接 HMI 启动的仿真实例，在容器中执行：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /workspace/install/setup.bash
+GAZEBO_MASTER_URI=http://127.0.0.1:11386 gzclient
+```
+
 ## 启动与操作
 
 在已加载上述 ROS 环境的容器终端执行：
@@ -47,13 +92,13 @@ ros2 launch sim_bringup hmi.launch.py
 
 该入口启动后端和桌面窗口；在界面中按顺序操作：
 
-1. 选择起点、终点及是否开启“行人”（默认开启）。
+1. 选择地图、起点、终点及是否开启“行人”（原三层楼默认开启，实测 PCD 地图禁用）。
 2. 点击 **启动仿真**，等待机器人里程计及规划节点就绪。
 3. 点击 **开始全局规划**，等待全局路径生成。
 4. 点击 **启动任务**，观察局部滚动规划、避障与执行状态，直到任务完成。
 5. 按需 **暂停/恢复仿真**；结束时点击 **停止仿真**。
 
-修改起终点后需重新全局规划；切换行人开关需先停止仿真。HMI 会管理 Gazebo 和规划进程，无需另行启动 `sim.launch.py` 或 `planning.launch.py`。
+修改起终点后需重新全局规划；切换地图或行人开关需先停止仿真。切图会清除旧任务与轨迹状态；不可用地图显示原因并拒绝启动。HMI 会管理 Gazebo 和规划进程，无需另行启动 `sim.launch.py` 或 `planning.launch.py`。
 
 也可只启动后端，在宿主机浏览器打开 <http://127.0.0.1:8000>：
 
@@ -85,7 +130,7 @@ docker compose -f docker/compose.yaml down
                             └──────────→ 局部规划反馈 → 到达终点
 ```
 
-HMI 通过 FastAPI / WebSocket 桥接 ROS，展示地图、路径、轨迹、机器人、行人、规划耗时和进程资源占用。全局规划读取离线地图，局部规划直接读取 World 碰撞几何，并结合里程计和动态障碍观测滚动生成轨迹。
+HMI 通过 FastAPI / WebSocket 桥接 ROS，展示地图、路径、轨迹、机器人、行人、规划耗时和进程资源占用。全局规划读取离线地图；局部规划在原场景读取 World 碰撞几何，在实测地图读取 NPZ 占据、距离及支撑查询，并结合里程计和适用场景的动态障碍观测滚动生成轨迹。
 
 ## 目录与模块
 
@@ -98,7 +143,8 @@ simulation_new/                   # ROS 工作空间根目录
 │   │   ├── launch/               # hmi / sim / planning.launch.py
 │   │   ├── worlds/               # three_floor.world
 │   │   ├── config/               # dynamic_obstacles.yaml
-│   │   └── scripts/              # dynamic_obstacles.py
+│   │   ├── maps/                 # 实测源副本、六个产物及地图清单
+│   │   └── scripts/              # dynamic_obstacles.py / prepare_scene.py
 │   ├── global_planning/          # 全局节点、配置、PCT 算法与地图预处理
 │   │   ├── global_node.cpp
 │   │   ├── config/

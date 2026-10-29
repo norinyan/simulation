@@ -204,5 +204,34 @@ def main():
     print('PCT map written:', output, flush=True)
 
 
+def observed_surface_map(points, center, dims, ground_min, settings, support, height):
+    """Run the original GPU tomography on one explicitly sampled geometry.
+
+    The support mask rejects unknown XY and unrelated upper surfaces. It never
+    creates traversability or replaces the original tomography cost/height.
+    """
+    import numpy as np
+    from tomogram import Tomogram
+    radius = math.hypot(settings['length'], settings['width']) / 2 + settings['safety_margin']
+    contour = 1. - settings['cost_threshold'] / settings['cost_barrier']
+    inflation = max(0., radius - contour * (settings['safe_margin'] + settings['resolution']))
+    cfg = NS(map=NS(resolution=settings['resolution'], slice_dh=settings['slice_dh'], simplify_layers=False),
+             trav=NS(kernel_size=settings['kernel_size'], interval_min=settings['clearance'],
+                     interval_free=settings['clearance'] + settings['interval_free_margin'],
+                     slope_max=settings['slope_max'], step_max=settings['max_step'] + 1e-6,
+                     standable_ratio=settings['standable_ratio'], cost_barrier=settings['cost_barrier'],
+                     safe_margin=settings['safe_margin'], inflation=inflation))
+    slices = int(np.ceil((points[:, 2].max() - ground_min) / settings['slice_dh']))
+    if int(np.prod(dims)) * slices > 50000000:
+        raise ValueError('PCT map exceeds 50 million cells')
+    tomography = Tomogram(cfg)
+    tomography.initMappingEnv(center, *dims, slices, ground_min + settings['slice_dh'])
+    cost, gx, gy, floor, ceiling, timing = tomography.point2map(points.astype(np.float32))
+    accepted = support[None] & np.isfinite(floor) & (np.abs(floor - height[None]) <= .01)
+    cost[~accepted] = settings['cost_barrier']
+    floor[~accepted] = np.nan
+    return np.stack([cost, gx, gy, floor, ceiling]).astype('<f4'), timing, radius
+
+
 if __name__ == '__main__':
     main()

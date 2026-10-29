@@ -1,0 +1,2 @@
+src/sim_bringup/maps/map.pctmap filter=lfs diff=lfs merge=lfs -text
+src/sim_bringup/maps/map.dae filter=lfs diff=lfs merge=lfs -text

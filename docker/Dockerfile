@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-cjk \
     liburdfdom-tools \
     libceres-dev \
+    libminizip-dev \
     ros-humble-gtsam \
     python3-venv \
     python3-pip \

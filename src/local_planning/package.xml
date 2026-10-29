@@ -17,6 +17,7 @@
   <depend>yaml-cpp</depend>
   <depend>eigen</depend>
   <depend>tinyxml2_vendor</depend>
+  <depend>libminizip-dev</depend>
   <exec_depend>control</exec_depend>
   <export><build_type>ament_cmake</build_type></export>
 </package>

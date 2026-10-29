@@ -1,0 +1,59 @@
+version: 1
+id: wisal-pcd
+name: Wisal PCD · 实测环境
+frame: world
+files:
+  pcd: source/clean_map.pcd
+  pctmap: map.pctmap
+  metadata: map.json
+  npz: map.npz
+  mesh: map.dae
+  world: map.world
+sha256:
+  pcd: 1c41ecd7042650a573d5f949a9650ba31c43873c8f9a63c06fa6eb484cafa7db
+  pctmap: 87fb30d3bd27affd99c0f7fd582cc99c839e0137c3556567314ad1801f9a074b
+  metadata: 218233fd799d1dbce2fce933d68d79282cb6c3062ca5b0e6290c84b6eb313878
+  npz: 72e51d5410b1fd3855d1bb3ea834ca89af4d5b38860a6447d6e8886f59b14941
+  mesh: d84b83457cd8cd865312f93a40df2a07b4d83b6daec72c2415c39b7bc43d07e7
+  world: b08c83424d19817b11d79e22686b87c283fd4c964e4e6116ca72e0cd664bc7ca
+source_sha256: 1c41ecd7042650a573d5f949a9650ba31c43873c8f9a63c06fa6eb484cafa7db
+geometry_fingerprint: cf5b6795a5371941f094739c5a4e23936cbebc9b1996d34dc14ed0dfaf80b104
+coordinates:
+  frame: world
+  unit: m
+  transform: identity; source coordinates retained
+  evidence: near-horizontal observed surfaces around z=-1 and z=1.9; near-vertical
+    walls; no registration
+features:
+  dynamic_obstacles: false
+points:
+  PCD-START:
+    label: PCD-START
+    pose:
+    - -15.425
+    - -0.5250000000000004
+    - -1.0
+    - 0.0
+  PCD-GOAL:
+    label: PCD-GOAL
+    pose:
+    - -13.775000000000002
+    - -1.0750000000000002
+    - -1.0188449685904533
+    - 0.0
+  PCD-LONG-START:
+    label: PCD-LONG-START
+    pose:
+    - -11.775000000000002
+    - -0.1750000000000007
+    - -1.0
+    - 0.0
+  PCD-LONG-GOAL:
+    label: PCD-LONG-GOAL
+    pose:
+    - -13.575000000000003
+    - -1.5250000000000004
+    - -1.0
+    - 0.0
+start: PCD-LONG-START
+goal: PCD-LONG-GOAL

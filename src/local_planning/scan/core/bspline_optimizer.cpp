@@ -1134,6 +1134,9 @@ namespace scan_planner
       int result = lbfgs::lbfgs_optimize(variable_num_, q, &final_cost, BsplineOptimizer::costFunctionRebound, NULL, BsplineOptimizer::earlyExit, this, &lbfgs_params);
       checkDeadline();
       copyFromSolver(q);
+      if (!cps_.points.allFinite()) {
+        throw std::runtime_error("SCAN_REBOUND_ROUNDING_NONFINITE_CONTROLS");
+      }
 
 
 
@@ -1141,8 +1144,14 @@ namespace scan_planner
       if (result == lbfgs::LBFGS_CONVERGENCE ||
           result == lbfgs::LBFGSERR_MAXIMUMITERATION ||
           result == lbfgs::LBFGS_ALREADY_MINIMIZED ||
-          result == lbfgs::LBFGS_STOP)
+          result == lbfgs::LBFGS_STOP ||
+          result == lbfgs::LBFGSERR_ROUNDING_ERROR)
       {
+        if (result == lbfgs::LBFGSERR_ROUNDING_ERROR) {
+          // A rounded line-search step still leaves candidate controls. Keep
+          // them only for the existing collision/restart checks below.
+          std::fprintf(stderr, "SCAN: Rebound line search rounding; validating current controls\n");
+        }
         //ROS_WARN("Solver error in planning!, return = %s", lbfgs::lbfgs_strerror(result));
         flag_force_return = false;
 
@@ -1239,6 +1248,7 @@ namespace scan_planner
       int result = lbfgs::lbfgs_optimize(variable_num_, q, &final_cost, BsplineOptimizer::costFunctionRefine, NULL, BsplineOptimizer::earlyExit, this, &lbfgs_params);
       checkDeadline();
       copyFromSolver(q);
+      bool solver_rounding_error = false;
       if (result == lbfgs::LBFGS_CONVERGENCE ||
           result == lbfgs::LBFGSERR_MAXIMUMITERATION ||
           result == lbfgs::LBFGS_ALREADY_MINIMIZED ||
@@ -1246,11 +1256,25 @@ namespace scan_planner
       {
         //pass
       }
+      else if (result == lbfgs::LBFGSERR_ROUNDING_ERROR)
+      {
+        // LBFGS may stop at a numerically rounded line-search step after
+        // producing finite controls. Keep those controls and let the exact
+        // collision/safety checks below decide whether they are usable.
+        std::fprintf(stderr, "SCAN: Refine line search rounding; validating current controls\n");
+        solver_rounding_error = true;
+      }
       else
       {
         std::fprintf(stderr, "SCAN: Solver error in refining!, return = %d, %s", result, lbfgs::lbfgs_strerror(result));
         lambda2_ = origin_lambda2;
         throw std::runtime_error("SCAN_REFINE_SOLVER code="+std::to_string(result)+" "+lbfgs::lbfgs_strerror(result));
+      }
+
+      if (!cps_.points.allFinite()) {
+        lambda2_ = origin_lambda2;
+        throw std::runtime_error(solver_rounding_error ?
+          "SCAN_REFINE_ROUNDING_NONFINITE_CONTROLS" : "SCAN_REFINE_NONFINITE_CONTROLS");
       }
 
       UniformBspline traj = UniformBspline(cps_.points, 3, bspline_interval_);

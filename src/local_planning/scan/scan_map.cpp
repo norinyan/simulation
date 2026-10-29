@@ -5,10 +5,88 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <minizip/unzip.h>
+#include <array>
+#include <cstring>
+#include <map>
+#include <regex>
+#include <cstdint>
 
 namespace local_planning {
 namespace {
 using Element = tinyxml2::XMLElement;
+
+struct Array {
+  std::string type;
+  std::vector<std::size_t> shape;
+  std::vector<unsigned char> data;
+};
+std::map<std::string,Array> arrays(const std::string & filename)
+{
+  const auto zip=unzOpen64(filename.c_str());
+  if(!zip)throw std::runtime_error("SCAN_NPZ_UNREADABLE: "+filename);
+  std::map<std::string,Array> result;
+  try {
+    int status=unzGoToFirstFile(zip);
+    std::size_t total=0;
+    while(status==UNZ_OK) {
+      unz_file_info64 info{};std::array<char,256> name{};
+      if(unzGetCurrentFileInfo64(zip,&info,name.data(),name.size(),nullptr,0,nullptr,0)!=UNZ_OK ||
+        info.size_filename>=name.size() || info.uncompressed_size>512ULL*1024*1024 ||
+        (total+=info.uncompressed_size)>1024ULL*1024*1024) {
+        throw std::runtime_error("SCAN_NPZ_INVALID_MEMBER_SIZE");
+      }
+      const std::string key(name.data());
+      if(key.size()<5 || key.substr(key.size()-4)!=".npy" || key.find('/')!=std::string::npos || result.count(key)) {
+        throw std::runtime_error("SCAN_NPZ_INVALID_MEMBER_NAME");
+      }
+      if(unzOpenCurrentFile(zip)!=UNZ_OK)throw std::runtime_error("SCAN_NPZ_MEMBER_UNREADABLE");
+      std::vector<unsigned char> bytes(info.uncompressed_size);std::size_t read=0;
+      while(read<bytes.size()) {
+        const int n=unzReadCurrentFile(zip,bytes.data()+read,std::min<std::size_t>(bytes.size()-read,1<<20));
+        if(n<=0) {unzCloseCurrentFile(zip);throw std::runtime_error("SCAN_NPZ_TRUNCATED");}
+        read+=n;
+      }
+      if(unzCloseCurrentFile(zip)!=UNZ_OK)throw std::runtime_error("SCAN_NPZ_CRC_ERROR");
+      if(bytes.size()<10 || std::memcmp(bytes.data(),"\x93NUMPY",6)!=0 || bytes[7]!=0 ||
+        (bytes[6]!=1 && bytes[6]!=2))throw std::runtime_error("SCAN_NPY_BAD_FORMAT");
+      const std::size_t prefix=bytes[6]==1?10:12;
+      if(bytes.size()<prefix)throw std::runtime_error("SCAN_NPY_TRUNCATED_HEADER");
+      std::size_t header_size=0;
+      for(std::size_t j=8;j<prefix;++j)header_size|=std::size_t(bytes[j])<<(8*(j-8));
+      if(header_size>65536 || prefix+header_size>bytes.size())throw std::runtime_error("SCAN_NPY_BAD_HEADER_SIZE");
+      const std::string header(reinterpret_cast<const char*>(bytes.data()+prefix),header_size);
+      std::smatch match;Array a;
+      if(!std::regex_search(header,match,std::regex("'descr'\\s*:\\s*'([^']+)'")))throw std::runtime_error("SCAN_NPY_MISSING_DTYPE");
+      a.type=match[1];
+      if(!std::regex_search(header,std::regex("'fortran_order'\\s*:\\s*False")))throw std::runtime_error("SCAN_NPY_REQUIRES_C_ORDER");
+      if(!std::regex_search(header,match,std::regex("'shape'\\s*:\\s*\\(([^)]*)\\)")))throw std::runtime_error("SCAN_NPY_MISSING_SHAPE");
+      std::istringstream dims(match[1]);std::string dim;
+      while(std::getline(dims,dim,',')) {
+        if(dim.find_first_not_of(" ")==std::string::npos)continue;
+        std::istringstream value(dim);std::size_t n;std::string extra;
+        if(!(value>>n) || n==0 || n>50000000 || (value>>extra))throw std::runtime_error("SCAN_NPY_BAD_SHAPE");
+        a.shape.push_back(n);
+      }
+      a.data.assign(bytes.begin()+prefix+header_size,bytes.end());
+      result.emplace(key,std::move(a));status=unzGoToNextFile(zip);
+    }
+    if(status!=UNZ_END_OF_LIST_OF_FILE)throw std::runtime_error("SCAN_NPZ_BAD_DIRECTORY");
+    unzClose(zip);return result;
+  } catch(...) {unzClose(zip);throw;}
+}
+template<class T> std::vector<T> values(const std::map<std::string,Array> & a,
+  const std::string & key,const std::string & type,const std::vector<std::size_t> & shape)
+{
+  const auto found=a.find(key+".npy");
+  if(found==a.end() || found->second.type!=type || found->second.shape!=shape) {
+    throw std::runtime_error("SCAN_NPZ_DTYPE_OR_SHAPE: "+key);
+  }
+  std::size_t count=1;
+  for(auto n:shape) {if(count>50000000/n)throw std::runtime_error("SCAN_NPZ_TOO_MANY_CELLS");count*=n;}
+  if(found->second.data.size()!=count*sizeof(T))throw std::runtime_error("SCAN_NPZ_PAYLOAD_SIZE: "+key);
+  std::vector<T> out(count);std::memcpy(out.data(),found->second.data.data(),out.size()*sizeof(T));return out;
+}
 
 std::vector<double> numbers(const char * text, std::size_t count)
 {
@@ -43,8 +121,53 @@ Eigen::Isometry3d pose(Element * parent)
 
 }  // namespace
 
+void ScanMap::loadNpz(const std::string & filename)
+{
+  const auto a=arrays(filename);Grid parsed;
+  if(values<int32_t>(a,"version","<i4",{})[0]!=1)throw std::runtime_error("SCAN_NPZ_UNSUPPORTED_VERSION");
+  parsed.resolution=values<double>(a,"resolution","<f8",{})[0];
+  const auto origin=values<double>(a,"origin","<f8",{3});
+  parsed.origin=Eigen::Vector3d(origin[0],origin[1],origin[2]);
+  if(!parsed.origin.allFinite() || !std::isfinite(parsed.resolution) || parsed.resolution<=0)throw std::runtime_error("SCAN_NPZ_INVALID_GEOMETRY");
+  const auto order=values<unsigned char>(a,"axis_order","|u1",{3});
+  if(std::string(order.begin(),order.end())!="xyz")throw std::runtime_error("SCAN_NPZ_BAD_AXIS_ORDER");
+  for(const auto & key:{"source_sha256","geometry_fingerprint"}) {
+    const auto fingerprint=values<unsigned char>(a,key,"|u1",{64});
+    for(auto ch:fingerprint)if(!((ch>='0'&&ch<='9')||(ch>='a'&&ch<='f')))throw std::runtime_error("SCAN_NPZ_BAD_FINGERPRINT");
+  }
+  const auto member=a.find("distance.npy");
+  if(member==a.end() || member->second.shape.size()!=3)throw std::runtime_error("SCAN_NPZ_BAD_DISTANCE_SHAPE");
+  const auto shape=member->second.shape;parsed.nx=shape[0];parsed.ny=shape[1];parsed.nz=shape[2];
+  if(parsed.nx<2||parsed.ny<2||parsed.nz<2)throw std::runtime_error("SCAN_NPZ_GRID_TOO_SMALL");
+  parsed.distance=values<float>(a,"distance","<f4",shape);
+  const auto occupancy=values<unsigned char>(a,"occupancy","|u1",shape);
+  const auto ground=a.find("ground.npy");
+  if(ground==a.end() || ground->second.shape.size()!=3 || ground->second.shape[1]!=parsed.nx || ground->second.shape[2]!=parsed.ny)throw std::runtime_error("SCAN_NPZ_BAD_GROUND_SHAPE");
+  parsed.layers=ground->second.shape[0];parsed.ground=values<float>(a,"ground","<f4",ground->second.shape);
+  parsed.valid=values<unsigned char>(a,"valid","|u1",ground->second.shape);
+  const auto layer_z=values<double>(a,"layer_z","<f8",{parsed.layers});
+  for(std::size_t i=0;i<layer_z.size();++i)if(!std::isfinite(layer_z[i]) || (i&&layer_z[i]<=layer_z[i-1]))throw std::runtime_error("SCAN_NPZ_INVALID_LAYERS");
+  const double margin=values<double>(a,"conservative_margin","<f8",{})[0];
+  if(!std::isfinite(margin)||margin<0)throw std::runtime_error("SCAN_NPZ_INVALID_DISTANCE_MARGIN");
+  for(std::size_t i=0;i<parsed.distance.size();++i) {
+    if(!std::isfinite(parsed.distance[i])||occupancy[i]>1 || (occupancy[i]&&parsed.distance[i]>0))throw std::runtime_error("SCAN_NPZ_INVALID_DISTANCE");
+  }
+  for(std::size_t i=0;i<parsed.ground.size();++i) {
+    if(parsed.valid[i]>1 || (parsed.valid[i]?!std::isfinite(parsed.ground[i]):!std::isnan(parsed.ground[i])))throw std::runtime_error("SCAN_NPZ_INVALID_GROUND");
+  }
+  for(std::size_t xy=0;xy<parsed.nx*parsed.ny;++xy) {
+    bool known=false;
+    for(std::size_t layer=0;layer<parsed.layers;++layer)known=known||parsed.valid[layer*parsed.nx*parsed.ny+xy];
+    if(!known)for(std::size_t z=0;z<parsed.nz;++z) {
+      if(!occupancy[xy*parsed.nz+z])throw std::runtime_error("SCAN_NPZ_UNKNOWN_COLUMN_IS_FREE");
+    }
+  }
+  boxes_.clear();grid_=std::move(parsed);
+}
+
 void ScanMap::load(const std::string & filename)
 {
+  if(filename.size()>=4 && filename.substr(filename.size()-4)==".npz") {loadNpz(filename);return;}
   tinyxml2::XMLDocument document;
   if (document.LoadFile(filename.c_str()) != tinyxml2::XML_SUCCESS) {
     throw std::runtime_error("SCAN_WORLD_UNREADABLE: " + filename);
@@ -95,12 +218,27 @@ void ScanMap::load(const std::string & filename)
   }
   if (parsed.empty()) {throw std::runtime_error("SCAN_WORLD_NO_COLLISIONS");}
   boxes_ = std::move(parsed);
+  grid_=Grid{};
 }
 
 bool ScanMap::height(double x, double y, double ceiling, double depth, double & z) const
 {
   if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(ceiling) ||
     !std::isfinite(depth) || depth <= 0) {return false;}
+  if(!grid_.distance.empty()) {
+    const auto & g=grid_;const double qx=(x-g.origin.x())/g.resolution,qy=(y-g.origin.y())/g.resolution;
+    if(qx<0||qy<0||qx>=double(g.nx)||qy>=double(g.ny))return false;
+    const std::size_t ix=std::floor(qx),iy=std::floor(qy);
+    bool found=false;double best=-std::numeric_limits<double>::infinity();
+    for(std::size_t layer=0;layer<g.layers;++layer) {
+      const auto i=(layer*g.nx+ix)*g.ny+iy;
+      if(!g.valid[i])continue;
+      const double h=g.ground[i];
+      if(h<=ceiling+1e-9&&h>=ceiling-depth-1e-9&&h>best) {best=h;found=true;}
+    }
+    if(found)z=best;
+    return found;
+  }
   double best = std::numeric_limits<double>::infinity();
   const Eigen::Vector3d origin(x, y, ceiling), direction(0, 0, -1);
   for (const auto & box : boxes_) {
@@ -138,6 +276,26 @@ bool ScanMap::height(double x, double y, double ceiling, double depth, double & 
 double ScanMap::signedDistance(const Eigen::Vector3d & point,Eigen::Vector3d & gradient) const
 {
   gradient.setZero();
+  if(!grid_.distance.empty()) {
+    if(!point.allFinite())throw std::runtime_error("SCAN_INVALID_DISTANCE_QUERY");
+    const auto & g=grid_;const Eigen::Vector3d q=(point-g.origin)/g.resolution-Eigen::Vector3d::Constant(.5);
+    const std::array<std::size_t,3> dims{g.nx,g.ny,g.nz};
+    std::array<std::size_t,3> base;Eigen::Vector3d t;
+    for(int j=0;j<3;++j) {
+      if(q[j]<0||q[j]>double(dims[j]-1))return -g.resolution;
+      base[j]=std::min<std::size_t>(std::floor(q[j]),dims[j]-2);t[j]=q[j]-base[j];
+    }
+    double result=0;
+    for(int x=0;x<2;++x)for(int y=0;y<2;++y)for(int z=0;z<2;++z) {
+      const double v=g.distance[((base[0]+x)*g.ny+base[1]+y)*g.nz+base[2]+z];
+      const double wx=x?t.x():1-t.x(),wy=y?t.y():1-t.y(),wz=z?t.z():1-t.z();
+      result+=v*wx*wy*wz;
+      gradient.x()+=v*(x?1:-1)*wy*wz/g.resolution;
+      gradient.y()+=v*wx*(y?1:-1)*wz/g.resolution;
+      gradient.z()+=v*wx*wy*(z?1:-1)/g.resolution;
+    }
+    return result;
+  }
   if (boxes_.empty() || !point.allFinite()) {throw std::runtime_error("SCAN_INVALID_DISTANCE_QUERY");}
   double best=std::numeric_limits<double>::infinity();
   for (const auto & box:boxes_) {
@@ -161,6 +319,7 @@ double ScanMap::signedDistance(const Eigen::Vector3d & point,Eigen::Vector3d & g
 
 double ScanMap::clearance(const Eigen::Vector3d & point) const
 {
+  if(!grid_.distance.empty()) {Eigen::Vector3d gradient;return point.allFinite()?std::max(0.,signedDistance(point,gradient)):0.;}
   return segmentClearance(point, point);
 }
 
@@ -168,6 +327,18 @@ double ScanMap::clearance(const Eigen::Vector3d & point) const
 // Within each interval split by box-face crossings, squared distance is quadratic.
 double ScanMap::segmentClearance(const Eigen::Vector3d & from, const Eigen::Vector3d & to) const
 {
+  if(!grid_.distance.empty()) {
+    if(!from.allFinite()||!to.allFinite())return 0;
+    const double length=(to-from).norm();
+    if(!std::isfinite(length)||length/(grid_.resolution*.5)>1000000)return 0;
+    const std::size_t count=std::max<std::size_t>(1,std::ceil(length/(grid_.resolution*.5)));
+    if(count>1000000)return 0;
+    double best=std::numeric_limits<double>::infinity();Eigen::Vector3d gradient;
+    for(std::size_t i=0;i<=count;++i)best=std::min(best,signedDistance(from+(to-from)*(double(i)/count),gradient));
+    // Each sampled field value is a lower bound on true geometry distance.
+    // True geometry distance is 1-Lipschitz, even if interpolation is not.
+    return std::max(0.,best-length/(2*count));
+  }
   if (boxes_.empty() || !from.allFinite() || !to.allFinite()) {return 0;}
   double best=std::numeric_limits<double>::infinity();
   const Eigen::Vector3d minimum=from.cwiseMin(to),maximum=from.cwiseMax(to);
