@@ -129,6 +129,33 @@ def _sha(path):
     return value.hexdigest()
 
 
+def _validate_completion(manifest, metadata):
+    terrain = metadata.get('terrain_model')
+    if terrain == 'observed_surface':
+        if any(record.get('simulation_only') or record.get('completion') for record in [manifest,metadata]):
+            raise ValueError('Observed map cannot declare simulation completion')
+        return
+    if terrain != 'observed_surface_with_simulation_completion':
+        raise ValueError('Unsupported map terrain model')
+    if manifest.get('simulation_only') is not True or metadata.get('simulation_only') is not True:
+        raise ValueError('Completed map must be explicitly simulation-only')
+    completion = metadata.get('completion')
+    if not isinstance(completion,dict) or not isinstance(completion.get('spec'),dict) or not completion['spec']:
+        raise ValueError('Missing simulation completion specification')
+    canonical = lambda value: json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False)
+    if canonical(completion) != canonical(manifest.get('completion')):
+        raise ValueError('Simulation completion manifest/metadata mismatch')
+    if hashlib.sha256(canonical(completion['spec']).encode()).hexdigest() != completion.get('spec_sha256'):
+        raise ValueError('Simulation completion specification fingerprint mismatch')
+    bounds = completion.get('bounds')
+    if not isinstance(bounds,dict) or set(bounds) != {'min','max'}:
+        raise ValueError('Missing simulation completion bounds')
+    lower,upper = np.asarray(bounds['min'],dtype=float),np.asarray(bounds['max'],dtype=float)
+    if (lower.shape!=(3,) or upper.shape!=(3,) or not np.isfinite([lower,upper]).all() or
+            np.any(lower>upper) or np.any(lower[:2]>=upper[:2])):
+        raise ValueError('Invalid simulation completion bounds')
+
+
 def validate_manifest(manifest_path):
     """Validate every resource before authorizing this observed map for a task."""
     path = Path(manifest_path).resolve()
@@ -153,10 +180,10 @@ def validate_manifest(manifest_path):
             raise ValueError('Map source fingerprint mismatch')
         metadata = json.loads(files['metadata'].read_text())
         if (metadata.get('map_kind') != 'pcd_surface_voxel_union_v1' or
-                metadata.get('terrain_model') != 'observed_surface' or
                 metadata.get('source_sha256') != source_hash or metadata.get('fingerprint') != geometry or
                 metadata.get('regions') != []):
             raise ValueError('Map metadata identity mismatch')
+        _validate_completion(manifest,metadata)
         if _relative_file(path.parent,metadata.get('source')) != files['pcd']:
             raise ValueError('Map metadata source path mismatch')
         header = struct.Struct('<8sIII6d')

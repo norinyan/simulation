@@ -172,7 +172,7 @@ export default function Scene({ world, globalPath, localTrajectory, initialTraje
       if (currentFilter === 'current' && current) floor = Math.max(0, Math.floor((current.pose.pose.position.z - .2) / 3.2));
       else if (currentFilter !== 'all' && currentFilter !== 'current') floor = Number(currentFilter);
       geometry.children.forEach(mesh => { mesh.visible = floor === null || mesh.userData.floor === floor; });
-      geometry.traverse(item => { if (item.name.startsWith('display_')) item.visible = live.current.showOverlay; });
+      geometry.traverse(item => { if (item.name?.startsWith('display_')) item.visible = live.current.showOverlay; });
       obstacles.children.forEach(mesh => { mesh.visible = floor === null || mesh.userData.floor === floor; });
       const pose = current?.pose?.pose;
       if (pose) {

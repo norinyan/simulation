@@ -46,7 +46,7 @@ source install/setup.bash
 
 地图输出为 `build/pct_maps/three_floor_ideal.pctmap` 及同名 `.json` 元数据。首次运行必须生成；修改 World 或地图预处理参数后重新执行上述命令，未变化时自动复用缓存。
 
-### 3. 实测 PCD 地图
+### 3. PCD 地图与仿真补全通道
 
 当前源为 `/home/hfun/norin/files/datafromwisal/pcd/clean_map.pcd`，共 77,247 点，SHA-256 为 `1c41ecd7042650a573d5f949a9650ba31c43873c8f9a63c06fa6eb484cafa7db`。项目保存原字节副本 `src/sim_bringup/maps/source/clean_map.pcd`，运行不依赖外部源路径。
 
@@ -56,8 +56,9 @@ source install/setup.bash
 /opt/pct/bin/python3 src/sim_bringup/scripts/prepare_scene.py \
   --source src/sim_bringup/maps/source/clean_map.pcd \
   --config src/global_planning/config/global_cfg.yaml \
+  --simulation-corridor src/sim_bringup/maps/source/simulation_corridor.yaml \
   --output src/sim_bringup/maps
-colcon build --packages-select sim_bringup
+colcon build --packages-select global_planning sim_bringup
 ```
 
 `--source` 可指定容器可读的其他 PCD；脚本不默认去噪、对齐或填洞。安装后的脚本必须指定可写输出目录：
@@ -70,9 +71,11 @@ colcon build --packages-select sim_bringup
 
 产物为 `map.pctmap`、`map.json`、`map.npz`、`map.dae`、`map.world` 和 `map.yaml`。转换仅连接有观测依据、最长边不超过 0.3 m 且坡度不超过原约束的地面三角面，并保留全部原点对应的 0.05 m 占据体素；未知区域拒绝导航，NPZ 未知地面为 NaN。坐标沿用源数据，米制为运行约定，尚无外部尺度标定文档。清单记录相对路径、指纹、预设点和功能开关，资源缺失或校验不符时明确报错。
 
-D3 显示沿用六产物：绿色表示该地面栅格中心同时通过 PCT 与地面上方 0.44 m 的 SCAN 净空检查，红色表示已提取支撑但未通过，未着色处没有有效支撑保证；灰色保留原点云体素几何。颜色不保证相邻栅格连通，路线仍由实际规划和轨迹检查决定。覆盖裁切到已有观测三角面，不填洞、不参与碰撞；离线图例生成另需 `matplotlib`（包依赖已声明）。
+当前仿真版本额外按 `source/simulation_corridor.yaml` 的中心线、1.3 m 宽度及高度补齐下侧通道的缺测地面；保留原有地面高度和全部障碍。补面同时进入 PCT、SCAN 和 Gazebo 碰撞几何，清单与场景图例明确标注“仿真补全”，不能作为实测地面依据。省略 `--simulation-corridor` 可生成只含观测面的版本；补面范围外未知区域仍拒绝导航。PCT 额外取 SCAN 点/邻接边安全域的交集，只提高不兼容栅格代价，不改变 0.05 m 硬净空和运动约束。
 
-默认点对 `PCD-LONG-START → PCD-LONG-GOAL` 间距 2.25 m、PCT 路径 2.682 m；原 `PCD-START → PCD-GOAL` 保留。优先评估的 5.628 m 候选在实际滚动时被安全检查拒绝，未保留为可用预设，不代表已完成 5～10 m 路线。详细技术证据和视觉确认状态见 `doc/二阶段PRD.md` 的 D3。
+通行着色沿用六产物：绿色表示该地面栅格中心同时通过 PCT 与地面上方 0.44 m 的 SCAN 净空检查，红色表示已提取支撑但未通过，未着色处没有有效支撑保证；灰色保留原点云体素几何。颜色不保证相邻栅格连通，路线仍由实际规划和轨迹检查决定。覆盖裁切到地图三角面（补全版含人工补面），着色本身不参与碰撞；离线图例生成另需 `matplotlib`（包依赖已声明）。
+
+仿真补全版默认点对为 `PCD-CORRIDOR-START → PCD-CORRIDOR-GOAL`，从左下侧到右下侧，间距约 43 m；原四个短路线点保留。实际执行验收见 `doc/二阶段PRD.md` 的 D4；D3 中 2.682 m 短路线证据对应补面前版本。
 
 HMI“对照原始外观”只切换着色显示。实际 Gazebo 中可旋转/缩放观察整层；在左侧 Models 选择 `display_overlay` 后按 Delete，可移除仅显示覆盖并对照原几何，重启场景恢复覆盖。所有碰撞始终只引用 `original` 子网格。连接 HMI 启动的仿真实例，在容器中执行：
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the observed PCD scene; no hole filling, smoothing or alignment."""
+"""Generate the PCD scene, optionally with an explicit simulation floor corridor."""
 import argparse
 import hashlib
 import json
@@ -77,6 +77,59 @@ def voxel_mesh(indices, resolution):
     return vertices, (faces[None]+np.arange(len(indices))[:, None, None]*8).reshape(-1,3)
 
 
+def simulation_corridor(path, source_hash, xy, dims, resolution, observed_support):
+    """A bounded synthetic floor, never a change to source obstacles or safety."""
+    spec = yaml.safe_load(path.read_text())
+    if (not isinstance(spec, dict) or spec.get('version') != 1
+            or spec.get('purpose') != 'simulation_only'
+            or spec.get('source_sha256') != source_hash):
+        raise ValueError('Corridor must be explicitly simulation-only and match the source PCD')
+    line = np.asarray(spec['centerline'], dtype=float)
+    width = float(spec['width_m'])
+    if (line.ndim != 2 or line.shape[1] != 3 or len(line) < 2
+            or not np.isfinite(line).all() or not .5 <= width <= 3.):
+        raise ValueError('Invalid simulation corridor centreline/width')
+    delta = np.diff(line, axis=0)
+    lengths2 = np.sum(delta[:, :2]**2, axis=1)
+    if (np.any(lengths2 < resolution**2)
+            or np.any(abs(delta[:, 2])/np.sqrt(lengths2) > np.tan(.4))):
+        raise ValueError('Simulation corridor has degenerate or over-steep segments')
+    def project(query):
+        best = np.full(len(query), np.inf)
+        heights = np.zeros(len(query))
+        for start, step, norm in zip(line[:-1], delta, lengths2):
+            t = np.clip((query-start[:2])@step[:2]/norm, 0, 1)
+            distance2 = np.sum((query-start[:2]-t[:, None]*step[:2])**2, axis=1)
+            take = distance2 < best
+            best[take] = distance2[take]
+            heights[take] = start[2]+t[take]*step[2]
+        return best, heights
+    distances2, heights = project(xy)
+    mask = ((distances2 <= (width/2)**2) & ~observed_support).reshape(tuple(dims))
+    cells = np.argwhere(mask)
+    if not len(cells):
+        raise ValueError('Simulation corridor lies outside source bounds')
+    origin_xy = xy[0]-resolution/2
+    corners = np.unique((cells[:, None]+np.array([[0,0],[1,0],[1,1],[0,1]])).reshape(-1,2), axis=0)
+    _, z = project(origin_xy+corners*resolution)
+    vertices = np.column_stack([origin_xy+corners*resolution, z])
+    lookup = {tuple(cell):n for n,cell in enumerate(corners)}
+    quads = np.array([[lookup[tuple(cell+offset)] for offset in
+                      np.array([[0,0],[1,0],[1,1],[0,1]])] for cell in cells])
+    faces = np.concatenate([quads[:,[0,1,2]], quads[:,[0,2,3]]])
+    triangles = vertices[faces]
+    normal = np.cross(triangles[:,1]-triangles[:,0], triangles[:,2]-triangles[:,0])
+    if np.any(normal[:,2] < np.cos(.4)*np.linalg.norm(normal,axis=1)-1e-10):
+        raise ValueError('Corridor bend produces an over-steep floor; adjust its height profile')
+    # Grid centres lie on the common diagonal of the two cell triangles.
+    grid_height = np.full(tuple(dims), np.nan)
+    grid_height[tuple(cells.T)] = (vertices[quads[:,0],2]+vertices[quads[:,2],2])/2
+    canonical = json.dumps(spec,sort_keys=True,separators=(',',':'),allow_nan=False)
+    completion = {'spec_sha256':hashlib.sha256(canonical.encode()).hexdigest(),
+                  'spec':spec, 'bounds':{'min':vertices.min(0).tolist(),'max':vertices.max(0).tolist()}}
+    return vertices, faces, mask.ravel(), grid_height.ravel(), completion
+
+
 def display_classification(data, ground, support, distance, origin, resolution, settings):
     """Exact shared-grid queries at ground + .44m; never project arbitrary Z."""
     pct_ground, cost, ceiling = data[3], data[0], data[4]
@@ -95,6 +148,88 @@ def display_classification(data, ground, support, distance, origin, resolution, 
     category[support] = 1
     category[support & pct & (clearance >= .05)] = 2
     return category, clearance, pct
+
+
+def scan_compatible_costs(data, ground, support, distance, origin, resolution, settings):
+    """Only close PCT nodes whose body or graph edges violate the SCAN map."""
+    def query(points):
+        q = (points-origin)/resolution-.5
+        inside = ((q>=0)&(q<=np.array(distance.shape)-1)).all(1)
+        base = np.minimum(np.maximum(np.floor(q).astype(int),0),np.array(distance.shape)-2)
+        t = q-base
+        value = np.zeros(len(points))
+        for dx in [0,1]:
+            for dy in [0,1]:
+                for dz in [0,1]:
+                    off = np.array([dx,dy,dz])
+                    value += distance[tuple((base+off).T)]*np.prod(np.where(off,t,1-t),axis=1)
+        value[~inside] = -np.inf
+        ij = np.floor((points[:,:2]-origin[:2])/resolution).astype(int)
+        in_xy = ((ij>=0)&(ij<np.array(support.shape))).all(1)
+        ij = np.clip(ij,0,np.array(support.shape)-1)
+        h = ground[tuple(ij.T)]
+        terrain = in_xy & support[tuple(ij.T)] & (h<=points[:,2]-.05+1e-9) & (h>=points[:,2]-.93-1e-9)
+        return value, terrain
+
+    before = data[0].copy()
+    threshold = settings['cost_threshold']
+    closed = np.zeros(data[0].shape,dtype=bool)
+    # Duplicate tomography layers are identical on this single surface.
+    # Reuse the closure for identical floor + candidate masks.
+    cache = {}
+    for layer in range(data.shape[1]):
+        floor = data[3,layer]
+        active = support & np.isfinite(floor) & (data[0,layer]<=threshold)
+        key = hashlib.sha256(floor.tobytes()+active.tobytes()).digest()
+        if key in cache:
+            closed[layer] = cache[key]
+            continue
+        cells = np.argwhere(active)
+        rejected = np.zeros(support.shape,dtype=bool)
+        if len(cells):
+            points = np.column_stack([origin[:2]+(cells+.5)*resolution,floor[tuple(cells.T)]+.44])
+            clearance, terrain = query(points)
+            bad = (clearance<.05) | ~terrain
+            rejected[tuple(cells[bad].T)] = True
+        safe = active & ~rejected
+        # A* traverses these eight-neighbour edges. Match production
+        # segmentClearance: <= r/2 sample spacing and half-gap subtraction.
+        for di,dj in [(1,0),(0,1),(1,1),(1,-1)]:
+            a = np.argwhere(safe)
+            b = a+np.array([di,dj])
+            inside = ((b>=0)&(b<np.array(safe.shape))).all(1)
+            a,b = a[inside],b[inside]
+            keep = safe[tuple(b.T)] & (abs(floor[tuple(a.T)]-floor[tuple(b.T)])<=settings['max_step']+1e-6)
+            a,b = a[keep],b[keep]
+            if not len(a): continue
+            p = np.column_stack([origin[:2]+(a+.5)*resolution,floor[tuple(a.T)]+.44])
+            q = np.column_stack([origin[:2]+(b+.5)*resolution,floor[tuple(b.T)]+.44])
+            length = np.linalg.norm(q-p,axis=1)
+            counts = np.maximum(1,np.ceil(length/(resolution*.5)).astype(int))
+            bad_edge = np.zeros(len(a),dtype=bool)
+            if di and dj:
+                # Do not cross a four-cell corner past an unknown column.
+                side_x,side_y = a+np.array([di,0]),a+np.array([0,dj])
+                bad_edge |= ~support[tuple(side_x.T)] | ~support[tuple(side_y.T)]
+            for count in np.unique(counts):
+                select = np.flatnonzero(counts==count)
+                samples = p[select,None]+(q-p)[select,None]*np.linspace(0,1,count+1)[None,:,None]
+                values,terrain = query(samples.reshape(-1,3))
+                values = values.reshape(-1,count+1)
+                terrain = terrain.reshape(-1,count+1)
+                bad_edge[select] |= (values.min(1)-length[select]/(2*count)<.05) | ~terrain.all(1)
+            rejected[tuple(a[bad_edge].T)] = True
+            rejected[tuple(b[bad_edge].T)] = True
+        closed[layer] = rejected
+        cache[key] = rejected
+    data[0,closed] = settings['cost_barrier']
+    # Keep the stored cost gradients consistent with the filtered costs.
+    data[1] = 0.; data[2] = 0.
+    data[1,:,1:-1,:] = data[0,:,2:,:]-data[0,:,:-2,:]
+    data[2,:,:,1:-1] = data[0,:,:,2:]-data[0,:,:,:-2]
+    if np.any(data[0]<before): raise ValueError('SCAN compatibility must never lower PCT cost')
+    return {'policy':'one-way intersection; only raise PCT cost; original SCAN .05m point/edge clearance',
+            'closed_layer_cells':int(np.sum(closed)), 'closed_xy_cells':int(np.any(closed,axis=0).sum())}
 
 
 def display_meshes(vertices, faces, ground, support, category, origin, resolution):
@@ -144,7 +279,7 @@ DISPLAY_COLORS = {'passable': (.12, .78, .36, 1.),
                   'blocked': (.95, .27, .12, 1.), 'legend': (.92, .95, 1., 1.)}
 
 
-def legend_mesh(origin):
+def legend_mesh(origin, completed=False):
     """Embed complete monochrome glyphs as pixel runs in the existing DAE."""
     from matplotlib.font_manager import FontProperties, findfont
     from PIL import Image, ImageDraw, ImageFont
@@ -155,6 +290,8 @@ def legend_mesh(origin):
     lines = ['GREEN  PCT + SCAN PASS', 'RED  SUPPORTED / BLOCKED',
              'VOID  UNKNOWN / NO FLOOR', 'COLOR IS NOT CONNECTIVITY',
              'COMPARE: DELETE display_overlay']
+    if completed:
+        lines.insert(0, 'SIMULATION FLOOR COMPLETION')
     for row, text in enumerate(lines):
         left, top, right, bottom = font.getbbox(text)
         bitmap = Image.new('1', (right-left, bottom-top))
@@ -251,6 +388,8 @@ def main():
     parser.add_argument('--source', required=True)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--config', type=Path)
+    parser.add_argument('--simulation-corridor', type=Path,
+                        help='Explicit simulation-only floor completion specification')
     args = parser.parse_args()
     source_config = Path(__file__).resolve().parents[2]/'global_planning/config/global_cfg.yaml'
     if args.config is None:
@@ -293,7 +432,12 @@ def main():
                 'minimum_second_eigenvalue': .0001, 'normal_z_min': .95,
                 'observed_lower_surface_z_max': -.5, 'triangle_max_edge': .3,
                 'triangle_slope_max': .4, 'triangle_sample_spacing': r/2,
+                'pct_voxel_face_xy_inset': r*.001,
+                'pct_scan_compatibility': 'body .44m; point and eight-neighbour segment clearance .05m; only raise cost',
                 'unknown_policy': 'reject; no filling or extrapolation'}
+    completion = None
+    if args.simulation_corridor:
+        geometry['unknown_policy'] = 'reject outside the explicit simulation corridor'
     processing = args.config.resolve().parents[1]/'pct/map_processing'
     if (processing/'prepare_map.py').exists():
         sys.path.insert(0,str(processing))
@@ -305,8 +449,6 @@ def main():
         observed_surface_map = SourceFileLoader('pct_scene_preparation',str(processing/'pct_prepare_map')).load_module().observed_surface_map
     algorithm_files = [processing/'tomogram.py',processing/'kernels.py']
     algorithm_files.append(processing/'prepare_map.py' if (processing/'prepare_map.py').exists() else processing/'pct_prepare_map')
-    fingerprint = hashlib.sha256((digest(source)+json.dumps(geometry,sort_keys=True)+
-        json.dumps(settings,sort_keys=True)+digest(__file__)+''.join(digest(p) for p in algorithm_files)).encode()).hexdigest()
     vertices, triangulation, accepted = surfaces(points)
     faces = triangulation.simplices[accepted]
     if not len(faces):
@@ -325,6 +467,18 @@ def main():
     bary = np.einsum('ijk,ik->ij',transform[:,:2],xy-transform[:,2])
     bary = np.column_stack([bary,1-bary.sum(1)])
     ground = np.sum(vertices[triangulation.simplices[np.maximum(simplex,0)],2]*bary,axis=1)
+    if args.simulation_corridor:
+        patch_vertices, patch_faces, patch_support, patch_ground, completion = simulation_corridor(
+            args.simulation_corridor, digest(source), xy, dims, r, support)
+        # Fill missing support only; measured terrain and every source voxel
+        # remain. No platform is placed over an existing observed floor.
+        ground = np.where(patch_support,patch_ground,ground)
+        support |= patch_support
+        faces = np.concatenate([faces,patch_faces+len(vertices)])
+        vertices = np.concatenate([vertices,patch_vertices])
+        geometry['simulation_completion'] = completion
+    fingerprint = hashlib.sha256((digest(source)+json.dumps(geometry,sort_keys=True)+
+        json.dumps(settings,sort_keys=True)+digest(__file__)+''.join(digest(p) for p in algorithm_files)).encode()).hexdigest()
     # At cell centres each closed source voxel has an unambiguous XY column.
     ij = np.floor(xy/r).astype(int)
     column = {}
@@ -348,13 +502,15 @@ def main():
             p = np.repeat(base[:,None,:],len(uv),axis=1)
             p[:,:,axis] += sign
             p[:,:,others[0]] += uv[:,0]; p[:,:,others[1]] += uv[:,1]
+            # Tomogram uses round-to-cell-centre indexing. Exact voxel edges
+            # otherwise leak a neighbouring voxel's top into this floor cell.
+            # Rasterize each voxel in its own half-open XY column; only the
+            # numerical quadrature moves (50 micrometres), not scene geometry.
+            p[:,:,:2] = np.clip(p[:,:,:2], base[:,None,:2]+r*.001,
+                               base[:,None,:2]+r-r*.001)
             face_samples.append(p.reshape(-1,3).astype(np.float32))
     samples = np.concatenate([triangle_samples,points]+face_samples)
     data,timing,envelope = observed_surface_map(samples,center,dims,float(minimum[2]),settings,support,ground)
-    with (out/'map.pctmap').open('wb') as f:
-        f.write(struct.pack('<8sIII6d',b'PCTMAP02',*data.shape[1:],r,*center,
-                            settings['max_step'],settings['clearance'],envelope))
-        f.write(data.tobytes())
     del samples,face_samples
     zmin = math.floor((np.nanmin(ground)-.1)/r)*r
     nz = int(math.ceil((np.nanmax(ground)+.44+.2-zmin)/r))+2
@@ -382,6 +538,11 @@ def main():
     unknown_distance = (distance_transform_edt(support)-distance_transform_edt(~support))*r-unknown_margin
     distance = np.minimum(distance,unknown_distance[:,:,None]).astype(np.float32)
     occupancy[~support,:] = True
+    compatibility = scan_compatible_costs(data,ground,support,distance,origin,r,settings)
+    with (out/'map.pctmap').open('wb') as f:
+        f.write(struct.pack('<8sIII6d',b'PCTMAP02',*data.shape[1:],r,*center,
+                            settings['max_step'],settings['clearance'],envelope))
+        f.write(data.tobytes())
     text = lambda s: np.frombuffer(s.encode('ascii'),dtype=np.uint8)
     np.savez_compressed(out/'map.npz',version=np.int32(1),resolution=np.float64(r),
         origin=origin.astype(np.float64),axis_order=text('xyz'),occupancy=occupancy.astype(np.uint8),
@@ -392,7 +553,7 @@ def main():
         data, ground, support, distance, origin, r, settings)
     overlays = display_meshes(vertices, faces, ground, support, category, origin, r)
     legend_origin = [minimum[0], minimum[1]-.7, float(np.nanmedian(ground))+.02]
-    legend_vertices, legend_faces = legend_mesh(legend_origin)
+    legend_vertices, legend_faces = legend_mesh(legend_origin, completion is not None)
     overlays['display_legend'] = (legend_vertices, legend_faces, DISPLAY_COLORS['legend'])
     write_dae(out/'map.dae',np.concatenate([vertices,box_vertices]),
               np.concatenate([faces,box_faces+len(vertices)]),overlays)
@@ -404,6 +565,7 @@ def main():
         'parameters':settings,'geometry':geometry,'shape':list(data.shape),'center':center.tolist(),
         'origin':origin.tolist(),'resolution':r,'regions':[],'point_count':len(points),
         'triangle_count':len(faces),'voxel_count':len(indices),'gpu_timing_ms':timing,
+        'pct_scan_compatibility':compatibility,
         'coordinates':{'frame':'world','unit':'m','transform':'identity; source coordinates retained',
                        'evidence':'near-horizontal observed surfaces around z=-1 and z=1.9; near-vertical walls; no registration'},
         'distance_field':{'axis_order':'xyz','origin':'lower corner','samples':'cell centers',
@@ -422,11 +584,22 @@ def main():
                     'material': 'single emissive category color; ambient/diffuse zero',
                     'surface': 'observed triangles clipped to classified grid cells; display-only offset .008m'},
         'generation_seconds':time.monotonic()-started}
+    if completion:
+        metadata.update(terrain_model='observed_surface_with_simulation_completion',
+                        simulation_only=True, completion=completion)
+        metadata['display']['unknown'] = 'no color; reject outside explicit simulation completion'
+        metadata['display']['classification'] = metadata['display']['classification'].replace(
+            'observed support', 'observed or explicitly completed simulation support')
+        metadata['display']['surface'] = 'measured and simulation triangles clipped to classified cells; display-only offset .008m'
     (out/'map.json').write_text(json.dumps(metadata,indent=2)+'\n')
     # Select nearby unambiguous shared-grid centres, preserving the investigated route.
     presets = {}
-    for name,target in [('PCD-START',[-15.45,-.5]),('PCD-GOAL',[-13.8,-1.1]),
-                        ('PCD-LONG-START',[-11.775,-.175]),('PCD-LONG-GOAL',[-13.575,-1.525])]:
+    targets = [('PCD-START',[-15.45,-.5]),('PCD-GOAL',[-13.8,-1.1]),
+               ('PCD-LONG-START',[-11.775,-.175]),('PCD-LONG-GOAL',[-13.575,-1.525])]
+    if completion:
+        targets += [('PCD-CORRIDOR-START',completion['spec']['centerline'][0][:2]),
+                    ('PCD-CORRIDOR-GOAL',completion['spec']['centerline'][-1][:2])]
+    for name,target in targets:
         order = np.argsort(np.linalg.norm(xy-np.array(target),axis=1))
         chosen = None
         for flat in order[:100]:
@@ -452,6 +625,9 @@ def main():
         'source_sha256':digest(source),'geometry_fingerprint':fingerprint,
         'coordinates':metadata['coordinates'],'features':{'dynamic_obstacles':False},
         'points':presets,'start':'PCD-LONG-START','goal':'PCD-LONG-GOAL'}
+    if completion:
+        manifest.update(name='Wisal PCD · 仿真补全通道',simulation_only=True,completion=completion,
+                        start='PCD-CORRIDOR-START',goal='PCD-CORRIDOR-GOAL')
     (out/'map.yaml').write_text(yaml.safe_dump(manifest,allow_unicode=True,sort_keys=False))
     print(json.dumps({'output':str(out),'points':presets,'seconds':time.monotonic()-started},indent=2),flush=True)
 

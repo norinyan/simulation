@@ -1,6 +1,6 @@
 version: 1
 id: wisal-pcd
-name: Wisal PCD · 实测环境
+name: Wisal PCD · 仿真补全通道
 frame: world
 files:
   pcd: source/clean_map.pcd
@@ -11,13 +11,13 @@ files:
   world: map.world
 sha256:
   pcd: 1c41ecd7042650a573d5f949a9650ba31c43873c8f9a63c06fa6eb484cafa7db
-  pctmap: 87fb30d3bd27affd99c0f7fd582cc99c839e0137c3556567314ad1801f9a074b
-  metadata: 218233fd799d1dbce2fce933d68d79282cb6c3062ca5b0e6290c84b6eb313878
-  npz: 72e51d5410b1fd3855d1bb3ea834ca89af4d5b38860a6447d6e8886f59b14941
-  mesh: d84b83457cd8cd865312f93a40df2a07b4d83b6daec72c2415c39b7bc43d07e7
-  world: b08c83424d19817b11d79e22686b87c283fd4c964e4e6116ca72e0cd664bc7ca
+  pctmap: cce9a54c4ae8fcea1782e407b9089834afcaec8347e25fc81c25f1da08e84b51
+  metadata: e988ff4cdd5132a000b728f60a3ff4e47fb38421004823c9fdb1bf0433b08162
+  npz: 4cd56a51bae9cbcea089d7a89a0e1231d32e783365e2260f7d60d1de89b13842
+  mesh: 981eed1dfe436d90aed91e125d32e55f3f6ba9654310fe4a18dee838bce222ee
+  world: 1fa7a92afb33497721750c65796d8eece7e1a0693e625e4bc9fdbbe641b642bc
 source_sha256: 1c41ecd7042650a573d5f949a9650ba31c43873c8f9a63c06fa6eb484cafa7db
-geometry_fingerprint: cf5b6795a5371941f094739c5a4e23936cbebc9b1996d34dc14ed0dfaf80b104
+geometry_fingerprint: 58735770aff4442bd86de1631cfa243801e71a217517f2e7e562102bf77ccbd6
 coordinates:
   frame: world
   unit: m
@@ -55,5 +55,78 @@ points:
     - -1.5250000000000004
     - -1.0
     - 0.0
-start: PCD-LONG-START
-goal: PCD-LONG-GOAL
+  PCD-CORRIDOR-START:
+    label: PCD-CORRIDOR-START
+    pose:
+    - -34.975
+    - 1.5250000000000004
+    - -1.2488179035867273
+    - 0.0
+  PCD-CORRIDOR-GOAL:
+    label: PCD-CORRIDOR-GOAL
+    pose:
+    - 7.975000000000001
+    - -1.9750000000000005
+    - -1.0035020902907728
+    - 0.0
+start: PCD-CORRIDOR-START
+goal: PCD-CORRIDOR-GOAL
+simulation_only: true
+completion:
+  spec_sha256: de89a0b1fde7b618d537aad452146fe98079a0364fd9914b55173b9f5819d1e4
+  spec:
+    version: 1
+    purpose: simulation_only
+    source_sha256: 1c41ecd7042650a573d5f949a9650ba31c43873c8f9a63c06fa6eb484cafa7db
+    description: Lower passage floor completion for simulation; inferred heights,
+      not surveyed terrain. Source points and obstacles are retained.
+    width_m: 1.3
+    centerline:
+    - - -35.0
+      - 1.5
+      - -1.25
+    - - -28.0
+      - 0.1575342466
+      - -1.25
+    - - -27.7
+      - 0.1
+      - -1.24375
+    - - -27.7
+      - -0.5
+      - -1.24375
+    - - -28.0
+      - -0.8
+      - -1.25
+    - - -28.6
+      - -1.4
+      - -1.25
+    - - -28.0
+      - -2.1714285714
+      - -1.25
+    - - -27.9
+      - -2.3
+      - -1.2479166667
+    - - -16.0
+      - -3.1407608696
+      - -1.0
+    - - -9.5
+      - -3.6
+      - -1.0
+    - - -0.5
+      - -3.5
+      - -1.0
+    - - 7.3
+      - -1.9
+      - -1.0
+    - - 8.0
+      - -2.0
+      - -1.0
+  bounds:
+    min:
+    - -35.6
+    - -4.250000000000001
+    - -1.25
+    max:
+    - 8.649999999999999
+    - 2.0999999999999996
+    - -1.0

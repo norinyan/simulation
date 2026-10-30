@@ -15,7 +15,7 @@
     </light>
     <gui>
       <camera name="overview">
-        <pose>-12.05 -44.125 59.695 0 .90 1.57079632679</pose>
+        <pose>-12.05 -44.550000000000004 59.695 0 .90 1.57079632679</pose>
         <view_controller>orbit</view_controller>
       </camera>
     </gui>

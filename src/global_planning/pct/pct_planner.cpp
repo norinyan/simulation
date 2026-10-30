@@ -9,6 +9,22 @@
 namespace global_planning {
 namespace {
 constexpr double height_epsilon = 1e-6;  // float32 台阶高差的数值误差，不增加通行能力。
+bool sameYaml(const YAML::Node & a,const YAML::Node & b) {
+  if(!a || !b)return bool(a)==bool(b);
+  if(a.Type()!=b.Type())return false;
+  if(a.IsMap()) {
+    if(a.size()!=b.size())return false;
+    for(const auto & field:a)if(!sameYaml(field.second,b[field.first.as<std::string>()]))return false;
+    return true;
+  }
+  if(a.IsSequence()) {
+    if(a.size()!=b.size())return false;
+    for(std::size_t i=0;i<a.size();++i)if(!sameYaml(a[i],b[i]))return false;
+    return true;
+  }
+  if(!a.IsScalar() || a.Scalar()==b.Scalar())return true;
+  try { return a.as<double>()==b.as<double>(); } catch(const YAML::Exception &) { return false; }
+}
 pct_native::Pose native(const geometry_msgs::msg::Pose & p) {
   return {p.position.x, p.position.y, p.position.z,
     2*std::atan2(p.orientation.z,p.orientation.w)};
@@ -78,10 +94,32 @@ public:
     // transition against the map's traversability, clearance and max_step.
     observed_surface_=metadata["map_kind"] &&
       metadata["map_kind"].as<std::string>()=="pcd_surface_voxel_union_v1";
-    if(observed_surface_ &&
-      (!metadata["terrain_model"] ||
-      metadata["terrain_model"].as<std::string>()!="observed_surface")) {
-      throw std::runtime_error("PCT_BAD_OBSERVED_SURFACE_METADATA");
+    if(observed_surface_) {
+      const auto terrain=metadata["terrain_model"].as<std::string>("");
+      if(terrain=="observed_surface_with_simulation_completion") {
+        const auto manifest=YAML::LoadFile((std::filesystem::path(filename).parent_path()/"map.yaml").string());
+        const auto completion=metadata["completion"];
+        if(!metadata["simulation_only"].as<bool>(false)||!manifest["simulation_only"].as<bool>(false)||
+          !completion.IsMap()||!completion["spec"].IsMap()||completion["spec"].size()==0||
+          !sameYaml(completion,manifest["completion"])) {
+          throw std::runtime_error("PCT_BAD_SIMULATION_COMPLETION_METADATA");
+        }
+        const auto hash=completion["spec_sha256"].as<std::string>("");
+        const auto bounds=completion["bounds"];
+        if(hash.size()!=64||!std::all_of(hash.begin(),hash.end(),[](char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f');})||
+          !bounds.IsMap()||bounds.size()!=2||!bounds["min"].IsSequence()||!bounds["max"].IsSequence()||
+          bounds["min"].size()!=3||bounds["max"].size()!=3) {
+          throw std::runtime_error("PCT_BAD_SIMULATION_COMPLETION_BOUNDS");
+        }
+        for(std::size_t axis=0;axis<3;++axis) {
+          const double lo=bounds["min"][axis].as<double>(),hi=bounds["max"][axis].as<double>();
+          if(!std::isfinite(lo)||!std::isfinite(hi)||lo>hi||(axis<2&&lo==hi)) {
+            throw std::runtime_error("PCT_BAD_SIMULATION_COMPLETION_BOUNDS");
+          }
+        }
+      } else if(terrain!="observed_surface"||metadata["simulation_only"].as<bool>(false)||metadata["completion"]) {
+        throw std::runtime_error("PCT_BAD_OBSERVED_SURFACE_METADATA");
+      }
     }
     const auto parameters=metadata["parameters"];
     const auto shape=metadata["shape"];
