@@ -1,8 +1,8 @@
-name: hfun-navi-simulation-nor
+name: hfun-navi-simulation
 
 services:
   dev:
-    image: hfun-navi-simulation-nor:humble
+    image: hfun-navi-simulation:humble
 
     build:
       context: .

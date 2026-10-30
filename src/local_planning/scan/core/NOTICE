@@ -4,7 +4,7 @@ Upstream main commit: 348e8a5 (add: sensor layout)
 Authors: Han Zheng, Zhe Chen, Yiwen Fu, Ming Yang, Tong Qin
 License: Apache-2.0; embedded L-BFGS retains its own license header.
 
-Local adaptation for simulation_new (2026-10-26):
+Local adaptation for simulation (2026-10-26):
 - Replace ROS parameters and timing with C++ options and steady deadlines.
 - Inject a request-local static-world occupancy interface. Preserve projected
   XY A-star guidance and locked-Z spline optimization.

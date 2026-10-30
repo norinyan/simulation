@@ -138,7 +138,7 @@ HMI 通过 FastAPI / WebSocket 桥接 ROS，展示地图、路径、轨迹、机
 ## 目录与模块
 
 ```text
-simulation_new/                   # ROS 工作空间根目录
+simulation/                       # ROS 工作空间根目录
 ├── docker/                       # Dockerfile、Compose 与 GPU/显示配置
 ├── doc/                          # 需求文档、使用手册
 ├── src/
